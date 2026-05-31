@@ -16,8 +16,8 @@ SELECT
     MIN(ts_nats) as first_message,
     MAX(ts_nats) as last_message
 FROM nats_scan('telemetry',
-    start_time := (current_timestamp - INTERVAL '2 hours')::TIMESTAMP,
-    end_time := (current_timestamp - INTERVAL '1 hour')::TIMESTAMP,
+    start_time := (current_timestamp::TIMESTAMP - INTERVAL '2 hours'),
+    end_time := (current_timestamp::TIMESTAMP - INTERVAL '1 hour'),
     proto_file := 'test/proto/telemetry.proto',
     proto_message := 'Telemetry',
     proto_extract := ['device_id']
@@ -33,8 +33,8 @@ SELECT
     ts_nats,
     device_id
 FROM nats_scan('telemetry',
-    start_time := (current_timestamp - INTERVAL '2 hours')::TIMESTAMP,
-    end_time := (current_timestamp - INTERVAL '1 hour')::TIMESTAMP,
+    start_time := (current_timestamp::TIMESTAMP - INTERVAL '2 hours'),
+    end_time := (current_timestamp::TIMESTAMP - INTERVAL '1 hour'),
     proto_file := 'test/proto/telemetry.proto',
     proto_message := 'Telemetry',
     proto_extract := ['device_id']
@@ -52,7 +52,7 @@ SELECT
     MIN(ts_nats) as first_message,
     MAX(ts_nats) as last_message
 FROM nats_scan('telemetry',
-    start_time := (current_timestamp - INTERVAL '4 hours')::TIMESTAMP,
+    start_time := (current_timestamp::TIMESTAMP - INTERVAL '4 hours'),
     proto_file := 'test/proto/telemetry.proto',
     proto_message := 'Telemetry',
     proto_extract := ['device_id']
@@ -68,7 +68,7 @@ SELECT
     MIN(ts_nats) as first_message,
     MAX(ts_nats) as last_message
 FROM nats_scan('telemetry',
-    end_time := (current_timestamp - INTERVAL '1 hour')::TIMESTAMP,
+    end_time := (current_timestamp::TIMESTAMP - INTERVAL '1 hour'),
     proto_file := 'test/proto/telemetry.proto',
     proto_message := 'Telemetry',
     proto_extract := ['device_id']
@@ -82,8 +82,8 @@ FROM nats_scan('telemetry',
 SELECT
     COUNT(*) as messages_in_5_min
 FROM nats_scan('telemetry',
-    start_time := (current_timestamp - INTERVAL '2 hours')::TIMESTAMP,
-    end_time := (current_timestamp - INTERVAL '2 hours' + INTERVAL '5 minutes')::TIMESTAMP,
+    start_time := (current_timestamp::TIMESTAMP - INTERVAL '2 hours'),
+    end_time := (current_timestamp::TIMESTAMP - INTERVAL '2 hours' + INTERVAL '5 minutes'),
     proto_file := 'test/proto/telemetry.proto',
     proto_message := 'Telemetry',
     proto_extract := ['device_id']
@@ -99,7 +99,7 @@ SELECT
     MIN(ts_nats) as first,
     MAX(ts_nats) as last
 FROM nats_scan('telemetry',
-    start_time := (current_timestamp - INTERVAL '12 hours')::TIMESTAMP,
+    start_time := (current_timestamp::TIMESTAMP - INTERVAL '12 hours'),
     end_time := current_timestamp::TIMESTAMP,
     proto_file := 'test/proto/telemetry.proto',
     proto_message := 'Telemetry',
@@ -145,8 +145,8 @@ WITH ordered_results AS (
         ts_nats,
         LAG(ts_nats) OVER (ORDER BY seq) as prev_ts
     FROM nats_scan('telemetry',
-        start_time := (current_timestamp - INTERVAL '3 hours')::TIMESTAMP,
-        end_time := (current_timestamp - INTERVAL '2 hours')::TIMESTAMP,
+        start_time := (current_timestamp::TIMESTAMP - INTERVAL '3 hours'),
+        end_time := (current_timestamp::TIMESTAMP - INTERVAL '2 hours'),
         proto_file := 'test/proto/telemetry.proto',
     proto_message := 'Telemetry',
     proto_extract := ['device_id']
@@ -169,8 +169,8 @@ SELECT
     zone,
     kw::DOUBLE as kw
 FROM nats_scan('telemetry',
-    start_time := (current_timestamp - INTERVAL '2 hours')::TIMESTAMP,
-    end_time := (current_timestamp - INTERVAL '1 hour')::TIMESTAMP,
+    start_time := (current_timestamp::TIMESTAMP - INTERVAL '2 hours'),
+    end_time := (current_timestamp::TIMESTAMP - INTERVAL '1 hour'),
     json_extract := ['device_id', 'zone', 'kw']
 )
 ORDER BY ts_nats
@@ -186,8 +186,8 @@ SELECT
     MIN(ts_nats) as first,
     MAX(ts_nats) as last
 FROM nats_scan('telemetry',
-    start_time := (current_timestamp - INTERVAL '3 hours')::TIMESTAMP,
-    end_time := (current_timestamp - INTERVAL '2 hours')::TIMESTAMP,
+    start_time := (current_timestamp::TIMESTAMP - INTERVAL '3 hours'),
+    end_time := (current_timestamp::TIMESTAMP - INTERVAL '2 hours'),
     subject := 'zone-a',
     proto_file := 'test/proto/telemetry.proto',
     proto_message := 'Telemetry',
@@ -206,8 +206,8 @@ SELECT
     ROUND(MIN(kw::DOUBLE), 2) as min_kw,
     ROUND(MAX(kw::DOUBLE), 2) as max_kw
 FROM nats_scan('telemetry',
-    start_time := (current_timestamp - INTERVAL '4 hours')::TIMESTAMP,
-    end_time := (current_timestamp - INTERVAL '3 hours')::TIMESTAMP,
+    start_time := (current_timestamp::TIMESTAMP - INTERVAL '4 hours'),
+    end_time := (current_timestamp::TIMESTAMP - INTERVAL '3 hours'),
     json_extract := ['device_id', 'kw']
 );
 
@@ -222,8 +222,8 @@ SELECT
     ROUND(AVG(kw::DOUBLE), 2) as avg_kw,
     ROUND(AVG(voltage::DOUBLE), 1) as avg_voltage
 FROM nats_scan('telemetry',
-    start_time := (current_timestamp - INTERVAL '6 hours')::TIMESTAMP,
-    end_time := (current_timestamp - INTERVAL '5 hours')::TIMESTAMP,
+    start_time := (current_timestamp::TIMESTAMP - INTERVAL '6 hours'),
+    end_time := (current_timestamp::TIMESTAMP - INTERVAL '5 hours'),
     json_extract := ['zone', 'kw', 'voltage']
 )
 GROUP BY zone
@@ -240,8 +240,8 @@ SELECT
     MAX(ts_nats) as last_reading,
     ROUND(AVG(temp_c::DOUBLE), 2) as avg_temp_c
 FROM nats_scan('environmental',
-    start_time := (current_timestamp - INTERVAL '3 hours')::TIMESTAMP,
-    end_time := (current_timestamp - INTERVAL '2 hours')::TIMESTAMP,
+    start_time := (current_timestamp::TIMESTAMP - INTERVAL '3 hours'),
+    end_time := (current_timestamp::TIMESTAMP - INTERVAL '2 hours'),
     json_extract := ['temp_c']
 );
 
@@ -256,8 +256,8 @@ SELECT
     MAX(ts_nats) as last,
     COUNT(DISTINCT device_id) as unique_devices
 FROM nats_scan('telemetry',
-    start_time := (current_timestamp - INTERVAL '2 hours')::TIMESTAMP,
-    end_time := (current_timestamp - INTERVAL '1 hour')::TIMESTAMP,
+    start_time := (current_timestamp::TIMESTAMP - INTERVAL '2 hours'),
+    end_time := (current_timestamp::TIMESTAMP - INTERVAL '1 hour'),
     proto_file := 'test/proto/telemetry.proto',
     proto_message := 'Telemetry',
     proto_extract := ['device_id']
@@ -267,4 +267,3 @@ FROM nats_scan('telemetry',
 .print ========================================
 .print All timestamp query tests completed successfully!
 .print ========================================
-

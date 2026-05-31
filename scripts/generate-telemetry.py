@@ -7,6 +7,7 @@ that mimics real-world datacenter telemetry patterns.
 """
 
 import asyncio
+import argparse
 import json
 import random
 import sys
@@ -208,14 +209,24 @@ class TelemetryGenerator:
 
 async def main():
     """Main entry point."""
-    generator = TelemetryGenerator()
+    parser = argparse.ArgumentParser(description="Generate synthetic telemetry data for NATS JetStream testing.")
+    parser.add_argument("--url", default="nats://localhost:4222", help="NATS server URL")
+    parser.add_argument("--hours", type=int, default=1, help="Historical data duration in hours")
+    parser.add_argument("--interval-seconds", type=int, default=60, help="Historical sample interval")
+    parser.add_argument("--realtime-seconds", type=int, default=0, help="Optional realtime generation duration")
+    args = parser.parse_args()
+
+    generator = TelemetryGenerator(args.url)
     
     try:
         await generator.connect()
         
-        # Generate 1 hour of historical data at 1-minute intervals for initial testing
         print("\n=== Generating Historical Data ===")
-        await generator.generate_historical_data(hours=1, interval_seconds=60)
+        await generator.generate_historical_data(hours=args.hours, interval_seconds=args.interval_seconds)
+
+        if args.realtime_seconds > 0:
+            print("\n=== Generating Realtime Data ===")
+            await generator.generate_realtime_data(duration_seconds=args.realtime_seconds, interval_seconds=args.interval_seconds)
         
         print("\n=== Data Generation Complete ===")
         print("\nYou can now query the data using:")
@@ -231,4 +242,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-

@@ -23,6 +23,8 @@ build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
 
 # Find dependencies via vcpkg
+find_package(OpenSSL REQUIRED)
+find_package(unofficial-sodium CONFIG REQUIRED)
 find_package(cnats CONFIG REQUIRED)
 find_package(Protobuf CONFIG REQUIRED)
 
@@ -37,4 +39,3 @@ install(
   EXPORT "${DUCKDB_EXPORT_SET}"
   LIBRARY DESTINATION "${INSTALL_LIB_DIR}"
   ARCHIVE DESTINATION "${INSTALL_LIB_DIR}")
-

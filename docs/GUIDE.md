@@ -138,14 +138,14 @@ The extension uses binary search to resolve timestamps to sequence numbers, prov
 
 ### Subject Filtering
 
-Filter messages by subject pattern:
+Filter messages by NATS subject pattern on the server:
 
 ```sql
 SELECT seq, subject, payload
-FROM nats_scan('telemetry', subject := 'telemetry.dc1.power.pm5560-001');
+FROM nats_scan('telemetry', nats_subject := 'telemetry.dc1.power.pm5560-001');
 ```
 
-The subject filter performs substring matching on message subjects. This filtering occurs after message retrieval, so it works efficiently when combined with sequence or timestamp ranges.
+Use `nats_subject` for exact or wildcard NATS subject filters that can be pushed down to JetStream. Use `subject_contains` for client-side substring matching on message subjects. The legacy `subject` parameter is still accepted as a substring-compatible alias.
 
 ### Combined Queries
 
@@ -154,7 +154,7 @@ Combine multiple query parameters:
 ```sql
 SELECT seq, ts_nats, subject, payload
 FROM nats_scan('telemetry',
-    subject := 'pm5560',
+    subject_contains := 'pm5560',
     start_time := '2025-11-01 09:00:00'::TIMESTAMP,
     end_time := '2025-11-01 17:00:00'::TIMESTAMP
 );
@@ -413,6 +413,20 @@ The extension uses the NATS C client library (cnats) for all NATS protocol opera
 
 The extension executes in a single-threaded model. Each query establishes one connection to the NATS server and fetches messages sequentially. Messages are returned to DuckDB in batches of up to 2048 rows (STANDARD_VECTOR_SIZE), allowing DuckDB to process results incrementally.
 
+### Performance Behavior
+
+The implementation uses a small set of fast paths to keep common scans predictable:
+
+- `nats_scan` fetches messages in batches instead of issuing one request per row.
+- Bounded scans without client-side subject filtering use JetStream deleted sequence
+  metadata to stop after the available messages in the requested range have been emitted.
+- Full-stream scans with `nats_subject` use JetStream subject counts to stop at the
+  end of the matching subject set without waiting on missing messages.
+- `nats_stream_stats` and `nats_stream_range_stats` are metadata-only helpers for
+  resume bounds and deleted/gapped range checks.
+- `subject_contains` remains a client-side filter, so it does not benefit from the
+  same completion shortcuts as server-side subject pushdown.
+
 ## API Reference
 
 The `nats_scan` table function accepts the following parameters:
@@ -421,7 +435,9 @@ The `nats_scan` table function accepts the following parameters:
 |-----------|------|----------|---------|-------------|
 | `stream_name` | VARCHAR | Yes | - | Name of the JetStream stream to query |
 | `url` | VARCHAR | No | `nats://localhost:4222` | NATS server URL |
-| `subject` | VARCHAR | No | - | Subject filter (substring match) |
+| `nats_subject` | VARCHAR | No | - | Server-side NATS subject filter |
+| `subject_contains` | VARCHAR | No | - | Client-side subject substring filter |
+| `subject` | VARCHAR | No | - | Legacy alias for `subject_contains` |
 | `start_seq` | UBIGINT | No | 1 | Starting sequence number (inclusive) |
 | `end_seq` | UBIGINT | No | Last message | Ending sequence number (inclusive) |
 | `start_time` | TIMESTAMP | No | - | Starting timestamp (inclusive) |

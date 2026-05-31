@@ -6,6 +6,7 @@ namespace duckdb {
 
 void NatsJsExtension::Load(ExtensionLoader &loader) {
     NatsScanFunction::Register(loader);
+    NatsStreamStatsFunction::Register(loader);
 }
 
 std::string NatsJsExtension::Name() {
@@ -30,4 +31,3 @@ DUCKDB_EXTENSION_API const char *nats_js_duckdb_cpp_version() {
 }
 
 }
-

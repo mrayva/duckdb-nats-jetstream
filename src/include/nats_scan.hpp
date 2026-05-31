@@ -12,5 +12,9 @@ public:
     static void Register(ExtensionLoader &loader);
 };
 
-} // namespace duckdb
+class NatsStreamStatsFunction {
+public:
+    static void Register(ExtensionLoader &loader);
+};
 
+} // namespace duckdb

@@ -50,8 +50,10 @@ Thumbs.db
 # Dependencies
 third_party/
 deps/
+vcpkg/
 
 # Test artifacts
+.cache/
 test_results/
 *.log
 test/TEST_COVERAGE_SUMMARY.md
@@ -66,4 +68,3 @@ planning/
 # Demo files (generated for screenshots)
 demo.html
 demo-protobuf.html
-

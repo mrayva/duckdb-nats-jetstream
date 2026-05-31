@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/brannn/duckdb-nats-jetstream/actions/workflows/MainDistributionPipeline.yml/badge.svg)](https://github.com/brannn/duckdb-nats-jetstream/actions/workflows/MainDistributionPipeline.yml)
 [![Version](https://img.shields.io/badge/Version-v0.2.1-orange)](https://github.com/brannn/duckdb-nats-jetstream/releases/tag/v0.2.1)
-[![DuckDB Version](https://img.shields.io/badge/DuckDB-v1.5.1-blue)](https://github.com/duckdb/duckdb/releases/tag/v1.5.1)
+[![DuckDB Version](https://img.shields.io/badge/DuckDB-v1.5.3-blue)](https://github.com/duckdb/duckdb/releases/tag/v1.5.3)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/Platform-Linux%20%7C%20macOS%20%7C%20Windows%20%7C%20WebAssembly-lightgrey)](https://github.com/brannn/duckdb-nats-jetstream/actions)
 
@@ -34,7 +34,7 @@ FROM nats_scan(
     url := 'nats://nats.messaging.svc.cluster.local:4222',
     start_time := '2025-11-01 09:00:00'::TIMESTAMP,
     end_time := '2025-11-01 09:05:00'::TIMESTAMP,
-    subject := 'telemetry.dc1.power',
+    nats_subject := 'telemetry.dc1.power.>',
     json_extract := ['device_id', 'kw']
 )
 ORDER BY seq;
@@ -46,11 +46,108 @@ ORDER BY seq;
 
 - **Timestamp-based queries** - Binary search through message streams by time range
 - **Subject filtering** - Filter messages by NATS subject patterns
+- **Batched JetStream pulls** - Fetch messages in batches for large scans instead of one request per row
 - **JSON extraction** - Extract JSON fields as columns
 - **Protocol Buffers** - Native type support (VARCHAR, DOUBLE, BOOLEAN, INTEGER, etc.)
 - **Nested fields** - Access nested protobuf fields with dot notation
 - **Sequence ranges** - Query by message sequence numbers
 - **Multi-platform** - Linux, macOS, Windows, WebAssembly
+
+---
+
+## Large Stream Scans
+
+Use `nats_subject` for server-side JetStream subject filtering. Use
+`subject_contains` for client-side substring filtering. The older `subject`
+parameter remains as a substring-compatible alias.
+
+```sql
+SELECT seq, subject, device_id, kw
+FROM nats_scan(
+    'telemetry',
+    url := 'nats://localhost:4222',
+    nats_subject := 'telemetry.dc1.power.>',
+    json_extract := ['device_id', 'kw']
+);
+```
+
+For whole-stream counts and resume bounds, use `nats_stream_stats` instead of
+scanning messages:
+
+```sql
+SELECT messages, first_seq, last_seq, last_seq + 1 AS next_start_seq
+FROM nats_stream_stats('telemetry', url := 'nats://localhost:4222');
+```
+
+`nats_stream_info` is an alias for the same table function.
+
+Use `nats_stream_range_stats` to check whether a sequence range is fully
+available before scanning it:
+
+```sql
+SELECT available_messages, deleted_in_range, has_gaps
+FROM nats_stream_range_stats(
+    'telemetry',
+    url := 'nats://localhost:4222',
+    start_seq := 100000,
+    end_seq := 200000
+);
+```
+
+`nats_scan` uses batched pull consumers by default. For large streams, keep `batch_size`
+large enough to avoid per-message fetch overhead:
+
+```sql
+SELECT count(*)
+FROM nats_scan(
+    'telemetry',
+    url := 'nats://localhost:4222',
+    batch_size := 4096
+);
+```
+
+For incremental reads, persist the highest processed `seq` and resume from the next
+sequence. If `end_seq` is omitted, the scan reads through the stream's latest sequence
+observed when the query starts:
+
+```sql
+SELECT *
+FROM nats_scan(
+    'telemetry',
+    url := 'nats://localhost:4222',
+    start_seq := 1234568,
+    batch_size := 4096
+);
+```
+
+`fetch_timeout_ms` controls how long a batch fetch may wait. The default is `1000`.
+
+## Performance Behavior
+
+The scan path is tuned for the common analytical cases:
+
+- `nats_scan` uses batched pull requests, so large reads avoid one fetch per message.
+- Bounded scans without client-side subject filtering use JetStream deleted sequence
+  metadata to stop once all available messages in the requested range have been emitted.
+- Full-stream scans with `nats_subject` use JetStream subject counts to avoid waiting
+  for missing messages at the end of the stream.
+- `nats_stream_stats` and `nats_stream_range_stats` provide cheap metadata-only checks
+  for resume bounds and deleted or gapped ranges before scanning.
+- Scans with `subject_contains` still use client-side filtering, so they remain
+  fetch-driven rather than count-driven.
+
+Run the local benchmark script to capture basic regression timings for stats,
+range stats, full scans, subject pushdown, JSON extraction, and protobuf
+extraction:
+
+```bash
+DUCKDB_BIN=/home/mrayva/.duckdb/cli/1.5.3/duckdb \
+NATS_CLI=/home/mrayva/nats \
+./scripts/benchmark-local.sh
+```
+
+Set `PREPARE_FIXTURES=1` to reset local JetStream streams and regenerate the
+standard test fixtures before timing.
 
 ---
 

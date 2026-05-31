@@ -48,16 +48,16 @@ FROM nats_scan('telemetry',
 
 ### Filter by Subject
 
-Retrieve messages matching a subject pattern:
+Retrieve messages matching a NATS subject pattern on the server:
 
 ```sql
 SELECT seq, subject, ts_nats
 FROM nats_scan('telemetry', 
-    subject := 'telemetry.dc1.power'
+    nats_subject := 'telemetry.dc1.power.>'
 );
 ```
 
-The subject parameter performs substring matching on message subjects.
+Use `subject_contains` when you need client-side substring matching instead.
 
 ## JSON Message Processing
 
@@ -199,7 +199,7 @@ SELECT seq, ts_nats, subject, device_id, kw
 FROM nats_scan('telemetry',
     start_time := '2025-11-01 09:00:00'::TIMESTAMP,
     end_time := '2025-11-01 17:00:00'::TIMESTAMP,
-    subject := 'telemetry.dc1.power',
+    nats_subject := 'telemetry.dc1.power.>',
     json_extract := ['device_id', 'kw']
 )
 ORDER BY seq;
@@ -358,9 +358,8 @@ SELECT device_id, AVG(kw::DOUBLE) as avg_kw
 FROM nats_scan('telemetry',
     start_time := '2025-11-01 09:00:00'::TIMESTAMP,
     end_time := '2025-11-01 10:00:00'::TIMESTAMP,
-    subject := 'telemetry.dc1',
+    nats_subject := 'telemetry.dc1.>',
     json_extract := ['device_id', 'kw']
 )
 GROUP BY device_id;
 ```
-

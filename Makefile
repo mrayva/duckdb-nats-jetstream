@@ -4,6 +4,11 @@ PROJ_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 EXT_NAME=nats_js
 EXT_CONFIG=${PROJ_DIR}extension_config.cmake
 
+# DuckDB v1.5.3's all-target release build links plan_serializer when BUILD_SHELL
+# is enabled. The extension release artifact does not need that tool.
+BUILD_SHELL ?= 0
+override EXT_FLAGS += -DBUILD_SHELL=$(BUILD_SHELL)
+
 # Include the Makefile from extension-ci-tools
 include extension-ci-tools/makefiles/duckdb_extension.Makefile
 
@@ -28,4 +33,3 @@ setup-streams: start
 generate-data: setup-streams
 	@echo "Generating synthetic telemetry data..."
 	./scripts/generate-telemetry.py
-
