@@ -3,7 +3,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-DUCKDB_BIN="${DUCKDB_BIN:-$ROOT_DIR/build/release/duckdb}"
+DUCKDB_BIN="${DUCKDB_BIN:-/home/mrayva/.duckdb/cli/1.5.3/duckdb}"
 EXTENSION_PATH="${EXTENSION_PATH:-$ROOT_DIR/build/release/extension/nats_js/nats_js.duckdb_extension}"
 NATS_URL="${NATS_URL:-nats://127.0.0.1:4222}"
 NATS_CLI="${NATS_CLI:-$HOME/nats}"
@@ -83,5 +83,12 @@ for pattern in \
   fi
 done
 echo "PASS test/sql/test_protobuf_errors.sql"
+
+echo "RUN scripts/run-ingest-harness.sh"
+NATS_URL="$NATS_URL" \
+NATS_CLI="$NATS_CLI" \
+RESET_STREAMS=1 \
+"$ROOT_DIR/scripts/run-ingest-harness.sh"
+echo "PASS scripts/run-ingest-harness.sh"
 
 echo "All local integration tests passed"
