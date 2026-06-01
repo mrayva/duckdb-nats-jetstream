@@ -16,6 +16,9 @@ if [ "${RESET_STREAMS:-0}" = "1" ]; then
   for stream in telemetry environmental telemetry_proto events stats_gaps; do
     "$NATS_BIN" stream rm "$stream" --force --server="${NATS_URL}" >/dev/null 2>&1 || true
   done
+  for consumer in duckdb_ingest_test duckdb_ingest_test_v1 duckdb_ingest_test_fresh duckdb_ingest_probe3; do
+    "$NATS_BIN" consumer rm stats_gaps "$consumer" --force --server="${NATS_URL}" >/dev/null 2>&1 || true
+  done
 fi
 
 echo "Setting up JetStream streams..."

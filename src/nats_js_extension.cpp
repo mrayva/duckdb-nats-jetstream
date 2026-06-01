@@ -1,4 +1,5 @@
 #include "nats_js_extension.hpp"
+#include "nats_ingest.hpp"
 #include "nats_scan.hpp"
 #include <nats/nats.h>
 
@@ -7,6 +8,7 @@ namespace duckdb {
 void NatsJsExtension::Load(ExtensionLoader &loader) {
     NatsScanFunction::Register(loader);
     NatsStreamStatsFunction::Register(loader);
+    NatsIngestFunction::Register(loader);
 }
 
 std::string NatsJsExtension::Name() {

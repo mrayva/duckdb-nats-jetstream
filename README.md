@@ -149,6 +149,15 @@ NATS_CLI=/home/mrayva/nats \
 Set `PREPARE_FIXTURES=1` to reset local JetStream streams and regenerate the
 standard test fixtures before timing.
 
+For a deterministic ingest smoke test, use the dedicated harness:
+
+```bash
+./scripts/run-ingest-harness.sh
+```
+
+It resets the local streams, starts a bounded ingest job, verifies the inserted
+row count, and stops the job cleanly.
+
 ---
 
 ## Documentation

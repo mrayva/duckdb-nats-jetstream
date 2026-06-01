@@ -1,0 +1,82 @@
+#pragma once
+
+#include "duckdb.hpp"
+#include "duckdb/function/table_function.hpp"
+#include <google/protobuf/descriptor.h>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
+#include <unordered_map>
+#include <nats/nats.h>
+
+namespace duckdb {
+
+class ExtensionLoader;
+class DatabaseInstance;
+
+class NatsIngestFunction {
+public:
+    static void Register(ExtensionLoader &loader);
+};
+
+struct NatsIngestConfig {
+    string job_name;
+    string stream_name;
+    string target_table;
+    string durable_name;
+    string nats_url = "nats://localhost:4222";
+    string subject_contains;
+    string nats_subject;
+    uint64_t start_seq = 1;
+    uint64_t batch_size = 1000;
+    int64_t poll_ms = 100;
+    int64_t fetch_timeout_ms = 1000;
+    vector<string> json_fields;
+    string proto_file;
+    string proto_message;
+    vector<string> proto_fields;
+    vector<vector<const google::protobuf::FieldDescriptor *>> proto_field_paths;
+};
+
+struct NatsIngestProgress {
+    bool running = false;
+    bool stop_requested = false;
+    bool stopped = false;
+    bool failed = false;
+    uint64_t last_committed_seq = 0;
+    uint64_t last_delivered_seq = 0;
+    uint64_t rows_inserted = 0;
+    uint64_t batches_committed = 0;
+    string last_error;
+};
+
+struct NatsIngestJobState {
+    explicit NatsIngestJobState(NatsIngestConfig config);
+    ~NatsIngestJobState();
+
+    NatsIngestConfig config;
+    NatsIngestProgress progress;
+    shared_ptr<DatabaseInstance> db;
+    std::mutex job_mutex;
+    std::condition_variable cv;
+    std::thread worker;
+    natsConnection *conn = nullptr;
+    jsCtx *js = nullptr;
+    natsSubscription *sub = nullptr;
+};
+
+class NatsIngestManager {
+public:
+    static NatsIngestManager &Get();
+
+    shared_ptr<NatsIngestJobState> CreateJob(NatsIngestConfig config);
+    shared_ptr<NatsIngestJobState> GetJob(const string &job_name);
+    vector<shared_ptr<NatsIngestJobState>> ListJobs();
+    bool StopJob(const string &job_name);
+
+private:
+    std::mutex mutex_;
+    unordered_map<string, shared_ptr<NatsIngestJobState>> jobs_;
+};
+
+} // namespace duckdb

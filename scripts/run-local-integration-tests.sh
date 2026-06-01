@@ -58,7 +58,8 @@ success_tests=(
 
 for test_file in "${success_tests[@]}"; do
   echo "RUN $test_file"
-  "$DUCKDB_BIN" -unsigned :memory: < "$ROOT_DIR/$test_file" >/tmp/"$(basename "$test_file")".log
+  log_file="/tmp/$(basename "$test_file")".log
+  "$DUCKDB_BIN" -unsigned :memory: < "$ROOT_DIR/$test_file" >"$log_file"
   echo "PASS $test_file"
 done
 
