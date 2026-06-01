@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <chrono>
 #include <filesystem>
+#include <sstream>
 #include <nats/nats.h>
 #include <google/protobuf/compiler/importer.h>
 #include <google/protobuf/dynamic_message.h>
@@ -97,6 +98,94 @@ struct NatsIngestSnapshot {
     uint64_t batches_committed = 0;
     string last_error;
 };
+
+static constexpr const char *NATS_INGEST_CHECKPOINT_TABLE = "duckdb_nats_ingest_checkpoints";
+
+static string SqlStringLiteral(const string &value) {
+    string result = "'";
+    for (auto ch : value) {
+        if (ch == '\'') {
+            result += "''";
+        } else {
+            result += ch;
+        }
+    }
+    result += "'";
+    return result;
+}
+
+static void ExecuteOrThrow(Connection &conn, const string &sql, const string &action) {
+    auto result = conn.Query(sql);
+    if (result->HasError()) {
+        throw std::runtime_error(action + ": " + result->GetError());
+    }
+}
+
+static void EnsureCheckpointTable(Connection &conn) {
+    std::ostringstream sql;
+    sql << "CREATE TABLE IF NOT EXISTS " << NATS_INGEST_CHECKPOINT_TABLE << " ("
+        << "stream_name VARCHAR NOT NULL,"
+        << "durable_name VARCHAR NOT NULL,"
+        << "job_name VARCHAR NOT NULL,"
+        << "last_committed_seq UBIGINT NOT NULL,"
+        << "last_delivered_seq UBIGINT NOT NULL,"
+        << "rows_inserted UBIGINT NOT NULL,"
+        << "batches_committed UBIGINT NOT NULL,"
+        << "updated_at TIMESTAMP NOT NULL,"
+        << "PRIMARY KEY(stream_name, durable_name)"
+        << ")";
+    ExecuteOrThrow(conn, sql.str(), "Failed to create ingest checkpoint table");
+}
+
+static bool LoadCheckpoint(Connection &conn, const NatsIngestConfig &config, uint64_t &resume_seq,
+                           NatsIngestProgress &progress) {
+    std::ostringstream sql;
+    sql << "SELECT last_committed_seq, last_delivered_seq, rows_inserted, batches_committed "
+        << "FROM " << NATS_INGEST_CHECKPOINT_TABLE << " WHERE stream_name = "
+        << SqlStringLiteral(config.stream_name) << " AND durable_name = " << SqlStringLiteral(config.durable_name);
+
+    auto result = conn.Query(sql.str());
+    if (result->HasError()) {
+        throw std::runtime_error("Failed to load ingest checkpoint: " + result->GetError());
+    }
+
+    auto chunk = result->Fetch();
+    if (!chunk || chunk->size() == 0) {
+        resume_seq = config.start_seq;
+        return false;
+    }
+
+    progress.last_committed_seq = chunk->GetValue(0, 0).GetValue<uint64_t>();
+    progress.last_delivered_seq = chunk->GetValue(1, 0).GetValue<uint64_t>();
+    progress.rows_inserted = chunk->GetValue(2, 0).GetValue<uint64_t>();
+    progress.batches_committed = chunk->GetValue(3, 0).GetValue<uint64_t>();
+    progress.checkpoint_seq = progress.last_committed_seq;
+    resume_seq = progress.last_committed_seq + 1;
+    return true;
+}
+
+static void UpsertCheckpoint(Connection &conn, const NatsIngestJobState &job, uint64_t committed_seq,
+                             uint64_t delivered_seq, uint64_t rows_inserted, uint64_t batches_committed) {
+    std::ostringstream sql;
+    sql << "INSERT INTO " << NATS_INGEST_CHECKPOINT_TABLE
+        << " (stream_name, durable_name, job_name, last_committed_seq, last_delivered_seq, rows_inserted, "
+           "batches_committed, updated_at) VALUES ("
+        << SqlStringLiteral(job.config.stream_name) << ", "
+        << SqlStringLiteral(job.config.durable_name) << ", "
+        << SqlStringLiteral(job.config.job_name) << ", "
+        << committed_seq << ", "
+        << delivered_seq << ", "
+        << rows_inserted << ", "
+        << batches_committed << ", CURRENT_TIMESTAMP"
+        << ") ON CONFLICT(stream_name, durable_name) DO UPDATE SET "
+        << "job_name = excluded.job_name, "
+        << "last_committed_seq = excluded.last_committed_seq, "
+        << "last_delivered_seq = excluded.last_delivered_seq, "
+        << "rows_inserted = excluded.rows_inserted, "
+        << "batches_committed = excluded.batches_committed, "
+        << "updated_at = excluded.updated_at";
+    ExecuteOrThrow(conn, sql.str(), "Failed to update ingest checkpoint");
+}
 
 static bool SubjectIsUnderStreamPattern(const string &subject, const char *stream_pattern) {
     if (stream_pattern == nullptr || subject.empty()) {
@@ -405,6 +494,8 @@ static void InitializeJobStateFromConfig(const shared_ptr<NatsIngestJobState> &j
 
 static void InitializeIngestResources(const shared_ptr<NatsIngestJobState> &job) {
     auto &config = job->config;
+    Connection db_connection(*job->db);
+    EnsureCheckpointTable(db_connection);
 
     natsConnection *conn = nullptr;
     jsCtx *js = nullptr;
@@ -433,15 +524,29 @@ static void InitializeIngestResources(const shared_ptr<NatsIngestJobState> &job)
     }
 
     string subscription_subject = config.nats_subject.empty() ? ">" : config.nats_subject;
+    uint64_t effective_start_seq = config.start_seq;
 
     jsSubOptions sub_opts;
     jsSubOptions_Init(&sub_opts);
     sub_opts.Stream = config.stream_name.c_str();
     sub_opts.Config.DeliverPolicy = js_DeliverByStartSequence;
-    sub_opts.Config.OptStartSeq = config.start_seq;
     sub_opts.Config.AckPolicy = js_AckExplicit;
     sub_opts.Config.ReplayPolicy = js_ReplayInstant;
     sub_opts.Config.InactiveThreshold = 60LL * 1000LL * 1000LL * 1000LL;
+
+    if (config.resume_from_checkpoint) {
+        uint64_t resume_seq = config.start_seq;
+        {
+            lock_guard<std::mutex> guard(job->job_mutex);
+            LoadCheckpoint(db_connection, config, resume_seq, job->progress);
+            job->progress.checkpoint_seq = job->progress.last_committed_seq;
+        }
+        effective_start_seq = std::max(config.start_seq, resume_seq);
+    } else {
+        lock_guard<std::mutex> guard(job->job_mutex);
+        job->progress.checkpoint_seq = 0;
+    }
+    sub_opts.Config.OptStartSeq = effective_start_seq;
 
     jsErrCode js_err = static_cast<jsErrCode>(0);
     natsSubscription *sub = nullptr;
@@ -467,6 +572,20 @@ static pair<string, string> SplitTargetTableName(const string &target_table) {
         return {string(), target_table};
     }
     return {target_table.substr(0, dot), target_table.substr(dot + 1)};
+}
+
+static uint64_t GetMessageSequence(natsMsg *msg) {
+    uint64_t stream_seq = natsMsg_GetSequence(msg);
+    if (stream_seq != 0) {
+        return stream_seq;
+    }
+
+    jsMsgMetaData *meta = nullptr;
+    if (natsMsg_GetMetaData(&meta, msg) == NATS_OK && meta != nullptr) {
+        stream_seq = meta->Sequence.Stream;
+        jsMsgMetaData_Destroy(meta);
+    }
+    return stream_seq;
 }
 
 static void AppendJsonFields(Appender &appender, const NatsIngestConfig &config, const char *msg_data, int data_len) {
@@ -521,13 +640,12 @@ static void AppendProtoFields(Appender &appender, const NatsIngestConfig &config
 
 static void AppendMessageRow(Appender &appender, const NatsIngestConfig &config, natsMsg *msg, Message *proto_msg) {
     const char *subject = natsMsg_GetSubject(msg);
-    uint64_t stream_seq = natsMsg_GetSequence(msg);
+    uint64_t stream_seq = GetMessageSequence(msg);
     int64_t timestamp_ns = 0;
 
-    if (stream_seq == 0 || timestamp_ns == 0) {
+    if (timestamp_ns == 0) {
         jsMsgMetaData *meta = nullptr;
         if (natsMsg_GetMetaData(&meta, msg) == NATS_OK && meta != nullptr) {
-            stream_seq = meta->Sequence.Stream;
             timestamp_ns = meta->Timestamp;
             jsMsgMetaData_Destroy(meta);
         }
@@ -654,10 +772,16 @@ static void RunIngestWorker(const shared_ptr<NatsIngestJobState> &job) {
 
             std::vector<natsMsg *> ack_msgs;
             ack_msgs.reserve(fetched_msgs.Count);
+            uint64_t batch_last_delivered_seq = 0;
 
             try {
                 db_connection.BeginTransaction();
                 idx_t inserted_rows = 0;
+                NatsIngestProgress progress_snapshot;
+                {
+                    lock_guard<std::mutex> guard(job->job_mutex);
+                    progress_snapshot = job->progress;
+                }
 
                 for (int i = 0; i < fetched_msgs.Count; i++) {
                     natsMsg *msg = fetched_msgs.Msgs[i];
@@ -668,11 +792,14 @@ static void RunIngestWorker(const shared_ptr<NatsIngestJobState> &job) {
 
                     ack_msgs.push_back(msg);
 
+                    uint64_t msg_seq = GetMessageSequence(msg);
+                    batch_last_delivered_seq = std::max(batch_last_delivered_seq, msg_seq);
+
                     const char *subject = natsMsg_GetSubject(msg);
                     if (!config.subject_contains.empty() &&
                         (subject == nullptr || string(subject).find(config.subject_contains) == string::npos)) {
                         lock_guard<std::mutex> guard(job->job_mutex);
-                        job->progress.last_delivered_seq = std::max(job->progress.last_delivered_seq, natsMsg_GetSequence(msg));
+                        job->progress.last_delivered_seq = std::max(job->progress.last_delivered_seq, msg_seq);
                         continue;
                     }
 
@@ -683,20 +810,34 @@ static void RunIngestWorker(const shared_ptr<NatsIngestJobState> &job) {
                         AppendMessageRow(*appender, config, msg, row_proto.get());
                     }
                     inserted_rows++;
-
-                    lock_guard<std::mutex> guard(job->job_mutex);
-                    job->progress.last_delivered_seq = std::max(job->progress.last_delivered_seq, natsMsg_GetSequence(msg));
                 }
 
                 if (inserted_rows > 0) {
                     appender->Flush();
-                    db_connection.Commit();
+                }
+
+                uint64_t committed_rows = progress_snapshot.rows_inserted + inserted_rows;
+                uint64_t committed_batches = progress_snapshot.batches_committed + 1;
+                uint64_t committed_seq = batch_last_delivered_seq;
+                if (committed_seq == 0) {
+                    committed_seq = progress_snapshot.last_committed_seq;
+                }
+                if (batch_last_delivered_seq == 0) {
+                    batch_last_delivered_seq = committed_seq;
+                }
+
+                UpsertCheckpoint(db_connection, *job, committed_seq, batch_last_delivered_seq, committed_rows,
+                                 committed_batches);
+                db_connection.Commit();
+
+                {
                     lock_guard<std::mutex> guard(job->job_mutex);
-                    job->progress.rows_inserted += inserted_rows;
-                    job->progress.batches_committed++;
+                    job->progress.rows_inserted = committed_rows;
+                    job->progress.batches_committed = committed_batches;
+                    job->progress.last_committed_seq = committed_seq;
+                    job->progress.last_delivered_seq = batch_last_delivered_seq;
+                    job->progress.checkpoint_seq = committed_seq;
                     job->cv.notify_all();
-                } else {
-                    db_connection.Rollback();
                 }
 
                 for (auto *msg : ack_msgs) {
@@ -710,8 +851,6 @@ static void RunIngestWorker(const shared_ptr<NatsIngestJobState> &job) {
                         throw std::runtime_error(std::string("Failed to ack JetStream message from '") +
                                                  config.stream_name + "': " + natsStatus_GetText(s));
                     }
-                    lock_guard<std::mutex> guard(job->job_mutex);
-                    job->progress.last_committed_seq = std::max(job->progress.last_committed_seq, natsMsg_GetSequence(msg));
                     natsMsg_Destroy(msg);
                 }
 
@@ -868,10 +1007,12 @@ static void NatsIngestStartExecute(ClientContext &context, TableFunctionInput &d
         return;
     }
     auto job = state.jobs[0];
+    uint64_t initial_rows_inserted = 0;
     {
         std::unique_lock<std::mutex> lock(job->job_mutex);
+        initial_rows_inserted = job->progress.rows_inserted;
         job->cv.wait_for(lock, std::chrono::seconds(5), [&]() {
-            return job->progress.rows_inserted > 0 || job->progress.failed || job->progress.stopped;
+            return job->progress.rows_inserted > initial_rows_inserted || job->progress.failed || job->progress.stopped;
         });
     }
     auto snapshot = SnapshotJob(job);

@@ -427,6 +427,10 @@ The implementation uses a small set of fast paths to keep common scans predictab
 - `subject_contains` remains a client-side filter, so it does not benefit from the
   same completion shortcuts as server-side subject pushdown.
 
+Ingest jobs persist checkpoints in `duckdb_nats_ingest_checkpoints`, keyed by
+`(stream_name, durable_name)`. A restarted job with the same durable resumes from
+the last committed sequence rather than replaying from the original start.
+
 ## API Reference
 
 The `nats_scan` table function accepts the following parameters:

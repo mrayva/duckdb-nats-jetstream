@@ -13,7 +13,7 @@ fi
 
 if [ "${RESET_STREAMS:-0}" = "1" ]; then
   echo "Resetting JetStream streams..."
-  for stream in telemetry environmental telemetry_proto events stats_gaps; do
+  for stream in telemetry environmental telemetry_proto events stats_gaps ingest_resume; do
     "$NATS_BIN" stream rm "$stream" --force --server="${NATS_URL}" >/dev/null 2>&1 || true
   done
   for consumer in duckdb_ingest_test duckdb_ingest_test_v1 duckdb_ingest_test_fresh duckdb_ingest_probe3; do
@@ -113,6 +113,27 @@ echo "Created stream: stats_gaps"
 "$NATS_BIN" stream rmm stats_gaps 7 --force --server="${NATS_URL}" >/dev/null
 
 echo "Seeded stream: stats_gaps with deleted sequences 3 and 7"
+
+# Create a small deterministic stream for ingest checkpoint/resume tests
+"$NATS_BIN" stream add ingest_resume \
+  --subjects "ingest_resume.>" \
+  --storage file \
+  --retention limits \
+  --max-msgs=-1 \
+  --max-bytes=-1 \
+  --max-age=7d \
+  --max-msg-size=1048576 \
+  --discard old \
+  --dupe-window=2m \
+  --replicas=1 \
+  --server="${NATS_URL}" \
+  --defaults
+
+echo "Created stream: ingest_resume"
+
+"$NATS_BIN" pub --jetstream --quiet --count 4 --server="${NATS_URL}" ingest_resume.items "resume-test-{{Count}}" >/dev/null
+
+echo "Seeded stream: ingest_resume with 4 messages"
 
 # Create test consumers
 echo "Creating test consumers..."

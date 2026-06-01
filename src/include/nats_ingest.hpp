@@ -31,6 +31,7 @@ struct NatsIngestConfig {
     uint64_t batch_size = 1000;
     int64_t poll_ms = 100;
     int64_t fetch_timeout_ms = 1000;
+    bool resume_from_checkpoint = true;
     vector<string> json_fields;
     string proto_file;
     string proto_message;
@@ -47,6 +48,7 @@ struct NatsIngestProgress {
     uint64_t last_delivered_seq = 0;
     uint64_t rows_inserted = 0;
     uint64_t batches_committed = 0;
+    uint64_t checkpoint_seq = 0;
     string last_error;
 };
 

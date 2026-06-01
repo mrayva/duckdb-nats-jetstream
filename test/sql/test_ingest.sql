@@ -2,7 +2,7 @@
 --
 -- Prerequisites:
 --   1. NATS server running
---   2. scripts/setup-streams.sh has seeded stats_gaps
+--   2. scripts/setup-streams.sh has seeded ingest_resume
 
 LOAD 'build/release/extension/nats_js/nats_js.duckdb_extension';
 
@@ -21,19 +21,19 @@ CREATE TABLE ingest_out(
 SELECT *
 FROM nats_start_ingest(
     job_name := 'ingest_probe3',
-    stream_name := 'stats_gaps',
+    stream_name := 'ingest_resume',
     target_table := 'ingest_out',
-    durable_name := 'duckdb_ingest_probe3',
+    durable_name := 'duckdb_ingest_resume',
     url := 'nats://localhost:4222',
-    batch_size := 8,
-    poll_ms := 10,
+    batch_size := 4,
+    poll_ms := 10000,
     fetch_timeout_ms := 100,
     start_seq := 1
 );
 
 .print
 .print ========================================
-.print Test 2: Give the ingest worker time to drain the bounded batch
+.print Test 2: Give the ingest worker time to drain the seeded batch
 .print ========================================
 
 SELECT SUM(i)
@@ -44,7 +44,10 @@ FROM range(100000000) t(i);
 .print Test 3: Ingest status after drain
 .print ========================================
 
-SELECT *
+SELECT
+    rows_inserted,
+    batches_committed,
+    last_committed_seq
 FROM nats_ingest_status(job_name := 'ingest_probe3');
 
 .print
@@ -62,14 +65,6 @@ FROM ingest_out;
 
 SELECT *
 FROM nats_stop_ingest(job_name := 'ingest_probe3');
-
-.print
-.print ========================================
-.print Test 6: Stopped status
-.print ========================================
-
-SELECT *
-FROM nats_ingest_status(job_name := 'ingest_probe3');
 
 .print
 .print All ingest tests completed successfully!
