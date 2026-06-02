@@ -431,6 +431,19 @@ Ingest jobs persist checkpoints in `duckdb_nats_ingest_checkpoints`, keyed by
 `(stream_name, durable_name)`. A restarted job with the same durable resumes from
 the last committed sequence rather than replaying from the original start.
 
+### Ingest Validation
+
+Use `scripts/run-ingest-harness.sh` for deterministic correctness checks. It
+supports `HARNESS_MODE=resume` and `HARNESS_MODE=redelivery`.
+
+Use `scripts/benchmark-ingest.sh` for timing and throughput measurements. It
+prints CSV and runs both modes by default so you can diff checkpoint/resume
+performance over time.
+
+Both scripts rely on the seeded `ingest_resume` and `ingest_redelivery` streams
+created by `scripts/setup-streams.sh`, so keep the same DuckDB binary and local
+NATS instance when comparing runs.
+
 ## API Reference
 
 The `nats_scan` table function accepts the following parameters:

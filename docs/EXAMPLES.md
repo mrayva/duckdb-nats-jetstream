@@ -363,3 +363,18 @@ FROM nats_scan('telemetry',
 )
 GROUP BY device_id;
 ```
+
+## Validation Scripts
+
+Run the deterministic ingest harness:
+
+```bash
+./scripts/run-ingest-harness.sh
+HARNESS_MODE=redelivery ./scripts/run-ingest-harness.sh
+```
+
+Run the ingest benchmark:
+
+```bash
+./scripts/benchmark-ingest.sh
+```
