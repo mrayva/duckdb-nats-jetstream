@@ -79,6 +79,7 @@ public:
     shared_ptr<NatsIngestJobState> GetJob(const string &job_name);
     vector<shared_ptr<NatsIngestJobState>> ListJobs();
     bool StopJob(const string &job_name);
+    bool RemoveJob(const string &job_name);
 
 private:
     std::mutex mutex_;

@@ -84,6 +84,18 @@ struct NatsIngestSnapshot {
     string stream_name;
     string target_table;
     string durable_name;
+    string nats_url = "nats://localhost:4222";
+    uint64_t start_seq = 1;
+    uint64_t batch_size = 1000;
+    int64_t poll_ms = 100;
+    int64_t fetch_timeout_ms = 1000;
+    bool resume_from_checkpoint = true;
+    string subject_contains;
+    string nats_subject;
+    vector<string> json_fields;
+    string proto_file;
+    string proto_message;
+    vector<string> proto_fields;
     bool running = false;
     bool stop_requested = false;
     bool stopped = false;
@@ -114,6 +126,8 @@ static constexpr const char *NATS_INGEST_CHECKPOINT_TABLE = "duckdb_nats_ingest_
 static constexpr const char *NATS_INGEST_REGISTRY_TABLE = "duckdb_nats_ingest_jobs";
 
 static NatsIngestSnapshot SnapshotJob(const shared_ptr<NatsIngestJobState> &job);
+static NatsIngestConfig SnapshotToConfig(const NatsIngestSnapshot &snapshot);
+static void RunIngestWorker(const shared_ptr<NatsIngestJobState> &job);
 
 static string SqlStringLiteral(const string &value) {
     string result = "'";
@@ -126,6 +140,22 @@ static string SqlStringLiteral(const string &value) {
     }
     result += "'";
     return result;
+}
+
+static string SqlListLiteral(const vector<string> &values) {
+    if (values.empty()) {
+        return "LIST_VALUE()";
+    }
+    std::ostringstream result;
+    result << "LIST_VALUE(";
+    for (idx_t i = 0; i < values.size(); i++) {
+        if (i > 0) {
+            result << ", ";
+        }
+        result << SqlStringLiteral(values[i]);
+    }
+    result << ")";
+    return result.str();
 }
 
 static void ExecuteOrThrow(Connection &conn, const string &sql, const string &action) {
@@ -170,6 +200,18 @@ static void EnsureRegistryTable(Connection &conn) {
         << "stream_name VARCHAR NOT NULL,"
         << "target_table VARCHAR NOT NULL,"
         << "durable_name VARCHAR NOT NULL,"
+        << "nats_url VARCHAR NOT NULL,"
+        << "start_seq UBIGINT NOT NULL,"
+        << "batch_size UBIGINT NOT NULL,"
+        << "poll_ms BIGINT NOT NULL,"
+        << "fetch_timeout_ms BIGINT NOT NULL,"
+        << "resume_from_checkpoint BOOLEAN NOT NULL,"
+        << "subject_contains VARCHAR,"
+        << "nats_subject VARCHAR,"
+        << "json_fields VARCHAR[],"
+        << "proto_file VARCHAR,"
+        << "proto_message VARCHAR,"
+        << "proto_fields VARCHAR[],"
         << "running BOOLEAN NOT NULL,"
         << "stop_requested BOOLEAN NOT NULL,"
         << "stopped BOOLEAN NOT NULL,"
@@ -191,13 +233,27 @@ static void EnsureRegistryTable(Connection &conn) {
 static void UpsertRegistry(Connection &conn, const NatsIngestSnapshot &snapshot) {
     std::ostringstream sql;
     sql << "INSERT INTO " << NATS_INGEST_REGISTRY_TABLE
-        << " (job_name, stream_name, target_table, durable_name, running, stop_requested, stopped, failed, "
-           "last_committed_seq, last_delivered_seq, rows_inserted, batches_committed, sequence_lag, "
-           "last_start_time, last_commit_time, last_error_time, last_error, updated_at) VALUES ("
+        << " (job_name, stream_name, target_table, durable_name, nats_url, start_seq, batch_size, poll_ms, "
+           "fetch_timeout_ms, resume_from_checkpoint, subject_contains, nats_subject, json_fields, proto_file, "
+           "proto_message, proto_fields, running, stop_requested, stopped, failed, last_committed_seq, "
+           "last_delivered_seq, rows_inserted, batches_committed, sequence_lag, last_start_time, last_commit_time, "
+           "last_error_time, last_error, updated_at) VALUES ("
         << SqlStringLiteral(snapshot.job_name) << ", "
         << SqlStringLiteral(snapshot.stream_name) << ", "
         << SqlStringLiteral(snapshot.target_table) << ", "
         << SqlStringLiteral(snapshot.durable_name) << ", "
+        << SqlStringLiteral(snapshot.nats_url) << ", "
+        << snapshot.start_seq << ", "
+        << snapshot.batch_size << ", "
+        << snapshot.poll_ms << ", "
+        << snapshot.fetch_timeout_ms << ", "
+        << (snapshot.resume_from_checkpoint ? "TRUE" : "FALSE") << ", "
+        << (snapshot.subject_contains.empty() ? "NULL" : SqlStringLiteral(snapshot.subject_contains)) << ", "
+        << (snapshot.nats_subject.empty() ? "NULL" : SqlStringLiteral(snapshot.nats_subject)) << ", "
+        << SqlListLiteral(snapshot.json_fields) << ", "
+        << (snapshot.proto_file.empty() ? "NULL" : SqlStringLiteral(snapshot.proto_file)) << ", "
+        << (snapshot.proto_message.empty() ? "NULL" : SqlStringLiteral(snapshot.proto_message)) << ", "
+        << SqlListLiteral(snapshot.proto_fields) << ", "
         << (snapshot.running ? "TRUE" : "FALSE") << ", "
         << (snapshot.stop_requested ? "TRUE" : "FALSE") << ", "
         << (snapshot.stopped ? "TRUE" : "FALSE") << ", "
@@ -216,6 +272,18 @@ static void UpsertRegistry(Connection &conn, const NatsIngestSnapshot &snapshot)
         << "stream_name = excluded.stream_name, "
         << "target_table = excluded.target_table, "
         << "durable_name = excluded.durable_name, "
+        << "nats_url = excluded.nats_url, "
+        << "start_seq = excluded.start_seq, "
+        << "batch_size = excluded.batch_size, "
+        << "poll_ms = excluded.poll_ms, "
+        << "fetch_timeout_ms = excluded.fetch_timeout_ms, "
+        << "resume_from_checkpoint = excluded.resume_from_checkpoint, "
+        << "subject_contains = excluded.subject_contains, "
+        << "nats_subject = excluded.nats_subject, "
+        << "json_fields = excluded.json_fields, "
+        << "proto_file = excluded.proto_file, "
+        << "proto_message = excluded.proto_message, "
+        << "proto_fields = excluded.proto_fields, "
         << "running = excluded.running, "
         << "stop_requested = excluded.stop_requested, "
         << "stopped = excluded.stopped, "
@@ -239,9 +307,11 @@ static void PersistRegistry(Connection &conn, const shared_ptr<NatsIngestJobStat
 
 static bool LoadRegistrySnapshot(Connection &conn, const string &job_name, NatsIngestSnapshot &snapshot) {
     std::ostringstream sql;
-    sql << "SELECT job_name, stream_name, target_table, durable_name, running, stop_requested, stopped, failed, "
-           "last_committed_seq, last_delivered_seq, rows_inserted, batches_committed, sequence_lag, "
-           "last_start_time, last_commit_time, last_error_time, last_error "
+    sql << "SELECT job_name, stream_name, target_table, durable_name, nats_url, start_seq, batch_size, poll_ms, "
+           "fetch_timeout_ms, resume_from_checkpoint, subject_contains, nats_subject, json_fields, proto_file, "
+           "proto_message, proto_fields, running, stop_requested, stopped, failed, last_committed_seq, "
+           "last_delivered_seq, rows_inserted, batches_committed, sequence_lag, last_start_time, last_commit_time, "
+           "last_error_time, last_error "
         << "FROM " << NATS_INGEST_REGISTRY_TABLE << " WHERE job_name = " << SqlStringLiteral(job_name);
 
     auto result = conn.Query(sql.str());
@@ -258,35 +328,65 @@ static bool LoadRegistrySnapshot(Connection &conn, const string &job_name, NatsI
     snapshot.stream_name = chunk->GetValue(1, 0).GetValue<string>();
     snapshot.target_table = chunk->GetValue(2, 0).GetValue<string>();
     snapshot.durable_name = chunk->GetValue(3, 0).GetValue<string>();
-    snapshot.running = chunk->GetValue(4, 0).GetValue<bool>();
-    snapshot.stop_requested = chunk->GetValue(5, 0).GetValue<bool>();
-    snapshot.stopped = chunk->GetValue(6, 0).GetValue<bool>();
-    snapshot.failed = chunk->GetValue(7, 0).GetValue<bool>();
-    snapshot.last_committed_seq = chunk->GetValue(8, 0).GetValue<uint64_t>();
-    snapshot.last_delivered_seq = chunk->GetValue(9, 0).GetValue<uint64_t>();
-    snapshot.rows_inserted = chunk->GetValue(10, 0).GetValue<uint64_t>();
-    snapshot.batches_committed = chunk->GetValue(11, 0).GetValue<uint64_t>();
-    snapshot.sequence_lag = chunk->GetValue(12, 0).GetValue<uint64_t>();
+    snapshot.nats_url = chunk->GetValue(4, 0).GetValue<string>();
+    snapshot.start_seq = chunk->GetValue(5, 0).GetValue<uint64_t>();
+    snapshot.batch_size = chunk->GetValue(6, 0).GetValue<uint64_t>();
+    snapshot.poll_ms = chunk->GetValue(7, 0).GetValue<int64_t>();
+    snapshot.fetch_timeout_ms = chunk->GetValue(8, 0).GetValue<int64_t>();
+    snapshot.resume_from_checkpoint = chunk->GetValue(9, 0).GetValue<bool>();
+    if (!chunk->GetValue(10, 0).IsNull()) {
+        snapshot.subject_contains = chunk->GetValue(10, 0).GetValue<string>();
+    }
+    if (!chunk->GetValue(11, 0).IsNull()) {
+        snapshot.nats_subject = chunk->GetValue(11, 0).GetValue<string>();
+    }
+    if (!chunk->GetValue(12, 0).IsNull()) {
+        for (auto &entry : ListValue::GetChildren(chunk->GetValue(12, 0))) {
+            snapshot.json_fields.push_back(entry.GetValue<string>());
+        }
+    }
     if (!chunk->GetValue(13, 0).IsNull()) {
-        snapshot.last_start_time = chunk->GetValue(13, 0).GetValue<timestamp_t>();
+        snapshot.proto_file = chunk->GetValue(13, 0).GetValue<string>();
     }
     if (!chunk->GetValue(14, 0).IsNull()) {
-        snapshot.last_commit_time = chunk->GetValue(14, 0).GetValue<timestamp_t>();
+        snapshot.proto_message = chunk->GetValue(14, 0).GetValue<string>();
     }
     if (!chunk->GetValue(15, 0).IsNull()) {
-        snapshot.last_error_time = chunk->GetValue(15, 0).GetValue<timestamp_t>();
+        for (auto &entry : ListValue::GetChildren(chunk->GetValue(15, 0))) {
+            snapshot.proto_fields.push_back(entry.GetValue<string>());
+        }
     }
-    if (!chunk->GetValue(16, 0).IsNull()) {
-        snapshot.last_error = chunk->GetValue(16, 0).GetValue<string>();
+    snapshot.running = chunk->GetValue(16, 0).GetValue<bool>();
+    snapshot.stop_requested = chunk->GetValue(17, 0).GetValue<bool>();
+    snapshot.stopped = chunk->GetValue(18, 0).GetValue<bool>();
+    snapshot.failed = chunk->GetValue(19, 0).GetValue<bool>();
+    snapshot.last_committed_seq = chunk->GetValue(20, 0).GetValue<uint64_t>();
+    snapshot.last_delivered_seq = chunk->GetValue(21, 0).GetValue<uint64_t>();
+    snapshot.rows_inserted = chunk->GetValue(22, 0).GetValue<uint64_t>();
+    snapshot.batches_committed = chunk->GetValue(23, 0).GetValue<uint64_t>();
+    snapshot.sequence_lag = chunk->GetValue(24, 0).GetValue<uint64_t>();
+    if (!chunk->GetValue(25, 0).IsNull()) {
+        snapshot.last_start_time = chunk->GetValue(25, 0).GetValue<timestamp_t>();
+    }
+    if (!chunk->GetValue(26, 0).IsNull()) {
+        snapshot.last_commit_time = chunk->GetValue(26, 0).GetValue<timestamp_t>();
+    }
+    if (!chunk->GetValue(27, 0).IsNull()) {
+        snapshot.last_error_time = chunk->GetValue(27, 0).GetValue<timestamp_t>();
+    }
+    if (!chunk->GetValue(28, 0).IsNull()) {
+        snapshot.last_error = chunk->GetValue(28, 0).GetValue<string>();
     }
     return true;
 }
 
 static vector<NatsIngestSnapshot> LoadRegistrySnapshots(Connection &conn) {
     std::ostringstream sql;
-    sql << "SELECT job_name, stream_name, target_table, durable_name, running, stop_requested, stopped, failed, "
-           "last_committed_seq, last_delivered_seq, rows_inserted, batches_committed, sequence_lag, "
-           "last_start_time, last_commit_time, last_error_time, last_error "
+    sql << "SELECT job_name, stream_name, target_table, durable_name, nats_url, start_seq, batch_size, poll_ms, "
+           "fetch_timeout_ms, resume_from_checkpoint, subject_contains, nats_subject, json_fields, proto_file, "
+           "proto_message, proto_fields, running, stop_requested, stopped, failed, last_committed_seq, "
+           "last_delivered_seq, rows_inserted, batches_committed, sequence_lag, last_start_time, last_commit_time, "
+           "last_error_time, last_error "
         << "FROM " << NATS_INGEST_REGISTRY_TABLE << " ORDER BY job_name";
 
     auto result = conn.Query(sql.str());
@@ -302,26 +402,54 @@ static vector<NatsIngestSnapshot> LoadRegistrySnapshots(Connection &conn) {
             snapshot.stream_name = chunk->GetValue(1, row).GetValue<string>();
             snapshot.target_table = chunk->GetValue(2, row).GetValue<string>();
             snapshot.durable_name = chunk->GetValue(3, row).GetValue<string>();
-            snapshot.running = chunk->GetValue(4, row).GetValue<bool>();
-            snapshot.stop_requested = chunk->GetValue(5, row).GetValue<bool>();
-            snapshot.stopped = chunk->GetValue(6, row).GetValue<bool>();
-            snapshot.failed = chunk->GetValue(7, row).GetValue<bool>();
-            snapshot.last_committed_seq = chunk->GetValue(8, row).GetValue<uint64_t>();
-            snapshot.last_delivered_seq = chunk->GetValue(9, row).GetValue<uint64_t>();
-            snapshot.rows_inserted = chunk->GetValue(10, row).GetValue<uint64_t>();
-            snapshot.batches_committed = chunk->GetValue(11, row).GetValue<uint64_t>();
-            snapshot.sequence_lag = chunk->GetValue(12, row).GetValue<uint64_t>();
+            snapshot.nats_url = chunk->GetValue(4, row).GetValue<string>();
+            snapshot.start_seq = chunk->GetValue(5, row).GetValue<uint64_t>();
+            snapshot.batch_size = chunk->GetValue(6, row).GetValue<uint64_t>();
+            snapshot.poll_ms = chunk->GetValue(7, row).GetValue<int64_t>();
+            snapshot.fetch_timeout_ms = chunk->GetValue(8, row).GetValue<int64_t>();
+            snapshot.resume_from_checkpoint = chunk->GetValue(9, row).GetValue<bool>();
+            if (!chunk->GetValue(10, row).IsNull()) {
+                snapshot.subject_contains = chunk->GetValue(10, row).GetValue<string>();
+            }
+            if (!chunk->GetValue(11, row).IsNull()) {
+                snapshot.nats_subject = chunk->GetValue(11, row).GetValue<string>();
+            }
+            if (!chunk->GetValue(12, row).IsNull()) {
+                for (auto &entry : ListValue::GetChildren(chunk->GetValue(12, row))) {
+                    snapshot.json_fields.push_back(entry.GetValue<string>());
+                }
+            }
             if (!chunk->GetValue(13, row).IsNull()) {
-                snapshot.last_start_time = chunk->GetValue(13, row).GetValue<timestamp_t>();
+                snapshot.proto_file = chunk->GetValue(13, row).GetValue<string>();
             }
             if (!chunk->GetValue(14, row).IsNull()) {
-                snapshot.last_commit_time = chunk->GetValue(14, row).GetValue<timestamp_t>();
+                snapshot.proto_message = chunk->GetValue(14, row).GetValue<string>();
             }
             if (!chunk->GetValue(15, row).IsNull()) {
-                snapshot.last_error_time = chunk->GetValue(15, row).GetValue<timestamp_t>();
+                for (auto &entry : ListValue::GetChildren(chunk->GetValue(15, row))) {
+                    snapshot.proto_fields.push_back(entry.GetValue<string>());
+                }
             }
-            if (!chunk->GetValue(16, row).IsNull()) {
-                snapshot.last_error = chunk->GetValue(16, row).GetValue<string>();
+            snapshot.running = chunk->GetValue(16, row).GetValue<bool>();
+            snapshot.stop_requested = chunk->GetValue(17, row).GetValue<bool>();
+            snapshot.stopped = chunk->GetValue(18, row).GetValue<bool>();
+            snapshot.failed = chunk->GetValue(19, row).GetValue<bool>();
+            snapshot.last_committed_seq = chunk->GetValue(20, row).GetValue<uint64_t>();
+            snapshot.last_delivered_seq = chunk->GetValue(21, row).GetValue<uint64_t>();
+            snapshot.rows_inserted = chunk->GetValue(22, row).GetValue<uint64_t>();
+            snapshot.batches_committed = chunk->GetValue(23, row).GetValue<uint64_t>();
+            snapshot.sequence_lag = chunk->GetValue(24, row).GetValue<uint64_t>();
+            if (!chunk->GetValue(25, row).IsNull()) {
+                snapshot.last_start_time = chunk->GetValue(25, row).GetValue<timestamp_t>();
+            }
+            if (!chunk->GetValue(26, row).IsNull()) {
+                snapshot.last_commit_time = chunk->GetValue(26, row).GetValue<timestamp_t>();
+            }
+            if (!chunk->GetValue(27, row).IsNull()) {
+                snapshot.last_error_time = chunk->GetValue(27, row).GetValue<timestamp_t>();
+            }
+            if (!chunk->GetValue(28, row).IsNull()) {
+                snapshot.last_error = chunk->GetValue(28, row).GetValue<string>();
             }
             snapshots.push_back(std::move(snapshot));
         }
@@ -619,6 +747,18 @@ static NatsIngestSnapshot SnapshotJob(const shared_ptr<NatsIngestJobState> &job)
     snapshot.stream_name = job->config.stream_name;
     snapshot.target_table = job->config.target_table;
     snapshot.durable_name = job->config.durable_name;
+    snapshot.nats_url = job->config.nats_url;
+    snapshot.start_seq = job->config.start_seq;
+    snapshot.batch_size = job->config.batch_size;
+    snapshot.poll_ms = job->config.poll_ms;
+    snapshot.fetch_timeout_ms = job->config.fetch_timeout_ms;
+    snapshot.resume_from_checkpoint = job->config.resume_from_checkpoint;
+    snapshot.subject_contains = job->config.subject_contains;
+    snapshot.nats_subject = job->config.nats_subject;
+    snapshot.json_fields = job->config.json_fields;
+    snapshot.proto_file = job->config.proto_file;
+    snapshot.proto_message = job->config.proto_message;
+    snapshot.proto_fields = job->config.proto_fields;
     snapshot.running = job->progress.running;
     snapshot.stop_requested = job->progress.stop_requested;
     snapshot.stopped = job->progress.stopped;
@@ -635,6 +775,27 @@ static NatsIngestSnapshot SnapshotJob(const shared_ptr<NatsIngestJobState> &job)
     snapshot.last_error_time = job->progress.last_error_time;
     snapshot.last_error = job->progress.last_error;
     return snapshot;
+}
+
+static NatsIngestConfig SnapshotToConfig(const NatsIngestSnapshot &snapshot) {
+    NatsIngestConfig config;
+    config.job_name = snapshot.job_name;
+    config.stream_name = snapshot.stream_name;
+    config.target_table = snapshot.target_table;
+    config.durable_name = snapshot.durable_name;
+    config.nats_url = snapshot.nats_url;
+    config.start_seq = snapshot.start_seq;
+    config.batch_size = snapshot.batch_size;
+    config.poll_ms = snapshot.poll_ms;
+    config.fetch_timeout_ms = snapshot.fetch_timeout_ms;
+    config.resume_from_checkpoint = snapshot.resume_from_checkpoint;
+    config.subject_contains = snapshot.subject_contains;
+    config.nats_subject = snapshot.nats_subject;
+    config.json_fields = snapshot.json_fields;
+    config.proto_file = snapshot.proto_file;
+    config.proto_message = snapshot.proto_message;
+    config.proto_fields = snapshot.proto_fields;
+    return config;
 }
 
 static void FillSnapshotColumns(DataChunk &output, idx_t row, const NatsIngestSnapshot &snapshot) {
@@ -714,6 +875,11 @@ static void InitializeJobStateFromConfig(const shared_ptr<NatsIngestJobState> &j
     job->db = context.db;
 }
 
+static void InitializeJobStateFromDatabase(const shared_ptr<NatsIngestJobState> &job, DatabaseInstance &db) {
+    Connection db_connection(db);
+    job->db = db_connection.context->db;
+}
+
 static void InitializeIngestResources(const shared_ptr<NatsIngestJobState> &job) {
     auto &config = job->config;
     Connection db_connection(*job->db);
@@ -786,6 +952,60 @@ static void InitializeIngestResources(const shared_ptr<NatsIngestJobState> &job)
     job->conn = conn;
     job->js = js;
     job->sub = sub;
+}
+
+static shared_ptr<NatsIngestJobState> LaunchIngestJob(const NatsIngestConfig &config, ClientContext *context,
+                                                      DatabaseInstance *db) {
+    auto job = NatsIngestManager::Get().CreateJob(config);
+    try {
+        if (context) {
+            InitializeJobStateFromConfig(job, *context);
+        } else if (db) {
+            InitializeJobStateFromDatabase(job, *db);
+        } else {
+            throw std::runtime_error("Missing database context for ingest job launch");
+        }
+        InitializeIngestResources(job);
+        {
+            Connection db_connection(*job->db);
+            EnsureRegistryTable(db_connection);
+            PersistRegistry(db_connection, job);
+        }
+        job->worker = std::thread([job]() { RunIngestWorker(job); });
+        return job;
+    } catch (...) {
+        NatsIngestManager::Get().RemoveJob(job->config.job_name);
+        throw;
+    }
+}
+
+static void RehydrateActiveIngestJobs(DatabaseInstance &db) {
+    Connection db_connection(db);
+    EnsureRegistryTable(db_connection);
+    auto snapshots = LoadRegistrySnapshots(db_connection);
+    for (const auto &snapshot : snapshots) {
+        if (!snapshot.running || snapshot.stopped || snapshot.failed) {
+            continue;
+        }
+        if (NatsIngestManager::Get().GetJob(snapshot.job_name)) {
+            continue;
+        }
+        auto config = SnapshotToConfig(snapshot);
+        try {
+            LaunchIngestJob(config, nullptr, &db);
+        } catch (const std::exception &ex) {
+            NatsIngestSnapshot failed_snapshot = snapshot;
+            failed_snapshot.running = false;
+            failed_snapshot.stopped = true;
+            failed_snapshot.failed = true;
+            failed_snapshot.last_error_time = Timestamp::GetCurrentTimestamp();
+            failed_snapshot.last_error = string("Failed to rehydrate ingest job: ") + ex.what();
+            try {
+                UpsertRegistry(db_connection, failed_snapshot);
+            } catch (...) {
+            }
+        }
+    }
 }
 
 static TableCatalogEntry &ResolveTargetTable(ClientContext &context, const string &target_table) {
@@ -1319,6 +1539,11 @@ bool NatsIngestManager::StopJob(const string &job_name) {
     return true;
 }
 
+bool NatsIngestManager::RemoveJob(const string &job_name) {
+    lock_guard<std::mutex> guard(mutex_);
+    return jobs_.erase(job_name) > 0;
+}
+
 static unique_ptr<FunctionData> NatsIngestStartBind(ClientContext &context, TableFunctionBindInput &input,
                                                     vector<LogicalType> &return_types, vector<string> &names) {
     auto config = ParseStartConfig(input);
@@ -1341,15 +1566,7 @@ static unique_ptr<FunctionData> NatsIngestStartBind(ClientContext &context, Tabl
 static unique_ptr<GlobalTableFunctionState> NatsIngestStartInitGlobal(ClientContext &context,
                                                                       TableFunctionInitInput &input) {
     auto &bind_data = input.bind_data->Cast<NatsIngestStartBindData>();
-    auto job = NatsIngestManager::Get().CreateJob(bind_data.config);
-    InitializeJobStateFromConfig(job, context);
-    InitializeIngestResources(job);
-    {
-        Connection db_connection(*job->db);
-        EnsureRegistryTable(db_connection);
-        PersistRegistry(db_connection, job);
-    }
-    job->worker = std::thread([job]() { RunIngestWorker(job); });
+    auto job = LaunchIngestJob(bind_data.config, &context, nullptr);
 
     auto state = make_uniq<NatsIngestControlGlobalState>();
     state->jobs.push_back(job);
@@ -1547,6 +1764,12 @@ void NatsIngestFunction::Register(ExtensionLoader &loader) {
 
     TableFunction jobs_fn("nats_ingest_jobs", {}, NatsIngestJobsExecute, NatsIngestJobsBind, NatsIngestJobsInitGlobal);
     loader.RegisterFunction(jobs_fn);
+
+    const char *disable_rehydrate_env = std::getenv("NATS_INGEST_DISABLE_REHYDRATE");
+    bool disable_rehydrate = disable_rehydrate_env != nullptr && string(disable_rehydrate_env) != "0";
+    if (!disable_rehydrate) {
+        RehydrateActiveIngestJobs(loader.GetDatabaseInstance());
+    }
 }
 
 } // namespace duckdb

@@ -60,7 +60,6 @@ bench_mode() {
   local stream="$2"
   local durable="$3"
   local job_a="$4"
-  local job_b="$5"
   local db_file
   local log_file
   local start_ns
@@ -91,17 +90,14 @@ FROM nats_start_ingest(
     fetch_timeout_ms := 100,
     start_seq := 1
 );
-SELECT SUM(i) FROM range(100000000) t(i);
 SELECT 'status1=' || rows_inserted || '/' || batches_committed || '/' || last_committed_seq AS ingest_status
 FROM nats_ingest_status(job_name := '${job_a}');
-SELECT 'stop1=' || job_name || '|' || stream_name || '|' || target_table || '|' || durable_name AS stop_result
-FROM nats_stop_ingest(job_name := '${job_a}');
 SQL
 )
 
   start_ns="$(date +%s%N)"
   set +e
-  "$DUCKDB_BIN" -unsigned "$db_file" -c "$sql_start_a" >"$log_file" 2>&1
+  NATS_INGEST_DISABLE_REHYDRATE=1 "$DUCKDB_BIN" -unsigned "$db_file" -c "$sql_start_a" >"$log_file" 2>&1
   local duckdb_status=$?
   set -e
   if [ "$duckdb_status" -ne 0 ]; then
@@ -122,24 +118,14 @@ SQL
   local sql_start_b
   sql_start_b=$(cat <<SQL
 LOAD '$(sql_escape "$EXTENSION_PATH")';
-SELECT 'start2=' || job_name || '|' || stream_name || '|' || target_table || '|' || durable_name AS start_result
-FROM nats_start_ingest(
-    job_name := '${job_b}',
-    stream_name := '${stream}',
-    target_table := 'ingest_out',
-    durable_name := '${durable}',
-    url := '${NATS_URL}',
-    batch_size := 4,
-    poll_ms := 10000,
-    fetch_timeout_ms := 100,
-    start_seq := 1
-);
+SELECT 'status1=' || running || '/' || rows_inserted || '/' || last_committed_seq || '/' || failed || '/' || stopped AS ingest_status
+FROM nats_ingest_status(job_name := '${job_a}');
 SELECT SUM(i) FROM range(100000000) t(i);
 SELECT 'status2=' || rows_inserted || '/' || batches_committed || '/' || last_committed_seq AS ingest_status
-FROM nats_ingest_status(job_name := '${job_b}');
+FROM nats_ingest_status(job_name := '${job_a}');
 SELECT 'count=' || COUNT(*) AS inserted_rows FROM ingest_out;
 SELECT 'stop2=' || job_name || '|' || stream_name || '|' || target_table || '|' || durable_name AS stop_result
-FROM nats_stop_ingest(job_name := '${job_b}');
+FROM nats_stop_ingest(job_name := '${job_a}');
 SQL
 )
 
@@ -155,6 +141,12 @@ SQL
   end_ns="$(date +%s%N)"
   second_ms="$(((end_ns - start_ns) / 1000000))"
   total_ms="$((first_ms + second_ms))"
+
+  if ! grep -Fq "status1=true/4/4/false/false" "$log_file"; then
+    echo "Missing expected rehydrate status for mode $mode" >&2
+    tail -n 80 "$log_file" >&2
+    exit 1
+  fi
 
   if ! grep -Fq "status2=8/2/8" "$log_file"; then
     echo "Missing expected resumed status for mode $mode" >&2

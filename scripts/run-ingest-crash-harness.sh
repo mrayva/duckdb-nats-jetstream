@@ -54,9 +54,9 @@ run_duckdb() {
   local fail_env="${4:-}"
   set +e
   if [ -n "$fail_env" ]; then
-    env "$fail_env" "$DUCKDB_BIN" -unsigned "$db_file" -c "$sql" >"$log_file" 2>&1
+    env NATS_INGEST_DISABLE_REHYDRATE=1 "$fail_env" "$DUCKDB_BIN" -unsigned "$db_file" -c "$sql" >"$log_file" 2>&1
   else
-    "$DUCKDB_BIN" -unsigned "$db_file" -c "$sql" >"$log_file" 2>&1
+    NATS_INGEST_DISABLE_REHYDRATE=1 "$DUCKDB_BIN" -unsigned "$db_file" -c "$sql" >"$log_file" 2>&1
   fi
   local duckdb_status=$?
   set -e
