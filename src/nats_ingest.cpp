@@ -1,13 +1,17 @@
 #include "nats_ingest.hpp"
 #include "nats_message_decode.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/catalog/catalog.hpp"
+#include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/common/types/timestamp.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/appender.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
+#include "duckdb/parser/qualified_name.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
+#include "duckdb/transaction/transaction.hpp"
 #include "duckdb/common/types/vector.hpp"
 #include "yyjson.hpp"
 #include <algorithm>
@@ -119,6 +123,18 @@ static void ExecuteOrThrow(Connection &conn, const string &sql, const string &ac
     if (result->HasError()) {
         throw std::runtime_error(action + ": " + result->GetError());
     }
+}
+
+static void EnsureActiveTransaction(Connection &conn) {
+    if (!conn.HasActiveTransaction()) {
+        conn.BeginTransaction();
+    }
+}
+
+static void MarkTransactionWrite(Connection &conn) {
+    auto &catalog = Catalog::GetCatalog(*conn.context, INVALID_CATALOG);
+    auto &transaction = Transaction::Get(*conn.context, catalog);
+    transaction.SetReadWrite();
 }
 
 static void EnsureCheckpointTable(Connection &conn) {
@@ -566,12 +582,11 @@ static void InitializeIngestResources(const shared_ptr<NatsIngestJobState> &job)
     job->sub = sub;
 }
 
-static pair<string, string> SplitTargetTableName(const string &target_table) {
-    auto dot = target_table.rfind('.');
-    if (dot == string::npos) {
-        return {string(), target_table};
-    }
-    return {target_table.substr(0, dot), target_table.substr(dot + 1)};
+static TableCatalogEntry &ResolveTargetTable(ClientContext &context, const string &target_table) {
+    auto qualified_name = QualifiedName::Parse(target_table);
+    auto &entry = Catalog::GetEntry(context, CatalogType::TABLE_ENTRY, qualified_name.catalog, qualified_name.schema,
+                                    qualified_name.name);
+    return entry.Cast<TableCatalogEntry>();
 }
 
 static uint64_t GetMessageSequence(natsMsg *msg) {
@@ -588,35 +603,37 @@ static uint64_t GetMessageSequence(natsMsg *msg) {
     return stream_seq;
 }
 
-static void AppendJsonFields(Appender &appender, const NatsIngestConfig &config, const char *msg_data, int data_len) {
+static void AppendJsonFields(DataChunk &chunk, idx_t row_idx, const NatsIngestConfig &config, const char *msg_data,
+                             int data_len) {
     yyjson_doc *doc = yyjson_read(msg_data, data_len, 0);
     if (!doc) {
         for (idx_t i = 0; i < config.json_fields.size(); i++) {
-            appender.Append(Value());
+            chunk.SetValue(5 + i, row_idx, Value());
         }
         return;
     }
 
     yyjson_val *root = yyjson_doc_get_root(doc);
+    idx_t col_idx = 5;
     for (const auto &field_name : config.json_fields) {
         yyjson_val *field_val = yyjson_obj_get(root, field_name.c_str());
         if (!field_val) {
-            appender.Append(Value());
+            chunk.SetValue(col_idx++, row_idx, Value());
         } else if (yyjson_is_str(field_val)) {
-            appender.Append(Value(yyjson_get_str(field_val)));
+            chunk.SetValue(col_idx++, row_idx, Value(yyjson_get_str(field_val)));
         } else if (yyjson_is_num(field_val)) {
-            appender.Append(Value(yyjson_get_num(field_val)));
+            chunk.SetValue(col_idx++, row_idx, Value(yyjson_get_num(field_val)));
         } else if (yyjson_is_bool(field_val)) {
-            appender.Append(Value::BOOLEAN(yyjson_get_bool(field_val)));
+            chunk.SetValue(col_idx++, row_idx, Value::BOOLEAN(yyjson_get_bool(field_val)));
         } else if (yyjson_is_null(field_val)) {
-            appender.Append(Value());
+            chunk.SetValue(col_idx++, row_idx, Value());
         } else {
             char *json_str = yyjson_val_write(field_val, 0, nullptr);
             if (json_str) {
-                appender.Append(Value(json_str));
+                chunk.SetValue(col_idx++, row_idx, Value(json_str));
                 free(json_str);
             } else {
-                appender.Append(Value());
+                chunk.SetValue(col_idx++, row_idx, Value());
             }
         }
     }
@@ -624,21 +641,23 @@ static void AppendJsonFields(Appender &appender, const NatsIngestConfig &config,
     yyjson_doc_free(doc);
 }
 
-static void AppendProtoFields(Appender &appender, const NatsIngestConfig &config, Message *proto_msg, const char *msg_data,
-                              int data_len) {
+static void AppendProtoFields(DataChunk &chunk, idx_t row_idx, const NatsIngestConfig &config, Message *proto_msg,
+                              const char *msg_data, int data_len) {
     if (!proto_msg || !proto_msg->ParseFromArray(msg_data, data_len)) {
         for (idx_t i = 0; i < config.proto_fields.size(); i++) {
-            appender.Append(Value());
+            chunk.SetValue(5 + i, row_idx, Value());
         }
         return;
     }
 
+    idx_t col_idx = 5;
     for (const auto &field_path : config.proto_field_paths) {
-        appender.Append(ExtractProtobufValue(proto_msg, field_path));
+        chunk.SetValue(col_idx++, row_idx, ExtractProtobufValue(proto_msg, field_path));
     }
 }
 
-static void AppendMessageRow(Appender &appender, const NatsIngestConfig &config, natsMsg *msg, Message *proto_msg) {
+static void AppendMessageRow(DataChunk &chunk, idx_t row_idx, const NatsIngestConfig &config, natsMsg *msg,
+                             Message *proto_msg) {
     const char *subject = natsMsg_GetSubject(msg);
     uint64_t stream_seq = GetMessageSequence(msg);
     int64_t timestamp_ns = 0;
@@ -658,29 +677,27 @@ static void AppendMessageRow(Appender &appender, const NatsIngestConfig &config,
     int data_len = natsMsg_GetDataLength(msg);
     bool payload_as_varchar = !config.json_fields.empty();
 
-    appender.BeginRow();
-    appender.Append(Value(config.stream_name));
-    appender.Append(Value(subject ? subject : ""));
-    appender.Append(Value::UBIGINT(stream_seq));
+    chunk.SetValue(0, row_idx, Value(config.stream_name));
+    chunk.SetValue(1, row_idx, Value(subject ? subject : ""));
+    chunk.SetValue(2, row_idx, Value::UBIGINT(stream_seq));
     if (timestamp_ns > 0) {
-        appender.Append(Value::TIMESTAMP(timestamp_t(timestamp_ns / 1000)));
+        chunk.SetValue(3, row_idx, Value::TIMESTAMP(timestamp_t(timestamp_ns / 1000)));
     } else {
-        appender.Append(Value());
+        chunk.SetValue(3, row_idx, Value());
     }
 
     if (payload_as_varchar) {
-        appender.Append(Value(string(msg_data ? msg_data : "", data_len)));
+        chunk.SetValue(4, row_idx, Value(string(msg_data ? msg_data : "", data_len)));
     } else {
         auto blob_ptr = data_len > 0 && msg_data ? const_data_ptr_cast(msg_data) : nullptr;
-        appender.Append(Value::BLOB(blob_ptr, data_len));
+        chunk.SetValue(4, row_idx, Value::BLOB(blob_ptr, data_len));
     }
 
     if (!config.json_fields.empty()) {
-        AppendJsonFields(appender, config, msg_data, data_len);
+        AppendJsonFields(chunk, row_idx, config, msg_data, data_len);
     } else if (!config.proto_fields.empty()) {
-        AppendProtoFields(appender, config, proto_msg, msg_data, data_len);
+        AppendProtoFields(chunk, row_idx, config, proto_msg, msg_data, data_len);
     }
-    appender.EndRow();
 }
 
 static void RunIngestWorker(const shared_ptr<NatsIngestJobState> &job) {
@@ -711,13 +728,14 @@ static void RunIngestWorker(const shared_ptr<NatsIngestJobState> &job) {
         }
         job->cv.notify_all();
 
-        pair<string, string> table_name = SplitTargetTableName(config.target_table);
-        std::unique_ptr<Appender> appender;
-        if (table_name.first.empty()) {
-            appender = make_uniq<Appender>(db_connection, table_name.second);
-        } else {
-            appender = make_uniq<Appender>(db_connection, table_name.first, table_name.second);
-        }
+        EnsureActiveTransaction(db_connection);
+        MarkTransactionWrite(db_connection);
+        auto &table = ResolveTargetTable(*db_connection.context, config.target_table);
+        std::unique_ptr<InternalAppender> appender = make_uniq<InternalAppender>(*db_connection.context, table);
+
+        DataChunk write_chunk;
+        write_chunk.Initialize(Allocator::Get(*db_connection.context), appender->GetActiveTypes(), STANDARD_VECTOR_SIZE);
+        idx_t write_row = 0;
 
         natsSubscription *sub = nullptr;
         {
@@ -773,9 +791,12 @@ static void RunIngestWorker(const shared_ptr<NatsIngestJobState> &job) {
             std::vector<natsMsg *> ack_msgs;
             ack_msgs.reserve(fetched_msgs.Count);
             uint64_t batch_last_delivered_seq = 0;
+            string batch_stage = "begin";
 
             try {
-                db_connection.BeginTransaction();
+                batch_stage = "ensure transaction";
+                EnsureActiveTransaction(db_connection);
+                MarkTransactionWrite(db_connection);
                 idx_t inserted_rows = 0;
                 NatsIngestProgress progress_snapshot;
                 {
@@ -804,16 +825,47 @@ static void RunIngestWorker(const shared_ptr<NatsIngestJobState> &job) {
                     }
 
                     if (!proto_template) {
-                        AppendMessageRow(*appender, config, msg, nullptr);
+                        batch_stage = "append row";
+                        AppendMessageRow(write_chunk, write_row, config, msg, nullptr);
                     } else {
                         std::unique_ptr<Message> row_proto(proto_template->New());
-                        AppendMessageRow(*appender, config, msg, row_proto.get());
+                        batch_stage = "append proto row";
+                        AppendMessageRow(write_chunk, write_row, config, msg, row_proto.get());
                     }
+                    write_row++;
+                    write_chunk.SetCardinality(write_row);
                     inserted_rows++;
+
+                    if (write_row == write_chunk.GetCapacity()) {
+                        batch_stage = "append chunk";
+                        try {
+                            appender->AppendDataChunk(write_chunk);
+                        } catch (const std::exception &ex) {
+                            throw std::runtime_error(string("Failed to append ingest chunk: ") + ex.what());
+                        }
+                        write_chunk.Reset();
+                        write_row = 0;
+                    }
+                }
+
+                if (write_row > 0) {
+                    batch_stage = "append final chunk";
+                    try {
+                        appender->AppendDataChunk(write_chunk);
+                    } catch (const std::exception &ex) {
+                        throw std::runtime_error(string("Failed to append final ingest chunk: ") + ex.what());
+                    }
+                    write_chunk.Reset();
+                    write_row = 0;
                 }
 
                 if (inserted_rows > 0) {
-                    appender->Flush();
+                    batch_stage = "flush appender";
+                    try {
+                        appender->Flush();
+                    } catch (const std::exception &ex) {
+                        throw std::runtime_error(string("Failed to flush ingest appender: ") + ex.what());
+                    }
                 }
 
                 uint64_t committed_rows = progress_snapshot.rows_inserted + inserted_rows;
@@ -826,9 +878,19 @@ static void RunIngestWorker(const shared_ptr<NatsIngestJobState> &job) {
                     batch_last_delivered_seq = committed_seq;
                 }
 
-                UpsertCheckpoint(db_connection, *job, committed_seq, batch_last_delivered_seq, committed_rows,
-                                 committed_batches);
-                db_connection.Commit();
+                try {
+                    batch_stage = "commit transaction";
+                    db_connection.Commit();
+                } catch (const std::exception &ex) {
+                    throw std::runtime_error(string("Failed to commit ingest transaction: ") + ex.what());
+                }
+                try {
+                    batch_stage = "write checkpoint";
+                    UpsertCheckpoint(db_connection, *job, committed_seq, batch_last_delivered_seq, committed_rows,
+                                     committed_batches);
+                } catch (const std::exception &ex) {
+                    throw std::runtime_error(string("Failed to write ingest checkpoint: ") + ex.what());
+                }
 
                 {
                     lock_guard<std::mutex> guard(job->job_mutex);
@@ -854,6 +916,18 @@ static void RunIngestWorker(const shared_ptr<NatsIngestJobState> &job) {
                     natsMsg_Destroy(msg);
                 }
 
+            } catch (const std::exception &ex) {
+                try {
+                    db_connection.Rollback();
+                } catch (...) {
+                }
+                for (auto *msg : ack_msgs) {
+                    if (msg) {
+                        natsMsg_Destroy(msg);
+                    }
+                }
+                natsMsgList_Destroy(&fetched_msgs);
+                throw std::runtime_error("Ingest failed at stage '" + batch_stage + "': " + ex.what());
             } catch (...) {
                 try {
                     db_connection.Rollback();
@@ -865,7 +939,7 @@ static void RunIngestWorker(const shared_ptr<NatsIngestJobState> &job) {
                     }
                 }
                 natsMsgList_Destroy(&fetched_msgs);
-                throw;
+                throw std::runtime_error("Ingest failed at stage '" + batch_stage + "': unknown exception");
             }
 
             natsMsgList_Destroy(&fetched_msgs);
