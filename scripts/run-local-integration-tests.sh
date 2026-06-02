@@ -99,4 +99,11 @@ RESET_STREAMS=1 \
 "$ROOT_DIR/scripts/run-ingest-harness.sh"
 echo "PASS scripts/run-ingest-harness.sh (HARNESS_MODE=redelivery)"
 
+echo "RUN scripts/run-ingest-crash-harness.sh"
+NATS_URL="$NATS_URL" \
+NATS_CLI="$NATS_CLI" \
+RESET_STREAMS=1 \
+"$ROOT_DIR/scripts/run-ingest-crash-harness.sh"
+echo "PASS scripts/run-ingest-crash-harness.sh"
+
 echo "All local integration tests passed"

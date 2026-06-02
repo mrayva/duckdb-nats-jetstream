@@ -16,6 +16,7 @@
 #include "yyjson.hpp"
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <filesystem>
 #include <sstream>
 #include <unordered_set>
@@ -705,6 +706,9 @@ static void RunIngestWorker(const shared_ptr<NatsIngestJobState> &job) {
     try {
         auto &config = job->config;
         Connection db_connection(*job->db);
+        const char *fail_after_commit_env = std::getenv("NATS_INGEST_FAIL_AFTER_COMMIT");
+        bool inject_fail_after_commit = fail_after_commit_env != nullptr && string(fail_after_commit_env) != "0";
+        bool injected_fail_after_commit = false;
 
         shared_ptr<DiskSourceTree> source_tree;
         shared_ptr<ProtobufErrorCollector> error_collector;
@@ -940,6 +944,11 @@ static void RunIngestWorker(const shared_ptr<NatsIngestJobState> &job) {
                     job->progress.last_delivered_seq = batch_last_delivered_seq;
                     job->progress.checkpoint_seq = committed_seq;
                     job->cv.notify_all();
+                }
+
+                if (inject_fail_after_commit && !injected_fail_after_commit) {
+                    injected_fail_after_commit = true;
+                    std::abort();
                 }
 
                 for (auto *msg : ack_msgs) {
