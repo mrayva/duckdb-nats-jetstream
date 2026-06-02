@@ -18,6 +18,7 @@
 #include <chrono>
 #include <filesystem>
 #include <sstream>
+#include <unordered_set>
 #include <nats/nats.h>
 #include <google/protobuf/compiler/importer.h>
 #include <google/protobuf/dynamic_message.h>
@@ -792,6 +793,8 @@ static void RunIngestWorker(const shared_ptr<NatsIngestJobState> &job) {
             ack_msgs.reserve(fetched_msgs.Count);
             uint64_t batch_last_delivered_seq = 0;
             string batch_stage = "begin";
+            std::unordered_set<uint64_t> batch_seen_sequences;
+            batch_seen_sequences.reserve(static_cast<size_t>(fetched_msgs.Count));
 
             try {
                 batch_stage = "ensure transaction";
@@ -815,6 +818,14 @@ static void RunIngestWorker(const shared_ptr<NatsIngestJobState> &job) {
 
                     uint64_t msg_seq = GetMessageSequence(msg);
                     batch_last_delivered_seq = std::max(batch_last_delivered_seq, msg_seq);
+                    if (msg_seq != 0) {
+                        if (msg_seq <= progress_snapshot.last_committed_seq) {
+                            continue;
+                        }
+                        if (!batch_seen_sequences.insert(msg_seq).second) {
+                            continue;
+                        }
+                    }
 
                     const char *subject = natsMsg_GetSubject(msg);
                     if (!config.subject_contains.empty() &&
@@ -846,6 +857,35 @@ static void RunIngestWorker(const shared_ptr<NatsIngestJobState> &job) {
                         write_chunk.Reset();
                         write_row = 0;
                     }
+                }
+
+                {
+                    lock_guard<std::mutex> guard(job->job_mutex);
+                    job->progress.last_delivered_seq = std::max(job->progress.last_delivered_seq, batch_last_delivered_seq);
+                }
+
+                if (inserted_rows == 0) {
+                    batch_stage = "rollback empty batch";
+                    try {
+                        db_connection.Rollback();
+                    } catch (const std::exception &ex) {
+                        throw std::runtime_error(string("Failed to rollback empty ingest transaction: ") + ex.what());
+                    }
+                    for (auto *msg : ack_msgs) {
+                        if (!msg) {
+                            continue;
+                        }
+                        jsErrCode ack_err = static_cast<jsErrCode>(0);
+                        s = natsMsg_AckSync(msg, nullptr, &ack_err);
+                        if (s != NATS_OK) {
+                            natsMsg_Destroy(msg);
+                            throw std::runtime_error(std::string("Failed to ack JetStream message from '") +
+                                                     config.stream_name + "': " + natsStatus_GetText(s));
+                        }
+                        natsMsg_Destroy(msg);
+                    }
+                    natsMsgList_Destroy(&fetched_msgs);
+                    continue;
                 }
 
                 if (write_row > 0) {
