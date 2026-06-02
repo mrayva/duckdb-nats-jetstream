@@ -2,6 +2,7 @@
 
 #include "duckdb.hpp"
 #include "duckdb/function/table_function.hpp"
+#include "duckdb/common/types/timestamp.hpp"
 #include <google/protobuf/descriptor.h>
 #include <condition_variable>
 #include <mutex>
@@ -49,6 +50,9 @@ struct NatsIngestProgress {
     uint64_t rows_inserted = 0;
     uint64_t batches_committed = 0;
     uint64_t checkpoint_seq = 0;
+    timestamp_t last_start_time;
+    timestamp_t last_commit_time;
+    timestamp_t last_error_time;
     string last_error;
 };
 

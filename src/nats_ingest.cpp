@@ -102,6 +102,10 @@ struct NatsIngestSnapshot {
     uint64_t last_delivered_seq = 0;
     uint64_t rows_inserted = 0;
     uint64_t batches_committed = 0;
+    uint64_t sequence_lag = 0;
+    timestamp_t last_start_time;
+    timestamp_t last_commit_time;
+    timestamp_t last_error_time;
     string last_error;
 };
 
@@ -453,6 +457,12 @@ static NatsIngestSnapshot SnapshotJob(const shared_ptr<NatsIngestJobState> &job)
     snapshot.last_delivered_seq = job->progress.last_delivered_seq;
     snapshot.rows_inserted = job->progress.rows_inserted;
     snapshot.batches_committed = job->progress.batches_committed;
+    snapshot.sequence_lag = snapshot.last_delivered_seq > snapshot.last_committed_seq
+                                ? snapshot.last_delivered_seq - snapshot.last_committed_seq
+                                : 0;
+    snapshot.last_start_time = job->progress.last_start_time;
+    snapshot.last_commit_time = job->progress.last_commit_time;
+    snapshot.last_error_time = job->progress.last_error_time;
     snapshot.last_error = job->progress.last_error;
     return snapshot;
 }
@@ -470,10 +480,26 @@ static void FillSnapshotColumns(DataChunk &output, idx_t row, const NatsIngestSn
     output.SetValue(9, row, Value::UBIGINT(snapshot.last_delivered_seq));
     output.SetValue(10, row, Value::UBIGINT(snapshot.rows_inserted));
     output.SetValue(11, row, Value::UBIGINT(snapshot.batches_committed));
-    if (snapshot.last_error.empty()) {
-        FlatVector::SetNull(output.data[12], row, true);
+    output.SetValue(12, row, Value::UBIGINT(snapshot.sequence_lag));
+    if (snapshot.last_start_time.value == 0) {
+        FlatVector::SetNull(output.data[13], row, true);
     } else {
-        output.SetValue(12, row, Value(snapshot.last_error));
+        output.SetValue(13, row, Value::TIMESTAMP(snapshot.last_start_time));
+    }
+    if (snapshot.last_commit_time.value == 0) {
+        FlatVector::SetNull(output.data[14], row, true);
+    } else {
+        output.SetValue(14, row, Value::TIMESTAMP(snapshot.last_commit_time));
+    }
+    if (snapshot.last_error_time.value == 0) {
+        FlatVector::SetNull(output.data[15], row, true);
+    } else {
+        output.SetValue(15, row, Value::TIMESTAMP(snapshot.last_error_time));
+    }
+    if (snapshot.last_error.empty()) {
+        FlatVector::SetNull(output.data[16], row, true);
+    } else {
+        output.SetValue(16, row, Value(snapshot.last_error));
     }
 }
 
@@ -502,6 +528,14 @@ static void AddSnapshotColumns(vector<LogicalType> &return_types, vector<string>
     return_types.emplace_back(LogicalType(LogicalTypeId::UBIGINT));
     names.emplace_back("batches_committed");
     return_types.emplace_back(LogicalType(LogicalTypeId::UBIGINT));
+    names.emplace_back("sequence_lag");
+    return_types.emplace_back(LogicalType(LogicalTypeId::UBIGINT));
+    names.emplace_back("last_start_time");
+    return_types.emplace_back(LogicalType(LogicalTypeId::TIMESTAMP));
+    names.emplace_back("last_commit_time");
+    return_types.emplace_back(LogicalType(LogicalTypeId::TIMESTAMP));
+    names.emplace_back("last_error_time");
+    return_types.emplace_back(LogicalType(LogicalTypeId::TIMESTAMP));
     names.emplace_back("last_error");
     return_types.emplace_back(LogicalType(LogicalTypeId::VARCHAR));
 }
@@ -730,6 +764,7 @@ static void RunIngestWorker(const shared_ptr<NatsIngestJobState> &job) {
             job->progress.stopped = false;
             job->progress.failed = false;
             job->progress.last_error.clear();
+            job->progress.last_start_time = Timestamp::GetCurrentTimestamp();
         }
         job->cv.notify_all();
 
@@ -943,6 +978,7 @@ static void RunIngestWorker(const shared_ptr<NatsIngestJobState> &job) {
                     job->progress.last_committed_seq = committed_seq;
                     job->progress.last_delivered_seq = batch_last_delivered_seq;
                     job->progress.checkpoint_seq = committed_seq;
+                    job->progress.last_commit_time = Timestamp::GetCurrentTimestamp();
                     job->cv.notify_all();
                 }
 
@@ -1005,6 +1041,7 @@ static void RunIngestWorker(const shared_ptr<NatsIngestJobState> &job) {
         job->progress.running = false;
         job->progress.stopped = true;
         job->progress.failed = true;
+        job->progress.last_error_time = Timestamp::GetCurrentTimestamp();
         job->progress.last_error = ex.what();
         job->cv.notify_all();
     } catch (...) {
@@ -1012,6 +1049,7 @@ static void RunIngestWorker(const shared_ptr<NatsIngestJobState> &job) {
         job->progress.running = false;
         job->progress.stopped = true;
         job->progress.failed = true;
+        job->progress.last_error_time = Timestamp::GetCurrentTimestamp();
         job->progress.last_error = "Unknown ingest worker failure";
         job->cv.notify_all();
     }
