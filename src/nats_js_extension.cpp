@@ -8,6 +8,7 @@ namespace duckdb {
 void NatsJsExtension::Load(ExtensionLoader &loader) {
     NatsScanFunction::Register(loader);
     NatsStreamStatsFunction::Register(loader);
+    NatsCopyFunction::Register(loader);
     NatsIngestFunction::Register(loader);
 }
 
@@ -16,7 +17,7 @@ std::string NatsJsExtension::Name() {
 }
 
 std::string NatsJsExtension::Version() const {
-    return "0.2.1";
+    return "0.2.2";
 }
 
 } // namespace duckdb

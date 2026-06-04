@@ -120,6 +120,13 @@ RESET_STREAMS=1 \
 "$ROOT_DIR/scripts/run-ingest-pause-resume-harness.sh"
 echo "PASS scripts/run-ingest-pause-resume-harness.sh"
 
+echo "RUN scripts/run-copy-harness.sh"
+NATS_URL="$NATS_URL" \
+NATS_CLI="$NATS_CLI" \
+RESET_STREAMS=1 \
+"$ROOT_DIR/scripts/run-copy-harness.sh"
+echo "PASS scripts/run-copy-harness.sh"
+
 echo "RUN scripts/run-ingest-rehydrate-harness.sh"
 NATS_URL="$NATS_URL" \
 NATS_CLI="$NATS_CLI" \

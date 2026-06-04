@@ -82,7 +82,14 @@ FROM nats_ingest_status(job_name := 'ingest_pause_resume');
 
 SELECT * FROM nats_pause_ingest(job_name := 'ingest_pause_resume');
 SELECT * FROM nats_resume_ingest(job_name := 'ingest_pause_resume');
+
+COPY ingest_out
+FROM 'ingest_resume'
+(FORMAT nats_js, url 'nats://127.0.0.1:4222');
 ```
+
+The `nats_js` copy format uses the same source layout as `nats_scan`, so the
+target table should match the standard ingest column order and types.
 
 ## JSON Message Processing
 

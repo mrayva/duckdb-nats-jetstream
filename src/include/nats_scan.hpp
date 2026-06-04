@@ -17,4 +17,9 @@ public:
     static void Register(ExtensionLoader &loader);
 };
 
+class NatsCopyFunction {
+public:
+    static void Register(ExtensionLoader &loader);
+};
+
 } // namespace duckdb

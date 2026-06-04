@@ -448,6 +448,11 @@ it exercises `nats_pause_ingest`, `nats_resume_ingest`, and the richer status
 fields such as `paused`, `pause_requested`, `fetches_completed`, and
 `last_batch_rows`.
 
+For a SQL-native write path, the extension also exposes a `nats_js` `COPY FROM`
+format that reuses the same source schema as `nats_scan`. It is intended for
+`COPY target FROM 'stream_name' (FORMAT nats_js, url '...')` when the target
+table matches the scan output layout.
+
 Both scripts rely on the seeded `ingest_resume` and `ingest_redelivery` streams
 created by `scripts/setup-streams.sh`, so keep the same DuckDB binary and local
 NATS instance when comparing runs.

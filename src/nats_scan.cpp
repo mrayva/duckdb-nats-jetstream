@@ -1,6 +1,8 @@
 #include "nats_scan.hpp"
 #include "nats_message_decode.hpp"
+#include "duckdb/function/copy_function.hpp"
 #include "duckdb/function/table_function.hpp"
+#include "duckdb/parser/parsed_data/copy_info.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/common/types/timestamp.hpp"
@@ -12,6 +14,7 @@
 #include <google/protobuf/descriptor.h>
 #include <filesystem>
 #include <algorithm>
+#include <optional>
 #include <cstring>
 
 // Windows defines GetMessage as a macro (GetMessageA/GetMessageW)
@@ -100,6 +103,97 @@ struct NatsScanBindData : public TableFunctionData {
         , fetch_timeout_ms(fetch_timeout) {
     }
 };
+
+static const FieldDescriptor *GetFieldDescriptorForPath(const Descriptor *message_desc, const string &field_path);
+
+struct NatsSourceSchema {
+    vector<string> names;
+    vector<LogicalType> return_types;
+};
+
+struct NatsCopyBindData : public TableFunctionData {
+    unique_ptr<NatsScanBindData> scan_bind_data;
+};
+
+static std::optional<string> GetCopyOptionString(const case_insensitive_map_t<vector<Value>> &options,
+                                                 const string &name) {
+    auto it = options.find(name);
+    if (it == options.end() || it->second.empty()) {
+        return std::nullopt;
+    }
+    return StringValue::Get(it->second.front());
+}
+
+static uint64_t GetCopyOptionUBigInt(const case_insensitive_map_t<vector<Value>> &options, const string &name,
+                                     uint64_t default_value) {
+    auto it = options.find(name);
+    if (it == options.end() || it->second.empty()) {
+        return default_value;
+    }
+    return UBigIntValue::Get(it->second.front());
+}
+
+static int64_t GetCopyOptionBigInt(const case_insensitive_map_t<vector<Value>> &options, const string &name,
+                                   int64_t default_value) {
+    auto it = options.find(name);
+    if (it == options.end() || it->second.empty()) {
+        return default_value;
+    }
+    return BigIntValue::Get(it->second.front());
+}
+
+static vector<string> GetCopyOptionStringList(const case_insensitive_map_t<vector<Value>> &options, const string &name) {
+    vector<string> result;
+    auto it = options.find(name);
+    if (it == options.end()) {
+        return result;
+    }
+    for (auto &child : it->second) {
+        result.push_back(StringValue::Get(child));
+    }
+    return result;
+}
+
+static NatsSourceSchema BuildNatsSourceSchema(const vector<string> &json_fields, const string &proto_file,
+                                              const string &proto_message, const vector<string> &proto_fields,
+                                              const Descriptor *descriptor) {
+    NatsSourceSchema schema;
+    schema.names.emplace_back("stream");
+    schema.return_types.emplace_back(LogicalType(LogicalTypeId::VARCHAR));
+    schema.names.emplace_back("subject");
+    schema.return_types.emplace_back(LogicalType(LogicalTypeId::VARCHAR));
+    schema.names.emplace_back("seq");
+    schema.return_types.emplace_back(LogicalType(LogicalTypeId::UBIGINT));
+    schema.names.emplace_back("ts_nats");
+    schema.return_types.emplace_back(LogicalType(LogicalTypeId::TIMESTAMP));
+
+    schema.names.emplace_back("payload");
+    if (!proto_fields.empty() || json_fields.empty()) {
+        schema.return_types.emplace_back(LogicalType(LogicalTypeId::BLOB));
+    } else {
+        schema.return_types.emplace_back(LogicalType(LogicalTypeId::VARCHAR));
+    }
+
+    for (const auto &field : json_fields) {
+        schema.names.emplace_back(field);
+        schema.return_types.emplace_back(LogicalType(LogicalTypeId::VARCHAR));
+    }
+
+    for (const auto &field_path : proto_fields) {
+        string column_name = field_path;
+        std::replace(column_name.begin(), column_name.end(), '.', '_');
+        schema.names.emplace_back(column_name);
+
+        const FieldDescriptor *field_desc = GetFieldDescriptorForPath(descriptor, field_path);
+        if (field_desc) {
+            schema.return_types.emplace_back(ProtobufFieldDescriptorToDuckDBType(field_desc));
+        } else {
+            schema.return_types.emplace_back(LogicalType(LogicalTypeId::VARCHAR));
+        }
+    }
+
+    return schema;
+}
 
 static vector<string> SplitFieldPath(const string& field_path) {
     vector<string> parts;
@@ -324,41 +418,9 @@ static unique_ptr<FunctionData> NatsScanBind(ClientContext &context, TableFuncti
         }
     }
 
-    names.emplace_back("stream");
-    return_types.emplace_back(LogicalType(LogicalTypeId::VARCHAR));
-    names.emplace_back("subject");
-    return_types.emplace_back(LogicalType(LogicalTypeId::VARCHAR));
-    names.emplace_back("seq");
-    return_types.emplace_back(LogicalType(LogicalTypeId::UBIGINT));
-    names.emplace_back("ts_nats");
-    return_types.emplace_back(LogicalType(LogicalTypeId::TIMESTAMP));
-
-    // BLOB unless json_extract is specified (known valid UTF-8), to avoid validation errors on binary data
-    names.emplace_back("payload");
-    if (!proto_fields.empty() || json_fields.empty()) {
-        return_types.emplace_back(LogicalType(LogicalTypeId::BLOB));
-    } else {
-        return_types.emplace_back(LogicalType(LogicalTypeId::VARCHAR));
-    }
-
-    for (const auto &field : json_fields) {
-        names.emplace_back(field);
-        return_types.emplace_back(LogicalType(LogicalTypeId::VARCHAR));
-    }
-
-    // Protobuf columns: dot notation -> underscores, types from schema
-    for (const auto &field_path : proto_fields) {
-        string column_name = field_path;
-        std::replace(column_name.begin(), column_name.end(), '.', '_');
-        names.emplace_back(column_name);
-
-        const FieldDescriptor* field_desc = GetFieldDescriptorForPath(descriptor, field_path);
-        if (field_desc) {
-            return_types.emplace_back(ProtobufFieldDescriptorToDuckDBType(field_desc));
-        } else {
-            return_types.emplace_back(LogicalType(LogicalTypeId::VARCHAR));
-        }
-    }
+    auto schema = BuildNatsSourceSchema(json_fields, proto_file, proto_message, proto_fields, descriptor);
+    names = schema.names;
+    return_types = schema.return_types;
 
     auto bind_data = make_uniq<NatsScanBindData>(stream_name, subject_contains, nats_subject, nats_url, start_seq, end_seq,
                                                   start_time, end_time, json_fields, proto_file, proto_message, proto_fields,
@@ -1190,7 +1252,7 @@ static void NatsStreamRangeStatsExecute(ClientContext &context, TableFunctionInp
     }
 }
 
-void NatsScanFunction::Register(ExtensionLoader &loader) {
+static TableFunction CreateNatsScanTableFunction() {
     TableFunction nats_scan("nats_scan", {LogicalType(LogicalTypeId::VARCHAR)}, NatsScanExecute, NatsScanBind,
                             NatsScanInitGlobal, NatsScanInitLocal);
     nats_scan.projection_pushdown = true;
@@ -1210,6 +1272,136 @@ void NatsScanFunction::Register(ExtensionLoader &loader) {
     nats_scan.named_parameters["batch_size"] = LogicalType(LogicalTypeId::UBIGINT);
     nats_scan.named_parameters["fetch_timeout_ms"] = LogicalType(LogicalTypeId::BIGINT);
 
+    return nats_scan;
+}
+
+static unique_ptr<FunctionData> NatsCopyFromBind(ClientContext &context, CopyFromFunctionBindInput &input,
+                                                 vector<string> &expected_names, vector<LogicalType> &expected_types) {
+    if (input.info.file_path.empty()) {
+        throw std::runtime_error("COPY FROM FORMAT nats_js requires a stream name in the file path");
+    }
+
+    auto stream_name = input.info.file_path;
+    string subject_legacy;
+    auto subject_contains = GetCopyOptionString(input.info.options, "subject_contains").value_or("");
+    auto nats_subject = GetCopyOptionString(input.info.options, "nats_subject").value_or("");
+    auto nats_url = GetCopyOptionString(input.info.options, "url").value_or("nats://localhost:4222");
+    uint64_t start_seq = GetCopyOptionUBigInt(input.info.options, "start_seq", 0);
+    uint64_t end_seq = GetCopyOptionUBigInt(input.info.options, "end_seq", UINT64_MAX);
+    int64_t start_time = 0;
+    int64_t end_time = 0;
+    vector<string> json_fields = GetCopyOptionStringList(input.info.options, "json_extract");
+    string proto_file = GetCopyOptionString(input.info.options, "proto_file").value_or("");
+    string proto_message = GetCopyOptionString(input.info.options, "proto_message").value_or("");
+    vector<string> proto_fields = GetCopyOptionStringList(input.info.options, "proto_extract");
+    uint64_t batch_size = GetCopyOptionUBigInt(input.info.options, "batch_size", 4096);
+    int64_t fetch_timeout_ms = GetCopyOptionBigInt(input.info.options, "fetch_timeout_ms", 1000);
+
+    if (auto subject = GetCopyOptionString(input.info.options, "subject")) {
+        subject_legacy = *subject;
+    }
+    if (!subject_legacy.empty()) {
+        if (!subject_contains.empty()) {
+            throw std::runtime_error("Cannot use both subject and subject_contains parameters");
+        }
+        subject_contains = subject_legacy;
+    }
+
+    if (auto start_time_opt = GetCopyOptionString(input.info.options, "start_time")) {
+        start_time = Timestamp::FromString(*start_time_opt, false).value * 1000;
+    }
+    if (auto end_time_opt = GetCopyOptionString(input.info.options, "end_time")) {
+        end_time = Timestamp::FromString(*end_time_opt, false).value * 1000;
+    }
+
+    if (batch_size == 0 || batch_size > 65536) {
+        throw std::runtime_error("batch_size must be between 1 and 65536");
+    }
+    if (fetch_timeout_ms < 1) {
+        throw std::runtime_error("fetch_timeout_ms must be at least 1");
+    }
+    if ((start_seq > 0 || end_seq != UINT64_MAX) && (start_time > 0 || end_time > 0)) {
+        throw std::runtime_error("Cannot mix sequence-based (start_seq/end_seq) and time-based (start_time/end_time) parameters");
+    }
+    if (!json_fields.empty() && !proto_fields.empty()) {
+        throw std::runtime_error("Cannot use both json_extract and proto_extract parameters");
+    }
+    if (!proto_fields.empty()) {
+        if (proto_file.empty()) {
+            throw std::runtime_error("proto_file parameter is required when using proto_extract");
+        }
+        if (proto_message.empty()) {
+            throw std::runtime_error("proto_message parameter is required when using proto_extract");
+        }
+    }
+
+    shared_ptr<DiskSourceTree> source_tree;
+    shared_ptr<ProtobufErrorCollector> error_collector;
+    shared_ptr<Importer> importer;
+    const Descriptor *descriptor = nullptr;
+    vector<vector<const FieldDescriptor *>> proto_field_paths;
+
+    if (!proto_fields.empty()) {
+        source_tree = make_shared_ptr<DiskSourceTree>();
+
+        std::filesystem::path proto_path(proto_file);
+        string proto_dir = proto_path.parent_path().string();
+        string proto_filename = proto_path.filename().string();
+
+        if (proto_dir.empty()) {
+            proto_dir = ".";
+        }
+
+        source_tree->MapPath("", proto_dir);
+
+        error_collector = make_shared_ptr<ProtobufErrorCollector>();
+        importer = make_shared_ptr<Importer>(source_tree.get(), error_collector.get());
+
+        const FileDescriptor *file_desc = importer->Import(proto_filename);
+        if (!file_desc) {
+            string error_msg = "Failed to import protobuf schema file: " + proto_file;
+            if (error_collector->HasErrors()) {
+                error_msg += "\n" + error_collector->GetErrors();
+            }
+            throw std::runtime_error(error_msg);
+        }
+
+        descriptor = file_desc->FindMessageTypeByName(proto_message);
+        if (!descriptor) {
+            throw std::runtime_error("Message type '" + proto_message + "' not found in " + proto_file);
+        }
+
+        for (const auto &field_path : proto_fields) {
+            proto_field_paths.push_back(ResolveProtobufFieldPath(descriptor, field_path));
+        }
+    }
+
+    auto schema = BuildNatsSourceSchema(json_fields, proto_file, proto_message, proto_fields, descriptor);
+    if (schema.return_types.size() != expected_types.size()) {
+        throw std::runtime_error("COPY FROM FORMAT nats_js requires the target table schema to match the nats_scan output schema");
+    }
+    for (idx_t i = 0; i < schema.return_types.size(); i++) {
+        if (schema.return_types[i] != expected_types[i]) {
+            throw std::runtime_error("COPY FROM FORMAT nats_js requires the target table schema to match the nats_scan output schema");
+        }
+    }
+
+    auto bind_data = make_uniq<NatsScanBindData>(stream_name, subject_contains, nats_subject, nats_url, start_seq, end_seq,
+                                                 start_time, end_time, json_fields, proto_file, proto_message,
+                                                 proto_fields, std::move(proto_field_paths), batch_size, fetch_timeout_ms);
+
+    if (!proto_fields.empty()) {
+        bind_data->proto_source_tree = source_tree;
+        bind_data->proto_error_collector = error_collector;
+        bind_data->proto_importer = importer;
+        bind_data->proto_descriptor = descriptor;
+    }
+
+    return bind_data;
+}
+
+void NatsScanFunction::Register(ExtensionLoader &loader) {
+    auto nats_scan = CreateNatsScanTableFunction();
     loader.RegisterFunction(nats_scan);
 }
 
@@ -1228,6 +1420,14 @@ void NatsStreamStatsFunction::Register(ExtensionLoader &loader) {
     nats_stream_range_stats.named_parameters["start_seq"] = LogicalType(LogicalTypeId::UBIGINT);
     nats_stream_range_stats.named_parameters["end_seq"] = LogicalType(LogicalTypeId::UBIGINT);
     loader.RegisterFunction(nats_stream_range_stats);
+}
+
+void NatsCopyFunction::Register(ExtensionLoader &loader) {
+    CopyFunction function("nats_js");
+    function.copy_from_bind = NatsCopyFromBind;
+    function.copy_from_function = CreateNatsScanTableFunction();
+    function.extension = "nats_js";
+    loader.RegisterFunction(function);
 }
 
 } // namespace duckdb
