@@ -72,6 +72,14 @@ struct NatsIngestStopBindData : public TableFunctionData {
     string job_name;
 };
 
+struct NatsIngestPauseBindData : public TableFunctionData {
+    string job_name;
+};
+
+struct NatsIngestResumeBindData : public TableFunctionData {
+    string job_name;
+};
+
 struct NatsIngestStatusBindData : public TableFunctionData {
     string job_name;
 };
@@ -101,12 +109,18 @@ struct NatsIngestSnapshot {
     bool stop_requested = false;
     bool stopped = false;
     bool failed = false;
+    bool paused = false;
+    bool pause_requested = false;
     uint64_t last_committed_seq = 0;
     uint64_t last_delivered_seq = 0;
     uint64_t rows_inserted = 0;
     uint64_t batches_committed = 0;
+    uint64_t fetches_completed = 0;
+    uint64_t last_batch_rows = 0;
     uint64_t sequence_lag = 0;
     timestamp_t last_start_time;
+    timestamp_t last_fetch_time;
+    timestamp_t last_ack_time;
     timestamp_t last_commit_time;
     timestamp_t last_error_time;
     string last_error;
@@ -128,6 +142,7 @@ static constexpr const char *NATS_INGEST_REGISTRY_TABLE = "duckdb_nats_ingest_jo
 
 static NatsIngestSnapshot SnapshotJob(const shared_ptr<NatsIngestJobState> &job);
 static NatsIngestConfig SnapshotToConfig(const NatsIngestSnapshot &snapshot);
+static void RestoreJobProgress(const shared_ptr<NatsIngestJobState> &job, const NatsIngestSnapshot &snapshot);
 static void RunIngestWorker(const shared_ptr<NatsIngestJobState> &job);
 static TableCatalogEntry &ResolveTargetTable(ClientContext &context, const string &target_table);
 static void EnsureTargetTable(Connection &conn, NatsIngestConfig &config);
@@ -220,12 +235,18 @@ static void EnsureRegistryTable(Connection &conn) {
         << "stop_requested BOOLEAN NOT NULL,"
         << "stopped BOOLEAN NOT NULL,"
         << "failed BOOLEAN NOT NULL,"
+        << "paused BOOLEAN NOT NULL,"
+        << "pause_requested BOOLEAN NOT NULL,"
         << "last_committed_seq UBIGINT NOT NULL,"
         << "last_delivered_seq UBIGINT NOT NULL,"
         << "rows_inserted UBIGINT NOT NULL,"
         << "batches_committed UBIGINT NOT NULL,"
+        << "fetches_completed UBIGINT NOT NULL,"
+        << "last_batch_rows UBIGINT NOT NULL,"
         << "sequence_lag UBIGINT NOT NULL,"
         << "last_start_time TIMESTAMP,"
+        << "last_fetch_time TIMESTAMP,"
+        << "last_ack_time TIMESTAMP,"
         << "last_commit_time TIMESTAMP,"
         << "last_error_time TIMESTAMP,"
         << "last_error VARCHAR,"
@@ -247,9 +268,9 @@ static void UpsertRegistry(Connection &conn, const NatsIngestSnapshot &snapshot)
     sql << "INSERT INTO " << NATS_INGEST_REGISTRY_TABLE
         << " (job_name, stream_name, target_table, durable_name, nats_url, start_seq, batch_size, poll_ms, "
            "fetch_timeout_ms, resume_from_checkpoint, create_target_table, subject_contains, nats_subject, json_fields, proto_file, "
-           "proto_message, proto_fields, running, stop_requested, stopped, failed, last_committed_seq, "
-           "last_delivered_seq, rows_inserted, batches_committed, sequence_lag, last_start_time, last_commit_time, "
-           "last_error_time, last_error, updated_at) VALUES ("
+           "proto_message, proto_fields, running, stop_requested, stopped, failed, paused, pause_requested, "
+           "last_committed_seq, last_delivered_seq, rows_inserted, batches_committed, fetches_completed, last_batch_rows, "
+           "sequence_lag, last_start_time, last_fetch_time, last_ack_time, last_commit_time, last_error_time, last_error, updated_at) VALUES ("
         << SqlStringLiteral(snapshot.job_name) << ", "
         << SqlStringLiteral(snapshot.stream_name) << ", "
         << SqlStringLiteral(snapshot.target_table) << ", "
@@ -271,12 +292,18 @@ static void UpsertRegistry(Connection &conn, const NatsIngestSnapshot &snapshot)
         << (snapshot.stop_requested ? "TRUE" : "FALSE") << ", "
         << (snapshot.stopped ? "TRUE" : "FALSE") << ", "
         << (snapshot.failed ? "TRUE" : "FALSE") << ", "
+        << (snapshot.paused ? "TRUE" : "FALSE") << ", "
+        << (snapshot.pause_requested ? "TRUE" : "FALSE") << ", "
         << snapshot.last_committed_seq << ", "
         << snapshot.last_delivered_seq << ", "
         << snapshot.rows_inserted << ", "
         << snapshot.batches_committed << ", "
+        << snapshot.fetches_completed << ", "
+        << snapshot.last_batch_rows << ", "
         << snapshot.sequence_lag << ", "
         << (snapshot.last_start_time.value == 0 ? "NULL" : SqlStringLiteral(Timestamp::ToString(snapshot.last_start_time))) << ", "
+        << (snapshot.last_fetch_time.value == 0 ? "NULL" : SqlStringLiteral(Timestamp::ToString(snapshot.last_fetch_time))) << ", "
+        << (snapshot.last_ack_time.value == 0 ? "NULL" : SqlStringLiteral(Timestamp::ToString(snapshot.last_ack_time))) << ", "
         << (snapshot.last_commit_time.value == 0 ? "NULL" : SqlStringLiteral(Timestamp::ToString(snapshot.last_commit_time))) << ", "
         << (snapshot.last_error_time.value == 0 ? "NULL" : SqlStringLiteral(Timestamp::ToString(snapshot.last_error_time))) << ", "
         << (snapshot.last_error.empty() ? "NULL" : SqlStringLiteral(snapshot.last_error)) << ", "
@@ -302,12 +329,18 @@ static void UpsertRegistry(Connection &conn, const NatsIngestSnapshot &snapshot)
         << "stop_requested = excluded.stop_requested, "
         << "stopped = excluded.stopped, "
         << "failed = excluded.failed, "
+        << "paused = excluded.paused, "
+        << "pause_requested = excluded.pause_requested, "
         << "last_committed_seq = excluded.last_committed_seq, "
         << "last_delivered_seq = excluded.last_delivered_seq, "
         << "rows_inserted = excluded.rows_inserted, "
         << "batches_committed = excluded.batches_committed, "
+        << "fetches_completed = excluded.fetches_completed, "
+        << "last_batch_rows = excluded.last_batch_rows, "
         << "sequence_lag = excluded.sequence_lag, "
         << "last_start_time = excluded.last_start_time, "
+        << "last_fetch_time = excluded.last_fetch_time, "
+        << "last_ack_time = excluded.last_ack_time, "
         << "last_commit_time = excluded.last_commit_time, "
         << "last_error_time = excluded.last_error_time, "
         << "last_error = excluded.last_error, "
@@ -323,9 +356,9 @@ static bool LoadRegistrySnapshot(Connection &conn, const string &job_name, NatsI
     std::ostringstream sql;
     sql << "SELECT job_name, stream_name, target_table, durable_name, nats_url, start_seq, batch_size, poll_ms, "
            "fetch_timeout_ms, resume_from_checkpoint, create_target_table, subject_contains, nats_subject, json_fields, proto_file, "
-           "proto_message, proto_fields, running, stop_requested, stopped, failed, last_committed_seq, "
-           "last_delivered_seq, rows_inserted, batches_committed, sequence_lag, last_start_time, last_commit_time, "
-           "last_error_time, last_error "
+           "proto_message, proto_fields, running, stop_requested, stopped, failed, paused, pause_requested, last_committed_seq, "
+           "last_delivered_seq, rows_inserted, batches_committed, fetches_completed, last_batch_rows, sequence_lag, last_start_time, "
+           "last_fetch_time, last_ack_time, last_commit_time, last_error_time, last_error "
         << "FROM " << NATS_INGEST_REGISTRY_TABLE << " WHERE job_name = " << SqlStringLiteral(job_name);
 
     auto result = conn.Query(sql.str());
@@ -375,22 +408,32 @@ static bool LoadRegistrySnapshot(Connection &conn, const string &job_name, NatsI
     snapshot.stop_requested = chunk->GetValue(18, 0).GetValue<bool>();
     snapshot.stopped = chunk->GetValue(19, 0).GetValue<bool>();
     snapshot.failed = chunk->GetValue(20, 0).GetValue<bool>();
-    snapshot.last_committed_seq = chunk->GetValue(21, 0).GetValue<uint64_t>();
-    snapshot.last_delivered_seq = chunk->GetValue(22, 0).GetValue<uint64_t>();
-    snapshot.rows_inserted = chunk->GetValue(23, 0).GetValue<uint64_t>();
-    snapshot.batches_committed = chunk->GetValue(24, 0).GetValue<uint64_t>();
-    snapshot.sequence_lag = chunk->GetValue(25, 0).GetValue<uint64_t>();
-    if (!chunk->GetValue(26, 0).IsNull()) {
-        snapshot.last_start_time = chunk->GetValue(26, 0).GetValue<timestamp_t>();
+    snapshot.paused = chunk->GetValue(21, 0).GetValue<bool>();
+    snapshot.pause_requested = chunk->GetValue(22, 0).GetValue<bool>();
+    snapshot.last_committed_seq = chunk->GetValue(23, 0).GetValue<uint64_t>();
+    snapshot.last_delivered_seq = chunk->GetValue(24, 0).GetValue<uint64_t>();
+    snapshot.rows_inserted = chunk->GetValue(25, 0).GetValue<uint64_t>();
+    snapshot.batches_committed = chunk->GetValue(26, 0).GetValue<uint64_t>();
+    snapshot.fetches_completed = chunk->GetValue(27, 0).GetValue<uint64_t>();
+    snapshot.last_batch_rows = chunk->GetValue(28, 0).GetValue<uint64_t>();
+    snapshot.sequence_lag = chunk->GetValue(29, 0).GetValue<uint64_t>();
+    if (!chunk->GetValue(30, 0).IsNull()) {
+        snapshot.last_start_time = chunk->GetValue(30, 0).GetValue<timestamp_t>();
     }
-    if (!chunk->GetValue(27, 0).IsNull()) {
-        snapshot.last_commit_time = chunk->GetValue(27, 0).GetValue<timestamp_t>();
+    if (!chunk->GetValue(31, 0).IsNull()) {
+        snapshot.last_fetch_time = chunk->GetValue(31, 0).GetValue<timestamp_t>();
     }
-    if (!chunk->GetValue(28, 0).IsNull()) {
-        snapshot.last_error_time = chunk->GetValue(28, 0).GetValue<timestamp_t>();
+    if (!chunk->GetValue(32, 0).IsNull()) {
+        snapshot.last_ack_time = chunk->GetValue(32, 0).GetValue<timestamp_t>();
     }
-    if (!chunk->GetValue(29, 0).IsNull()) {
-        snapshot.last_error = chunk->GetValue(29, 0).GetValue<string>();
+    if (!chunk->GetValue(33, 0).IsNull()) {
+        snapshot.last_commit_time = chunk->GetValue(33, 0).GetValue<timestamp_t>();
+    }
+    if (!chunk->GetValue(34, 0).IsNull()) {
+        snapshot.last_error_time = chunk->GetValue(34, 0).GetValue<timestamp_t>();
+    }
+    if (!chunk->GetValue(35, 0).IsNull()) {
+        snapshot.last_error = chunk->GetValue(35, 0).GetValue<string>();
     }
     return true;
 }
@@ -399,9 +442,9 @@ static vector<NatsIngestSnapshot> LoadRegistrySnapshots(Connection &conn) {
     std::ostringstream sql;
     sql << "SELECT job_name, stream_name, target_table, durable_name, nats_url, start_seq, batch_size, poll_ms, "
            "fetch_timeout_ms, resume_from_checkpoint, create_target_table, subject_contains, nats_subject, json_fields, proto_file, "
-           "proto_message, proto_fields, running, stop_requested, stopped, failed, last_committed_seq, "
-           "last_delivered_seq, rows_inserted, batches_committed, sequence_lag, last_start_time, last_commit_time, "
-           "last_error_time, last_error "
+           "proto_message, proto_fields, running, stop_requested, stopped, failed, paused, pause_requested, last_committed_seq, "
+           "last_delivered_seq, rows_inserted, batches_committed, fetches_completed, last_batch_rows, sequence_lag, last_start_time, "
+           "last_fetch_time, last_ack_time, last_commit_time, last_error_time, last_error "
         << "FROM " << NATS_INGEST_REGISTRY_TABLE << " ORDER BY job_name";
 
     auto result = conn.Query(sql.str());
@@ -450,22 +493,32 @@ static vector<NatsIngestSnapshot> LoadRegistrySnapshots(Connection &conn) {
             snapshot.stop_requested = chunk->GetValue(18, row).GetValue<bool>();
             snapshot.stopped = chunk->GetValue(19, row).GetValue<bool>();
             snapshot.failed = chunk->GetValue(20, row).GetValue<bool>();
-            snapshot.last_committed_seq = chunk->GetValue(21, row).GetValue<uint64_t>();
-            snapshot.last_delivered_seq = chunk->GetValue(22, row).GetValue<uint64_t>();
-            snapshot.rows_inserted = chunk->GetValue(23, row).GetValue<uint64_t>();
-            snapshot.batches_committed = chunk->GetValue(24, row).GetValue<uint64_t>();
-            snapshot.sequence_lag = chunk->GetValue(25, row).GetValue<uint64_t>();
-            if (!chunk->GetValue(26, row).IsNull()) {
-                snapshot.last_start_time = chunk->GetValue(26, row).GetValue<timestamp_t>();
+            snapshot.paused = chunk->GetValue(21, row).GetValue<bool>();
+            snapshot.pause_requested = chunk->GetValue(22, row).GetValue<bool>();
+            snapshot.last_committed_seq = chunk->GetValue(23, row).GetValue<uint64_t>();
+            snapshot.last_delivered_seq = chunk->GetValue(24, row).GetValue<uint64_t>();
+            snapshot.rows_inserted = chunk->GetValue(25, row).GetValue<uint64_t>();
+            snapshot.batches_committed = chunk->GetValue(26, row).GetValue<uint64_t>();
+            snapshot.fetches_completed = chunk->GetValue(27, row).GetValue<uint64_t>();
+            snapshot.last_batch_rows = chunk->GetValue(28, row).GetValue<uint64_t>();
+            snapshot.sequence_lag = chunk->GetValue(29, row).GetValue<uint64_t>();
+            if (!chunk->GetValue(30, row).IsNull()) {
+                snapshot.last_start_time = chunk->GetValue(30, row).GetValue<timestamp_t>();
             }
-            if (!chunk->GetValue(27, row).IsNull()) {
-                snapshot.last_commit_time = chunk->GetValue(27, row).GetValue<timestamp_t>();
+            if (!chunk->GetValue(31, row).IsNull()) {
+                snapshot.last_fetch_time = chunk->GetValue(31, row).GetValue<timestamp_t>();
             }
-            if (!chunk->GetValue(28, row).IsNull()) {
-                snapshot.last_error_time = chunk->GetValue(28, row).GetValue<timestamp_t>();
+            if (!chunk->GetValue(32, row).IsNull()) {
+                snapshot.last_ack_time = chunk->GetValue(32, row).GetValue<timestamp_t>();
             }
-            if (!chunk->GetValue(29, row).IsNull()) {
-                snapshot.last_error = chunk->GetValue(29, row).GetValue<string>();
+            if (!chunk->GetValue(33, row).IsNull()) {
+                snapshot.last_commit_time = chunk->GetValue(33, row).GetValue<timestamp_t>();
+            }
+            if (!chunk->GetValue(34, row).IsNull()) {
+                snapshot.last_error_time = chunk->GetValue(34, row).GetValue<timestamp_t>();
+            }
+            if (!chunk->GetValue(35, row).IsNull()) {
+                snapshot.last_error = chunk->GetValue(35, row).GetValue<string>();
             }
             snapshots.push_back(std::move(snapshot));
         }
@@ -785,14 +838,20 @@ static NatsIngestSnapshot SnapshotJob(const shared_ptr<NatsIngestJobState> &job)
     snapshot.stop_requested = job->progress.stop_requested;
     snapshot.stopped = job->progress.stopped;
     snapshot.failed = job->progress.failed;
+    snapshot.paused = job->progress.paused;
+    snapshot.pause_requested = job->progress.pause_requested;
     snapshot.last_committed_seq = job->progress.last_committed_seq;
     snapshot.last_delivered_seq = job->progress.last_delivered_seq;
     snapshot.rows_inserted = job->progress.rows_inserted;
     snapshot.batches_committed = job->progress.batches_committed;
+    snapshot.fetches_completed = job->progress.fetches_completed;
+    snapshot.last_batch_rows = job->progress.last_batch_rows;
     snapshot.sequence_lag = snapshot.last_delivered_seq > snapshot.last_committed_seq
                                 ? snapshot.last_delivered_seq - snapshot.last_committed_seq
                                 : 0;
     snapshot.last_start_time = job->progress.last_start_time;
+    snapshot.last_fetch_time = job->progress.last_fetch_time;
+    snapshot.last_ack_time = job->progress.last_ack_time;
     snapshot.last_commit_time = job->progress.last_commit_time;
     snapshot.last_error_time = job->progress.last_error_time;
     snapshot.last_error = job->progress.last_error;
@@ -821,6 +880,25 @@ static NatsIngestConfig SnapshotToConfig(const NatsIngestSnapshot &snapshot) {
     return config;
 }
 
+static void RestoreJobProgress(const shared_ptr<NatsIngestJobState> &job, const NatsIngestSnapshot &snapshot) {
+    lock_guard<std::mutex> guard(job->job_mutex);
+    job->progress.pause_requested = snapshot.pause_requested;
+    job->progress.paused = snapshot.paused;
+    job->progress.last_committed_seq = snapshot.last_committed_seq;
+    job->progress.last_delivered_seq = snapshot.last_delivered_seq;
+    job->progress.rows_inserted = snapshot.rows_inserted;
+    job->progress.batches_committed = snapshot.batches_committed;
+    job->progress.fetches_completed = snapshot.fetches_completed;
+    job->progress.last_batch_rows = snapshot.last_batch_rows;
+    job->progress.checkpoint_seq = snapshot.last_committed_seq;
+    job->progress.last_start_time = snapshot.last_start_time;
+    job->progress.last_fetch_time = snapshot.last_fetch_time;
+    job->progress.last_ack_time = snapshot.last_ack_time;
+    job->progress.last_commit_time = snapshot.last_commit_time;
+    job->progress.last_error_time = snapshot.last_error_time;
+    job->progress.last_error = snapshot.last_error;
+}
+
 static void FillSnapshotColumns(DataChunk &output, idx_t row, const NatsIngestSnapshot &snapshot) {
     output.SetValue(0, row, Value(snapshot.job_name));
     output.SetValue(1, row, Value(snapshot.stream_name));
@@ -830,30 +908,44 @@ static void FillSnapshotColumns(DataChunk &output, idx_t row, const NatsIngestSn
     output.SetValue(5, row, Value::BOOLEAN(snapshot.stop_requested));
     output.SetValue(6, row, Value::BOOLEAN(snapshot.stopped));
     output.SetValue(7, row, Value::BOOLEAN(snapshot.failed));
-    output.SetValue(8, row, Value::UBIGINT(snapshot.last_committed_seq));
-    output.SetValue(9, row, Value::UBIGINT(snapshot.last_delivered_seq));
-    output.SetValue(10, row, Value::UBIGINT(snapshot.rows_inserted));
-    output.SetValue(11, row, Value::UBIGINT(snapshot.batches_committed));
-    output.SetValue(12, row, Value::UBIGINT(snapshot.sequence_lag));
+    output.SetValue(8, row, Value::BOOLEAN(snapshot.paused));
+    output.SetValue(9, row, Value::BOOLEAN(snapshot.pause_requested));
+    output.SetValue(10, row, Value::UBIGINT(snapshot.last_committed_seq));
+    output.SetValue(11, row, Value::UBIGINT(snapshot.last_delivered_seq));
+    output.SetValue(12, row, Value::UBIGINT(snapshot.rows_inserted));
+    output.SetValue(13, row, Value::UBIGINT(snapshot.batches_committed));
+    output.SetValue(14, row, Value::UBIGINT(snapshot.fetches_completed));
+    output.SetValue(15, row, Value::UBIGINT(snapshot.last_batch_rows));
+    output.SetValue(16, row, Value::UBIGINT(snapshot.sequence_lag));
     if (snapshot.last_start_time.value == 0) {
-        FlatVector::SetNull(output.data[13], row, true);
+        FlatVector::SetNull(output.data[17], row, true);
     } else {
-        output.SetValue(13, row, Value::TIMESTAMP(snapshot.last_start_time));
+        output.SetValue(17, row, Value::TIMESTAMP(snapshot.last_start_time));
+    }
+    if (snapshot.last_fetch_time.value == 0) {
+        FlatVector::SetNull(output.data[18], row, true);
+    } else {
+        output.SetValue(18, row, Value::TIMESTAMP(snapshot.last_fetch_time));
+    }
+    if (snapshot.last_ack_time.value == 0) {
+        FlatVector::SetNull(output.data[19], row, true);
+    } else {
+        output.SetValue(19, row, Value::TIMESTAMP(snapshot.last_ack_time));
     }
     if (snapshot.last_commit_time.value == 0) {
-        FlatVector::SetNull(output.data[14], row, true);
+        FlatVector::SetNull(output.data[20], row, true);
     } else {
-        output.SetValue(14, row, Value::TIMESTAMP(snapshot.last_commit_time));
+        output.SetValue(20, row, Value::TIMESTAMP(snapshot.last_commit_time));
     }
     if (snapshot.last_error_time.value == 0) {
-        FlatVector::SetNull(output.data[15], row, true);
+        FlatVector::SetNull(output.data[21], row, true);
     } else {
-        output.SetValue(15, row, Value::TIMESTAMP(snapshot.last_error_time));
+        output.SetValue(21, row, Value::TIMESTAMP(snapshot.last_error_time));
     }
     if (snapshot.last_error.empty()) {
-        FlatVector::SetNull(output.data[16], row, true);
+        FlatVector::SetNull(output.data[22], row, true);
     } else {
-        output.SetValue(16, row, Value(snapshot.last_error));
+        output.SetValue(22, row, Value(snapshot.last_error));
     }
 }
 
@@ -874,6 +966,10 @@ static void AddSnapshotColumns(vector<LogicalType> &return_types, vector<string>
     return_types.emplace_back(LogicalType(LogicalTypeId::BOOLEAN));
     names.emplace_back("failed");
     return_types.emplace_back(LogicalType(LogicalTypeId::BOOLEAN));
+    names.emplace_back("paused");
+    return_types.emplace_back(LogicalType(LogicalTypeId::BOOLEAN));
+    names.emplace_back("pause_requested");
+    return_types.emplace_back(LogicalType(LogicalTypeId::BOOLEAN));
     names.emplace_back("last_committed_seq");
     return_types.emplace_back(LogicalType(LogicalTypeId::UBIGINT));
     names.emplace_back("last_delivered_seq");
@@ -882,9 +978,17 @@ static void AddSnapshotColumns(vector<LogicalType> &return_types, vector<string>
     return_types.emplace_back(LogicalType(LogicalTypeId::UBIGINT));
     names.emplace_back("batches_committed");
     return_types.emplace_back(LogicalType(LogicalTypeId::UBIGINT));
+    names.emplace_back("fetches_completed");
+    return_types.emplace_back(LogicalType(LogicalTypeId::UBIGINT));
+    names.emplace_back("last_batch_rows");
+    return_types.emplace_back(LogicalType(LogicalTypeId::UBIGINT));
     names.emplace_back("sequence_lag");
     return_types.emplace_back(LogicalType(LogicalTypeId::UBIGINT));
     names.emplace_back("last_start_time");
+    return_types.emplace_back(LogicalType(LogicalTypeId::TIMESTAMP));
+    names.emplace_back("last_fetch_time");
+    return_types.emplace_back(LogicalType(LogicalTypeId::TIMESTAMP));
+    names.emplace_back("last_ack_time");
     return_types.emplace_back(LogicalType(LogicalTypeId::TIMESTAMP));
     names.emplace_back("last_commit_time");
     return_types.emplace_back(LogicalType(LogicalTypeId::TIMESTAMP));
@@ -986,7 +1090,7 @@ static void InitializeIngestResources(const shared_ptr<NatsIngestJobState> &job)
 }
 
 static shared_ptr<NatsIngestJobState> LaunchIngestJob(const NatsIngestConfig &config, ClientContext *context,
-                                                      DatabaseInstance *db) {
+                                                      DatabaseInstance *db, const NatsIngestSnapshot *restore_snapshot = nullptr) {
     auto job = NatsIngestManager::Get().CreateJob(config);
     try {
         if (context) {
@@ -997,6 +1101,9 @@ static shared_ptr<NatsIngestJobState> LaunchIngestJob(const NatsIngestConfig &co
             throw std::runtime_error("Missing database context for ingest job launch");
         }
         InitializeIngestResources(job);
+        if (restore_snapshot != nullptr) {
+            RestoreJobProgress(job, *restore_snapshot);
+        }
         {
             Connection db_connection(*job->db);
             EnsureRegistryTable(db_connection);
@@ -1023,7 +1130,7 @@ static void RehydrateActiveIngestJobs(DatabaseInstance &db) {
         }
         auto config = SnapshotToConfig(snapshot);
         try {
-            LaunchIngestJob(config, nullptr, &db);
+            LaunchIngestJob(config, nullptr, &db, &snapshot);
         } catch (const std::exception &ex) {
             NatsIngestSnapshot failed_snapshot = snapshot;
             failed_snapshot.running = false;
@@ -1331,6 +1438,52 @@ static void RunIngestWorker(const shared_ptr<NatsIngestJobState> &job) {
         }
 
         while (true) {
+            bool pause_requested = false;
+            {
+                lock_guard<std::mutex> guard(job->job_mutex);
+                pause_requested = job->progress.pause_requested && !job->progress.stop_requested &&
+                                  !job->progress.failed;
+            }
+            if (pause_requested) {
+                bool updated_pause_state = false;
+                {
+                    lock_guard<std::mutex> guard(job->job_mutex);
+                    if (!job->progress.paused) {
+                        job->progress.paused = true;
+                        updated_pause_state = true;
+                    }
+                }
+                if (updated_pause_state) {
+                    job->cv.notify_all();
+                    try {
+                        PersistRegistry(db_connection, job);
+                    } catch (...) {
+                    }
+                }
+
+                std::unique_lock<std::mutex> lock(job->job_mutex);
+                job->cv.wait(lock, [&]() {
+                    return !job->progress.pause_requested || job->progress.stop_requested ||
+                           job->progress.failed || db_connection.context->IsInterrupted();
+                });
+                bool stop_or_failed = job->progress.stop_requested || job->progress.failed ||
+                                      db_connection.context->IsInterrupted();
+                bool paused_changed = job->progress.paused;
+                job->progress.paused = false;
+                lock.unlock();
+                if (paused_changed) {
+                    job->cv.notify_all();
+                    try {
+                        PersistRegistry(db_connection, job);
+                    } catch (...) {
+                    }
+                }
+                if (stop_or_failed) {
+                    break;
+                }
+                continue;
+            }
+
             bool stop_requested = false;
             {
                 lock_guard<std::mutex> guard(job->job_mutex);
@@ -1370,6 +1523,12 @@ static void RunIngestWorker(const shared_ptr<NatsIngestJobState> &job) {
                     std::this_thread::sleep_for(std::chrono::milliseconds(config.poll_ms));
                 }
                 continue;
+            }
+
+            {
+                lock_guard<std::mutex> guard(job->job_mutex);
+                job->progress.fetches_completed++;
+                job->progress.last_fetch_time = Timestamp::GetCurrentTimestamp();
             }
 
             std::vector<natsMsg *> ack_msgs;
@@ -1493,6 +1652,7 @@ static void RunIngestWorker(const shared_ptr<NatsIngestJobState> &job) {
 
                 uint64_t committed_rows = progress_snapshot.rows_inserted + inserted_rows;
                 uint64_t committed_batches = progress_snapshot.batches_committed + 1;
+                uint64_t committed_fetches = progress_snapshot.fetches_completed + 1;
                 uint64_t committed_seq = batch_last_delivered_seq;
                 if (committed_seq == 0) {
                     committed_seq = progress_snapshot.last_committed_seq;
@@ -1519,6 +1679,8 @@ static void RunIngestWorker(const shared_ptr<NatsIngestJobState> &job) {
                     lock_guard<std::mutex> guard(job->job_mutex);
                     job->progress.rows_inserted = committed_rows;
                     job->progress.batches_committed = committed_batches;
+                    job->progress.fetches_completed = committed_fetches;
+                    job->progress.last_batch_rows = inserted_rows;
                     job->progress.last_committed_seq = committed_seq;
                     job->progress.last_delivered_seq = batch_last_delivered_seq;
                     job->progress.checkpoint_seq = committed_seq;
@@ -1544,6 +1706,11 @@ static void RunIngestWorker(const shared_ptr<NatsIngestJobState> &job) {
                                                  config.stream_name + "': " + natsStatus_GetText(s));
                     }
                     natsMsg_Destroy(msg);
+                }
+                {
+                    lock_guard<std::mutex> guard(job->job_mutex);
+                    job->progress.last_ack_time = Timestamp::GetCurrentTimestamp();
+                    job->cv.notify_all();
                 }
 
             } catch (const std::exception &ex) {
@@ -1678,6 +1845,32 @@ vector<shared_ptr<NatsIngestJobState>> NatsIngestManager::ListJobs() {
     return result;
 }
 
+bool NatsIngestManager::PauseJob(const string &job_name) {
+    auto job = GetJob(job_name);
+    if (!job) {
+        return false;
+    }
+    {
+        lock_guard<std::mutex> guard(job->job_mutex);
+        job->progress.pause_requested = true;
+    }
+    job->cv.notify_all();
+    return true;
+}
+
+bool NatsIngestManager::ResumeJob(const string &job_name) {
+    auto job = GetJob(job_name);
+    if (!job) {
+        return false;
+    }
+    {
+        lock_guard<std::mutex> guard(job->job_mutex);
+        job->progress.pause_requested = false;
+    }
+    job->cv.notify_all();
+    return true;
+}
+
 bool NatsIngestManager::StopJob(const string &job_name) {
     auto job = GetJob(job_name);
     if (!job) {
@@ -1739,6 +1932,130 @@ static void NatsIngestStartExecute(ClientContext &context, TableFunctionInput &d
         job->cv.wait_for(lock, std::chrono::seconds(5), [&]() {
             return job->progress.rows_inserted > initial_rows_inserted || job->progress.failed || job->progress.stopped;
         });
+    }
+    auto snapshot = SnapshotJob(job);
+    FillSnapshotColumns(output, 0, snapshot);
+    output.SetCardinality(1);
+    state.done = true;
+}
+
+static unique_ptr<FunctionData> NatsIngestPauseBind(ClientContext &context, TableFunctionBindInput &input,
+                                                    vector<LogicalType> &return_types, vector<string> &names) {
+    string job_name;
+    bool has_job_name = false;
+    for (auto &kv : input.named_parameters) {
+        if (kv.first == "job_name") {
+            job_name = StringValue::Get(kv.second);
+            has_job_name = true;
+        }
+    }
+    if (!has_job_name) {
+        throw std::runtime_error("job_name parameter is required");
+    }
+    AddSnapshotColumns(return_types, names);
+    auto bind_data = make_uniq<NatsIngestPauseBindData>();
+    bind_data->job_name = std::move(job_name);
+    return bind_data;
+}
+
+static unique_ptr<GlobalTableFunctionState> NatsIngestPauseInitGlobal(ClientContext &context,
+                                                                      TableFunctionInitInput &input) {
+    auto &bind_data = input.bind_data->Cast<NatsIngestPauseBindData>();
+    auto job = NatsIngestManager::Get().GetJob(bind_data.job_name);
+    if (!job) {
+        throw std::runtime_error("Ingest job '" + bind_data.job_name + "' does not exist or is not running");
+    }
+    {
+        lock_guard<std::mutex> guard(job->job_mutex);
+        if (!job->progress.running || job->progress.stopped || job->progress.failed) {
+            throw std::runtime_error("Ingest job '" + bind_data.job_name + "' is not running");
+        }
+    }
+    NatsIngestManager::Get().PauseJob(bind_data.job_name);
+    auto state = make_uniq<NatsIngestControlGlobalState>();
+    state->jobs.push_back(job);
+    return state;
+}
+
+static void NatsIngestPauseExecute(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
+    auto &state = data_p.global_state->Cast<NatsIngestControlGlobalState>();
+    if (state.done) {
+        output.SetCardinality(0);
+        return;
+    }
+    auto job = state.jobs[0];
+    {
+        std::unique_lock<std::mutex> lock(job->job_mutex);
+        if (!job->cv.wait_for(lock, std::chrono::seconds(30), [&]() {
+            return job->progress.paused || job->progress.failed || job->progress.stopped;
+        })) {
+            throw std::runtime_error("Timed out waiting for ingest job '" + job->config.job_name + "' to pause");
+        }
+        if (!job->progress.paused && !job->progress.failed && !job->progress.stopped) {
+            throw std::runtime_error("Ingest job '" + job->config.job_name + "' did not pause");
+        }
+    }
+    auto snapshot = SnapshotJob(job);
+    FillSnapshotColumns(output, 0, snapshot);
+    output.SetCardinality(1);
+    state.done = true;
+}
+
+static unique_ptr<FunctionData> NatsIngestResumeBind(ClientContext &context, TableFunctionBindInput &input,
+                                                     vector<LogicalType> &return_types, vector<string> &names) {
+    string job_name;
+    bool has_job_name = false;
+    for (auto &kv : input.named_parameters) {
+        if (kv.first == "job_name") {
+            job_name = StringValue::Get(kv.second);
+            has_job_name = true;
+        }
+    }
+    if (!has_job_name) {
+        throw std::runtime_error("job_name parameter is required");
+    }
+    AddSnapshotColumns(return_types, names);
+    auto bind_data = make_uniq<NatsIngestResumeBindData>();
+    bind_data->job_name = std::move(job_name);
+    return bind_data;
+}
+
+static unique_ptr<GlobalTableFunctionState> NatsIngestResumeInitGlobal(ClientContext &context,
+                                                                       TableFunctionInitInput &input) {
+    auto &bind_data = input.bind_data->Cast<NatsIngestResumeBindData>();
+    auto job = NatsIngestManager::Get().GetJob(bind_data.job_name);
+    if (!job) {
+        throw std::runtime_error("Ingest job '" + bind_data.job_name + "' does not exist or is not running");
+    }
+    {
+        lock_guard<std::mutex> guard(job->job_mutex);
+        if (!job->progress.running || job->progress.stopped || job->progress.failed) {
+            throw std::runtime_error("Ingest job '" + bind_data.job_name + "' is not running");
+        }
+    }
+    NatsIngestManager::Get().ResumeJob(bind_data.job_name);
+    auto state = make_uniq<NatsIngestControlGlobalState>();
+    state->jobs.push_back(job);
+    return state;
+}
+
+static void NatsIngestResumeExecute(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
+    auto &state = data_p.global_state->Cast<NatsIngestControlGlobalState>();
+    if (state.done) {
+        output.SetCardinality(0);
+        return;
+    }
+    auto job = state.jobs[0];
+    {
+        std::unique_lock<std::mutex> lock(job->job_mutex);
+        if (!job->cv.wait_for(lock, std::chrono::seconds(30), [&]() {
+            return !job->progress.paused || job->progress.failed || job->progress.stopped;
+        })) {
+            throw std::runtime_error("Timed out waiting for ingest job '" + job->config.job_name + "' to resume");
+        }
+        if (job->progress.paused && !job->progress.failed && !job->progress.stopped) {
+            throw std::runtime_error("Ingest job '" + job->config.job_name + "' did not resume");
+        }
     }
     auto snapshot = SnapshotJob(job);
     FillSnapshotColumns(output, 0, snapshot);
@@ -1909,6 +2226,15 @@ void NatsIngestFunction::Register(ExtensionLoader &loader) {
     TableFunction stop_fn("nats_stop_ingest", {}, NatsIngestStopExecute, NatsIngestStopBind, NatsIngestStopInitGlobal);
     stop_fn.named_parameters["job_name"] = LogicalType(LogicalTypeId::VARCHAR);
     loader.RegisterFunction(stop_fn);
+
+    TableFunction pause_fn("nats_pause_ingest", {}, NatsIngestPauseExecute, NatsIngestPauseBind, NatsIngestPauseInitGlobal);
+    pause_fn.named_parameters["job_name"] = LogicalType(LogicalTypeId::VARCHAR);
+    loader.RegisterFunction(pause_fn);
+
+    TableFunction resume_fn("nats_resume_ingest", {}, NatsIngestResumeExecute, NatsIngestResumeBind,
+                            NatsIngestResumeInitGlobal);
+    resume_fn.named_parameters["job_name"] = LogicalType(LogicalTypeId::VARCHAR);
+    loader.RegisterFunction(resume_fn);
 
     TableFunction status_fn("nats_ingest_status", {}, NatsIngestStatusExecute, NatsIngestStatusBind,
                             NatsIngestStatusInitGlobal);

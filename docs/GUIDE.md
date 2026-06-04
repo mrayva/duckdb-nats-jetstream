@@ -443,6 +443,11 @@ Use `scripts/benchmark-ingest.sh` for timing and throughput measurements. It
 prints CSV and runs both modes by default so you can diff checkpoint/resume
 performance over time.
 
+Use `scripts/run-ingest-pause-resume-harness.sh` to validate the control plane:
+it exercises `nats_pause_ingest`, `nats_resume_ingest`, and the richer status
+fields such as `paused`, `pause_requested`, `fetches_completed`, and
+`last_batch_rows`.
+
 Both scripts rely on the seeded `ingest_resume` and `ingest_redelivery` streams
 created by `scripts/setup-streams.sh`, so keep the same DuckDB binary and local
 NATS instance when comparing runs.

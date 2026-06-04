@@ -158,6 +158,8 @@ For a deterministic ingest smoke test, use the dedicated harness:
 It resets the local streams, starts a bounded ingest job, verifies the inserted
 row count, and stops the job cleanly. The harness also supports
 `HARNESS_MODE=redelivery` for a second deterministic checkpoint/resume pass.
+Use `scripts/run-ingest-pause-resume-harness.sh` to exercise the pause/resume
+control path and the richer ingest status fields.
 
 Ingest jobs also persist a checkpoint keyed by `stream_name` and `durable_name`,
 so restarting with the same durable resumes from the last committed sequence.

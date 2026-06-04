@@ -45,8 +45,12 @@ FROM range(100000000) t(i);
 .print ========================================
 
 SELECT
+    paused,
+    pause_requested,
     rows_inserted,
     batches_committed,
+    fetches_completed,
+    last_batch_rows,
     last_committed_seq
 FROM nats_ingest_status(job_name := 'ingest_probe3');
 

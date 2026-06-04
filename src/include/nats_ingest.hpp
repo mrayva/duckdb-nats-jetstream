@@ -46,12 +46,18 @@ struct NatsIngestProgress {
     bool stop_requested = false;
     bool stopped = false;
     bool failed = false;
+    bool paused = false;
+    bool pause_requested = false;
     uint64_t last_committed_seq = 0;
     uint64_t last_delivered_seq = 0;
     uint64_t rows_inserted = 0;
     uint64_t batches_committed = 0;
+    uint64_t fetches_completed = 0;
+    uint64_t last_batch_rows = 0;
     uint64_t checkpoint_seq = 0;
     timestamp_t last_start_time;
+    timestamp_t last_fetch_time;
+    timestamp_t last_ack_time;
     timestamp_t last_commit_time;
     timestamp_t last_error_time;
     string last_error;
@@ -79,6 +85,8 @@ public:
     shared_ptr<NatsIngestJobState> CreateJob(NatsIngestConfig config);
     shared_ptr<NatsIngestJobState> GetJob(const string &job_name);
     vector<shared_ptr<NatsIngestJobState>> ListJobs();
+    bool PauseJob(const string &job_name);
+    bool ResumeJob(const string &job_name);
     bool StopJob(const string &job_name);
     bool RemoveJob(const string &job_name);
 

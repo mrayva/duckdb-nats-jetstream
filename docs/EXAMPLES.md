@@ -59,6 +59,31 @@ FROM nats_scan('telemetry',
 
 Use `subject_contains` when you need client-side substring matching instead.
 
+## Ingest Control
+
+Start a bounded ingest job, then pause and resume it while inspecting richer
+status fields:
+
+```sql
+SELECT * FROM nats_start_ingest(
+    job_name := 'ingest_pause_resume',
+    stream_name := 'ingest_resume',
+    target_table := 'ingest_out',
+    durable_name := 'duckdb_ingest_pause_resume',
+    url := 'nats://127.0.0.1:4222',
+    batch_size := 4,
+    poll_ms := 100,
+    fetch_timeout_ms := 100,
+    start_seq := 1
+);
+
+SELECT paused, pause_requested, rows_inserted, batches_committed, fetches_completed
+FROM nats_ingest_status(job_name := 'ingest_pause_resume');
+
+SELECT * FROM nats_pause_ingest(job_name := 'ingest_pause_resume');
+SELECT * FROM nats_resume_ingest(job_name := 'ingest_pause_resume');
+```
+
 ## JSON Message Processing
 
 ### Extract JSON Fields

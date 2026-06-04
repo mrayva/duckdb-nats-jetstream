@@ -72,6 +72,7 @@ SELECT 'status1=' || running || '/' || rows_inserted || '/' || last_committed_se
 FROM nats_ingest_status(job_name := 'ingest_rehydrate');
 END
 EXPECT status1=true/4/4/false/false 30
+SLEEP 2
 QUIT
 SQL
 then
