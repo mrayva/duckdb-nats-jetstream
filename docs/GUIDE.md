@@ -452,6 +452,7 @@ For a SQL-native write path, the extension also exposes a `nats_js` `COPY FROM`
 format that reuses the same source schema as `nats_scan`. It is intended for
 `COPY target FROM 'stream_name' (FORMAT nats_js, url '...')` when the target
 table matches the scan output layout.
+The regression tests for that path are [test/sql/test_copy_from.sql](/home/mrayva/duckdb-nats-jetstream/test/sql/test_copy_from.sql) and [test/sql/test_copy_from_errors.sql](/home/mrayva/duckdb-nats-jetstream/test/sql/test_copy_from_errors.sql); the end-to-end smoke test is [scripts/run-copy-harness.sh](/home/mrayva/duckdb-nats-jetstream/scripts/run-copy-harness.sh).
 
 Both scripts rely on the seeded `ingest_resume` and `ingest_redelivery` streams
 created by `scripts/setup-streams.sh`, so keep the same DuckDB binary and local

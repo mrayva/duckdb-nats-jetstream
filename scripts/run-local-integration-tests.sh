@@ -8,6 +8,9 @@ EXTENSION_PATH="${EXTENSION_PATH:-$ROOT_DIR/build/release/extension/nats_js/nats
 NATS_URL="${NATS_URL:-nats://127.0.0.1:4222}"
 NATS_CLI="${NATS_CLI:-$HOME/nats}"
 PYTHON_BIN="${PYTHON_BIN:-$ROOT_DIR/.venv/bin/python}"
+COPY_DUCKDB_BIN="${COPY_DUCKDB_BIN:-$DUCKDB_BIN}"
+COPY_DUCKDB_LIB="${COPY_DUCKDB_LIB:-$ROOT_DIR/build/release/src/libduckdb.so}"
+COPY_EXTENSION_PATH="${COPY_EXTENSION_PATH:-$EXTENSION_PATH}"
 
 if [ ! -x "$DUCKDB_BIN" ]; then
   echo "DuckDB binary not found: $DUCKDB_BIN" >&2
@@ -39,6 +42,13 @@ run_sql_test() {
   local log_file="$2"
   sed "s#build/release/extension/nats_js/nats_js.duckdb_extension#$EXTENSION_PATH#g" "$ROOT_DIR/$test_file" \
     | "$DUCKDB_BIN" -unsigned :memory: >"$log_file"
+}
+
+run_copy_sql_test() {
+  local test_file="$1"
+  local log_file="$2"
+  sed "s#build/release/extension/nats_js/nats_js.duckdb_extension#$COPY_EXTENSION_PATH#g" "$ROOT_DIR/$test_file" \
+    | "$COPY_DUCKDB_BIN" -unsigned :memory: >"$log_file"
 }
 
 echo "Checking NATS connection at $NATS_URL"
@@ -91,6 +101,28 @@ for pattern in \
 done
 echo "PASS test/sql/test_protobuf_errors.sql"
 
+echo "RUN test/sql/test_copy_from.sql"
+log_file="/tmp/test_copy_from.sql.log"
+run_copy_sql_test "test/sql/test_copy_from.sql" "$log_file"
+echo "PASS test/sql/test_copy_from.sql"
+
+echo "RUN test/sql/test_copy_from_errors.sql (expected errors)"
+if run_copy_sql_test "test/sql/test_copy_from_errors.sql" /tmp/test_copy_from_errors.sql.log >/tmp/test_copy_from_errors.sql.log 2>&1; then
+  echo "Expected COPY FROM error suite to fail, but it exited 0" >&2
+  exit 1
+fi
+
+for pattern in \
+  "requires the target table schema to match" \
+  "Cannot use both subject and subject_contains parameters"; do
+  if ! grep -q "$pattern" /tmp/test_copy_from_errors.sql.log; then
+    echo "Missing expected COPY error pattern: $pattern" >&2
+    tail -n 80 /tmp/test_copy_from_errors.sql.log >&2
+    exit 1
+  fi
+done
+echo "PASS test/sql/test_copy_from_errors.sql"
+
 echo "RUN scripts/run-ingest-harness.sh"
 NATS_URL="$NATS_URL" \
 NATS_CLI="$NATS_CLI" \
@@ -121,6 +153,9 @@ RESET_STREAMS=1 \
 echo "PASS scripts/run-ingest-pause-resume-harness.sh"
 
 echo "RUN scripts/run-copy-harness.sh"
+DUCKDB_BIN="$COPY_DUCKDB_BIN" \
+DUCKDB_LIB="$COPY_DUCKDB_LIB" \
+EXTENSION_PATH="$COPY_EXTENSION_PATH" \
 NATS_URL="$NATS_URL" \
 NATS_CLI="$NATS_CLI" \
 RESET_STREAMS=1 \

@@ -164,6 +164,8 @@ control path and the richer ingest status fields.
 JetStream also registers a `nats_js` `COPY FROM` format that reuses the same
 source path. Use it when you want to load a table with the standard scan
 schema via `COPY target FROM 'ingest_resume' (FORMAT nats_js, url '...')`.
+Regression coverage for the format lives in `test/sql/test_copy_from.sql`,
+`test/sql/test_copy_from_errors.sql`, and `scripts/run-copy-harness.sh`.
 
 Ingest jobs also persist a checkpoint keyed by `stream_name` and `durable_name`,
 so restarting with the same durable resumes from the last committed sequence.
