@@ -90,6 +90,7 @@ struct NatsIngestSnapshot {
     int64_t poll_ms = 100;
     int64_t fetch_timeout_ms = 1000;
     bool resume_from_checkpoint = true;
+    bool create_target_table = false;
     string subject_contains;
     string nats_subject;
     vector<string> json_fields;
@@ -128,6 +129,8 @@ static constexpr const char *NATS_INGEST_REGISTRY_TABLE = "duckdb_nats_ingest_jo
 static NatsIngestSnapshot SnapshotJob(const shared_ptr<NatsIngestJobState> &job);
 static NatsIngestConfig SnapshotToConfig(const NatsIngestSnapshot &snapshot);
 static void RunIngestWorker(const shared_ptr<NatsIngestJobState> &job);
+static TableCatalogEntry &ResolveTargetTable(ClientContext &context, const string &target_table);
+static void EnsureTargetTable(Connection &conn, NatsIngestConfig &config);
 
 static string SqlStringLiteral(const string &value) {
     string result = "'";
@@ -206,6 +209,7 @@ static void EnsureRegistryTable(Connection &conn) {
         << "poll_ms BIGINT NOT NULL,"
         << "fetch_timeout_ms BIGINT NOT NULL,"
         << "resume_from_checkpoint BOOLEAN NOT NULL,"
+        << "create_target_table BOOLEAN NOT NULL,"
         << "subject_contains VARCHAR,"
         << "nats_subject VARCHAR,"
         << "json_fields VARCHAR[],"
@@ -228,13 +232,21 @@ static void EnsureRegistryTable(Connection &conn) {
         << "updated_at TIMESTAMP NOT NULL"
         << ")";
     ExecuteOrThrow(conn, sql.str(), "Failed to create ingest registry table");
+    ExecuteOrThrow(conn,
+                   "ALTER TABLE " + string(NATS_INGEST_REGISTRY_TABLE) +
+                       " ADD COLUMN IF NOT EXISTS create_target_table BOOLEAN",
+                   "Failed to migrate ingest registry table");
+    ExecuteOrThrow(conn,
+                   "UPDATE " + string(NATS_INGEST_REGISTRY_TABLE) +
+                       " SET create_target_table = COALESCE(create_target_table, FALSE)",
+                   "Failed to backfill ingest registry table");
 }
 
 static void UpsertRegistry(Connection &conn, const NatsIngestSnapshot &snapshot) {
     std::ostringstream sql;
     sql << "INSERT INTO " << NATS_INGEST_REGISTRY_TABLE
         << " (job_name, stream_name, target_table, durable_name, nats_url, start_seq, batch_size, poll_ms, "
-           "fetch_timeout_ms, resume_from_checkpoint, subject_contains, nats_subject, json_fields, proto_file, "
+           "fetch_timeout_ms, resume_from_checkpoint, create_target_table, subject_contains, nats_subject, json_fields, proto_file, "
            "proto_message, proto_fields, running, stop_requested, stopped, failed, last_committed_seq, "
            "last_delivered_seq, rows_inserted, batches_committed, sequence_lag, last_start_time, last_commit_time, "
            "last_error_time, last_error, updated_at) VALUES ("
@@ -248,6 +260,7 @@ static void UpsertRegistry(Connection &conn, const NatsIngestSnapshot &snapshot)
         << snapshot.poll_ms << ", "
         << snapshot.fetch_timeout_ms << ", "
         << (snapshot.resume_from_checkpoint ? "TRUE" : "FALSE") << ", "
+        << (snapshot.create_target_table ? "TRUE" : "FALSE") << ", "
         << (snapshot.subject_contains.empty() ? "NULL" : SqlStringLiteral(snapshot.subject_contains)) << ", "
         << (snapshot.nats_subject.empty() ? "NULL" : SqlStringLiteral(snapshot.nats_subject)) << ", "
         << SqlListLiteral(snapshot.json_fields) << ", "
@@ -278,6 +291,7 @@ static void UpsertRegistry(Connection &conn, const NatsIngestSnapshot &snapshot)
         << "poll_ms = excluded.poll_ms, "
         << "fetch_timeout_ms = excluded.fetch_timeout_ms, "
         << "resume_from_checkpoint = excluded.resume_from_checkpoint, "
+        << "create_target_table = excluded.create_target_table, "
         << "subject_contains = excluded.subject_contains, "
         << "nats_subject = excluded.nats_subject, "
         << "json_fields = excluded.json_fields, "
@@ -308,7 +322,7 @@ static void PersistRegistry(Connection &conn, const shared_ptr<NatsIngestJobStat
 static bool LoadRegistrySnapshot(Connection &conn, const string &job_name, NatsIngestSnapshot &snapshot) {
     std::ostringstream sql;
     sql << "SELECT job_name, stream_name, target_table, durable_name, nats_url, start_seq, batch_size, poll_ms, "
-           "fetch_timeout_ms, resume_from_checkpoint, subject_contains, nats_subject, json_fields, proto_file, "
+           "fetch_timeout_ms, resume_from_checkpoint, create_target_table, subject_contains, nats_subject, json_fields, proto_file, "
            "proto_message, proto_fields, running, stop_requested, stopped, failed, last_committed_seq, "
            "last_delivered_seq, rows_inserted, batches_committed, sequence_lag, last_start_time, last_commit_time, "
            "last_error_time, last_error "
@@ -334,48 +348,49 @@ static bool LoadRegistrySnapshot(Connection &conn, const string &job_name, NatsI
     snapshot.poll_ms = chunk->GetValue(7, 0).GetValue<int64_t>();
     snapshot.fetch_timeout_ms = chunk->GetValue(8, 0).GetValue<int64_t>();
     snapshot.resume_from_checkpoint = chunk->GetValue(9, 0).GetValue<bool>();
-    if (!chunk->GetValue(10, 0).IsNull()) {
-        snapshot.subject_contains = chunk->GetValue(10, 0).GetValue<string>();
-    }
+    snapshot.create_target_table = chunk->GetValue(10, 0).GetValue<bool>();
     if (!chunk->GetValue(11, 0).IsNull()) {
-        snapshot.nats_subject = chunk->GetValue(11, 0).GetValue<string>();
+        snapshot.subject_contains = chunk->GetValue(11, 0).GetValue<string>();
     }
     if (!chunk->GetValue(12, 0).IsNull()) {
-        for (auto &entry : ListValue::GetChildren(chunk->GetValue(12, 0))) {
+        snapshot.nats_subject = chunk->GetValue(12, 0).GetValue<string>();
+    }
+    if (!chunk->GetValue(13, 0).IsNull()) {
+        for (auto &entry : ListValue::GetChildren(chunk->GetValue(13, 0))) {
             snapshot.json_fields.push_back(entry.GetValue<string>());
         }
     }
-    if (!chunk->GetValue(13, 0).IsNull()) {
-        snapshot.proto_file = chunk->GetValue(13, 0).GetValue<string>();
-    }
     if (!chunk->GetValue(14, 0).IsNull()) {
-        snapshot.proto_message = chunk->GetValue(14, 0).GetValue<string>();
+        snapshot.proto_file = chunk->GetValue(14, 0).GetValue<string>();
     }
     if (!chunk->GetValue(15, 0).IsNull()) {
-        for (auto &entry : ListValue::GetChildren(chunk->GetValue(15, 0))) {
+        snapshot.proto_message = chunk->GetValue(15, 0).GetValue<string>();
+    }
+    if (!chunk->GetValue(16, 0).IsNull()) {
+        for (auto &entry : ListValue::GetChildren(chunk->GetValue(16, 0))) {
             snapshot.proto_fields.push_back(entry.GetValue<string>());
         }
     }
-    snapshot.running = chunk->GetValue(16, 0).GetValue<bool>();
-    snapshot.stop_requested = chunk->GetValue(17, 0).GetValue<bool>();
-    snapshot.stopped = chunk->GetValue(18, 0).GetValue<bool>();
-    snapshot.failed = chunk->GetValue(19, 0).GetValue<bool>();
-    snapshot.last_committed_seq = chunk->GetValue(20, 0).GetValue<uint64_t>();
-    snapshot.last_delivered_seq = chunk->GetValue(21, 0).GetValue<uint64_t>();
-    snapshot.rows_inserted = chunk->GetValue(22, 0).GetValue<uint64_t>();
-    snapshot.batches_committed = chunk->GetValue(23, 0).GetValue<uint64_t>();
-    snapshot.sequence_lag = chunk->GetValue(24, 0).GetValue<uint64_t>();
-    if (!chunk->GetValue(25, 0).IsNull()) {
-        snapshot.last_start_time = chunk->GetValue(25, 0).GetValue<timestamp_t>();
-    }
+    snapshot.running = chunk->GetValue(17, 0).GetValue<bool>();
+    snapshot.stop_requested = chunk->GetValue(18, 0).GetValue<bool>();
+    snapshot.stopped = chunk->GetValue(19, 0).GetValue<bool>();
+    snapshot.failed = chunk->GetValue(20, 0).GetValue<bool>();
+    snapshot.last_committed_seq = chunk->GetValue(21, 0).GetValue<uint64_t>();
+    snapshot.last_delivered_seq = chunk->GetValue(22, 0).GetValue<uint64_t>();
+    snapshot.rows_inserted = chunk->GetValue(23, 0).GetValue<uint64_t>();
+    snapshot.batches_committed = chunk->GetValue(24, 0).GetValue<uint64_t>();
+    snapshot.sequence_lag = chunk->GetValue(25, 0).GetValue<uint64_t>();
     if (!chunk->GetValue(26, 0).IsNull()) {
-        snapshot.last_commit_time = chunk->GetValue(26, 0).GetValue<timestamp_t>();
+        snapshot.last_start_time = chunk->GetValue(26, 0).GetValue<timestamp_t>();
     }
     if (!chunk->GetValue(27, 0).IsNull()) {
-        snapshot.last_error_time = chunk->GetValue(27, 0).GetValue<timestamp_t>();
+        snapshot.last_commit_time = chunk->GetValue(27, 0).GetValue<timestamp_t>();
     }
     if (!chunk->GetValue(28, 0).IsNull()) {
-        snapshot.last_error = chunk->GetValue(28, 0).GetValue<string>();
+        snapshot.last_error_time = chunk->GetValue(28, 0).GetValue<timestamp_t>();
+    }
+    if (!chunk->GetValue(29, 0).IsNull()) {
+        snapshot.last_error = chunk->GetValue(29, 0).GetValue<string>();
     }
     return true;
 }
@@ -383,7 +398,7 @@ static bool LoadRegistrySnapshot(Connection &conn, const string &job_name, NatsI
 static vector<NatsIngestSnapshot> LoadRegistrySnapshots(Connection &conn) {
     std::ostringstream sql;
     sql << "SELECT job_name, stream_name, target_table, durable_name, nats_url, start_seq, batch_size, poll_ms, "
-           "fetch_timeout_ms, resume_from_checkpoint, subject_contains, nats_subject, json_fields, proto_file, "
+           "fetch_timeout_ms, resume_from_checkpoint, create_target_table, subject_contains, nats_subject, json_fields, proto_file, "
            "proto_message, proto_fields, running, stop_requested, stopped, failed, last_committed_seq, "
            "last_delivered_seq, rows_inserted, batches_committed, sequence_lag, last_start_time, last_commit_time, "
            "last_error_time, last_error "
@@ -408,48 +423,49 @@ static vector<NatsIngestSnapshot> LoadRegistrySnapshots(Connection &conn) {
             snapshot.poll_ms = chunk->GetValue(7, row).GetValue<int64_t>();
             snapshot.fetch_timeout_ms = chunk->GetValue(8, row).GetValue<int64_t>();
             snapshot.resume_from_checkpoint = chunk->GetValue(9, row).GetValue<bool>();
-            if (!chunk->GetValue(10, row).IsNull()) {
-                snapshot.subject_contains = chunk->GetValue(10, row).GetValue<string>();
-            }
+            snapshot.create_target_table = chunk->GetValue(10, row).GetValue<bool>();
             if (!chunk->GetValue(11, row).IsNull()) {
-                snapshot.nats_subject = chunk->GetValue(11, row).GetValue<string>();
+                snapshot.subject_contains = chunk->GetValue(11, row).GetValue<string>();
             }
             if (!chunk->GetValue(12, row).IsNull()) {
-                for (auto &entry : ListValue::GetChildren(chunk->GetValue(12, row))) {
+                snapshot.nats_subject = chunk->GetValue(12, row).GetValue<string>();
+            }
+            if (!chunk->GetValue(13, row).IsNull()) {
+                for (auto &entry : ListValue::GetChildren(chunk->GetValue(13, row))) {
                     snapshot.json_fields.push_back(entry.GetValue<string>());
                 }
             }
-            if (!chunk->GetValue(13, row).IsNull()) {
-                snapshot.proto_file = chunk->GetValue(13, row).GetValue<string>();
-            }
             if (!chunk->GetValue(14, row).IsNull()) {
-                snapshot.proto_message = chunk->GetValue(14, row).GetValue<string>();
+                snapshot.proto_file = chunk->GetValue(14, row).GetValue<string>();
             }
             if (!chunk->GetValue(15, row).IsNull()) {
-                for (auto &entry : ListValue::GetChildren(chunk->GetValue(15, row))) {
+                snapshot.proto_message = chunk->GetValue(15, row).GetValue<string>();
+            }
+            if (!chunk->GetValue(16, row).IsNull()) {
+                for (auto &entry : ListValue::GetChildren(chunk->GetValue(16, row))) {
                     snapshot.proto_fields.push_back(entry.GetValue<string>());
                 }
             }
-            snapshot.running = chunk->GetValue(16, row).GetValue<bool>();
-            snapshot.stop_requested = chunk->GetValue(17, row).GetValue<bool>();
-            snapshot.stopped = chunk->GetValue(18, row).GetValue<bool>();
-            snapshot.failed = chunk->GetValue(19, row).GetValue<bool>();
-            snapshot.last_committed_seq = chunk->GetValue(20, row).GetValue<uint64_t>();
-            snapshot.last_delivered_seq = chunk->GetValue(21, row).GetValue<uint64_t>();
-            snapshot.rows_inserted = chunk->GetValue(22, row).GetValue<uint64_t>();
-            snapshot.batches_committed = chunk->GetValue(23, row).GetValue<uint64_t>();
-            snapshot.sequence_lag = chunk->GetValue(24, row).GetValue<uint64_t>();
-            if (!chunk->GetValue(25, row).IsNull()) {
-                snapshot.last_start_time = chunk->GetValue(25, row).GetValue<timestamp_t>();
-            }
+            snapshot.running = chunk->GetValue(17, row).GetValue<bool>();
+            snapshot.stop_requested = chunk->GetValue(18, row).GetValue<bool>();
+            snapshot.stopped = chunk->GetValue(19, row).GetValue<bool>();
+            snapshot.failed = chunk->GetValue(20, row).GetValue<bool>();
+            snapshot.last_committed_seq = chunk->GetValue(21, row).GetValue<uint64_t>();
+            snapshot.last_delivered_seq = chunk->GetValue(22, row).GetValue<uint64_t>();
+            snapshot.rows_inserted = chunk->GetValue(23, row).GetValue<uint64_t>();
+            snapshot.batches_committed = chunk->GetValue(24, row).GetValue<uint64_t>();
+            snapshot.sequence_lag = chunk->GetValue(25, row).GetValue<uint64_t>();
             if (!chunk->GetValue(26, row).IsNull()) {
-                snapshot.last_commit_time = chunk->GetValue(26, row).GetValue<timestamp_t>();
+                snapshot.last_start_time = chunk->GetValue(26, row).GetValue<timestamp_t>();
             }
             if (!chunk->GetValue(27, row).IsNull()) {
-                snapshot.last_error_time = chunk->GetValue(27, row).GetValue<timestamp_t>();
+                snapshot.last_commit_time = chunk->GetValue(27, row).GetValue<timestamp_t>();
             }
             if (!chunk->GetValue(28, row).IsNull()) {
-                snapshot.last_error = chunk->GetValue(28, row).GetValue<string>();
+                snapshot.last_error_time = chunk->GetValue(28, row).GetValue<timestamp_t>();
+            }
+            if (!chunk->GetValue(29, row).IsNull()) {
+                snapshot.last_error = chunk->GetValue(29, row).GetValue<string>();
             }
             snapshots.push_back(std::move(snapshot));
         }
@@ -648,6 +664,7 @@ static NatsIngestConfig ParseStartConfig(TableFunctionBindInput &input) {
     bool has_target_table = false;
     bool has_durable_name = false;
     string subject_legacy;
+    bool create_target_table = false;
 
     for (auto &kv : input.named_parameters) {
         if (kv.first == "job_name") {
@@ -692,6 +709,8 @@ static NatsIngestConfig ParseStartConfig(TableFunctionBindInput &input) {
             for (auto &child : list_children) {
                 config.proto_fields.push_back(StringValue::Get(child));
             }
+        } else if (kv.first == "create_target_table") {
+            create_target_table = BooleanValue::Get(kv.second);
         }
     }
 
@@ -737,6 +756,8 @@ static NatsIngestConfig ParseStartConfig(TableFunctionBindInput &input) {
         }
     }
 
+    config.create_target_table = create_target_table;
+
     return config;
 }
 
@@ -753,6 +774,7 @@ static NatsIngestSnapshot SnapshotJob(const shared_ptr<NatsIngestJobState> &job)
     snapshot.poll_ms = job->config.poll_ms;
     snapshot.fetch_timeout_ms = job->config.fetch_timeout_ms;
     snapshot.resume_from_checkpoint = job->config.resume_from_checkpoint;
+    snapshot.create_target_table = job->config.create_target_table;
     snapshot.subject_contains = job->config.subject_contains;
     snapshot.nats_subject = job->config.nats_subject;
     snapshot.json_fields = job->config.json_fields;
@@ -789,6 +811,7 @@ static NatsIngestConfig SnapshotToConfig(const NatsIngestSnapshot &snapshot) {
     config.poll_ms = snapshot.poll_ms;
     config.fetch_timeout_ms = snapshot.fetch_timeout_ms;
     config.resume_from_checkpoint = snapshot.resume_from_checkpoint;
+    config.create_target_table = snapshot.create_target_table;
     config.subject_contains = snapshot.subject_contains;
     config.nats_subject = snapshot.nats_subject;
     config.json_fields = snapshot.json_fields;
@@ -885,6 +908,15 @@ static void InitializeIngestResources(const shared_ptr<NatsIngestJobState> &job)
     Connection db_connection(*job->db);
     EnsureCheckpointTable(db_connection);
 
+    if (!config.proto_fields.empty() && config.proto_field_paths.empty()) {
+        shared_ptr<DiskSourceTree> source_tree;
+        shared_ptr<ProtobufErrorCollector> error_collector;
+        shared_ptr<Importer> importer;
+        const Descriptor *descriptor = nullptr;
+        ImportProtoSchema(config.proto_file, config.proto_message, source_tree, error_collector, importer, descriptor);
+        ResolveProtoFieldPaths(descriptor, config.proto_fields, config.proto_field_paths);
+    }
+
     natsConnection *conn = nullptr;
     jsCtx *js = nullptr;
     ConnectJetStream(config.nats_url, &conn, &js);
@@ -945,7 +977,6 @@ static void InitializeIngestResources(const shared_ptr<NatsIngestJobState> &job)
         throw std::runtime_error(std::string("Failed to create JetStream pull subscription for '") +
                                  config.stream_name + "': " + natsStatus_GetText(s));
     }
-
     jsStreamInfo_Destroy(stream_info);
 
     lock_guard<std::mutex> guard(job->job_mutex);
@@ -1006,6 +1037,123 @@ static void RehydrateActiveIngestJobs(DatabaseInstance &db) {
             }
         }
     }
+}
+
+static string QuoteIdentifier(const string &identifier) {
+    string result = "\"";
+    for (char ch : identifier) {
+        if (ch == '"') {
+            result += "\"\"";
+        } else {
+            result += ch;
+        }
+    }
+    result += "\"";
+    return result;
+}
+
+static string ProtobufFieldDescriptorToSQLType(const FieldDescriptor *field) {
+    if (field == nullptr || field->is_repeated()) {
+        return "VARCHAR";
+    }
+    switch (field->type()) {
+    case FieldDescriptor::TYPE_STRING:
+        return "VARCHAR";
+    case FieldDescriptor::TYPE_BYTES:
+        return "BLOB";
+    case FieldDescriptor::TYPE_INT32:
+    case FieldDescriptor::TYPE_SINT32:
+    case FieldDescriptor::TYPE_SFIXED32:
+        return "INTEGER";
+    case FieldDescriptor::TYPE_INT64:
+    case FieldDescriptor::TYPE_SINT64:
+    case FieldDescriptor::TYPE_SFIXED64:
+        return "BIGINT";
+    case FieldDescriptor::TYPE_UINT32:
+    case FieldDescriptor::TYPE_FIXED32:
+        return "UINTEGER";
+    case FieldDescriptor::TYPE_UINT64:
+    case FieldDescriptor::TYPE_FIXED64:
+        return "UBIGINT";
+    case FieldDescriptor::TYPE_FLOAT:
+        return "FLOAT";
+    case FieldDescriptor::TYPE_DOUBLE:
+        return "DOUBLE";
+    case FieldDescriptor::TYPE_BOOL:
+        return "BOOLEAN";
+    case FieldDescriptor::TYPE_ENUM:
+    case FieldDescriptor::TYPE_MESSAGE:
+    default:
+        return "VARCHAR";
+    }
+}
+
+struct NatsIngestColumnDef {
+    string name;
+    string sql_type;
+};
+
+static vector<NatsIngestColumnDef> BuildTargetTableColumns(const NatsIngestConfig &config) {
+    vector<NatsIngestColumnDef> columns;
+    columns.push_back({"stream_name", "VARCHAR"});
+    columns.push_back({"subject", "VARCHAR"});
+    columns.push_back({"sequence", "UBIGINT"});
+    columns.push_back({"ts", "TIMESTAMP"});
+    columns.push_back({"payload", config.json_fields.empty() ? "BLOB" : "VARCHAR"});
+
+    for (const auto &field_name : config.json_fields) {
+        columns.push_back({field_name, "VARCHAR"});
+    }
+
+    for (idx_t i = 0; i < config.proto_fields.size(); i++) {
+        string column_name = config.proto_fields[i];
+        std::replace(column_name.begin(), column_name.end(), '.', '_');
+        string sql_type = "VARCHAR";
+        if (i < config.proto_field_paths.size() && !config.proto_field_paths[i].empty()) {
+            sql_type = ProtobufFieldDescriptorToSQLType(config.proto_field_paths[i].back());
+        }
+        columns.push_back({column_name, sql_type});
+    }
+
+    return columns;
+}
+
+static string BuildTargetTableCreateSql(const string &target_table, const NatsIngestConfig &config) {
+    auto qualified_name = QualifiedName::Parse(target_table);
+    if (!qualified_name.catalog.empty()) {
+        throw std::runtime_error("auto-create target table does not support catalog-qualified names");
+    }
+
+    std::ostringstream sql;
+    sql << "CREATE TABLE IF NOT EXISTS ";
+    if (!qualified_name.schema.empty()) {
+        sql << QuoteIdentifier(qualified_name.schema) << ".";
+    }
+    sql << QuoteIdentifier(qualified_name.name) << " (";
+
+    auto columns = BuildTargetTableColumns(config);
+    for (idx_t i = 0; i < columns.size(); i++) {
+        if (i > 0) {
+            sql << ", ";
+        }
+        sql << QuoteIdentifier(columns[i].name) << " " << columns[i].sql_type;
+    }
+    sql << ")";
+    return sql.str();
+}
+
+static void EnsureTargetTable(Connection &conn, NatsIngestConfig &config) {
+    try {
+        (void)ResolveTargetTable(*conn.context, config.target_table);
+        return;
+    } catch (const std::exception &) {
+    }
+
+    if (!config.create_target_table) {
+        throw std::runtime_error("Target table '" + config.target_table + "' does not exist");
+    }
+
+    ExecuteOrThrow(conn, BuildTargetTableCreateSql(config.target_table, config), "Failed to create ingest target table");
 }
 
 static TableCatalogEntry &ResolveTargetTable(ClientContext &context, const string &target_table) {
@@ -1143,6 +1291,9 @@ static void RunIngestWorker(const shared_ptr<NatsIngestJobState> &job) {
 
         if (!config.proto_fields.empty()) {
             ImportProtoSchema(config.proto_file, config.proto_message, source_tree, error_collector, importer, descriptor);
+            if (config.proto_field_paths.empty()) {
+                ResolveProtoFieldPaths(descriptor, config.proto_fields, config.proto_field_paths);
+            }
             proto_factory = make_shared_ptr<DynamicMessageFactory>();
             proto_template.reset(proto_factory->GetPrototype(descriptor)->New());
         }
@@ -1159,9 +1310,10 @@ static void RunIngestWorker(const shared_ptr<NatsIngestJobState> &job) {
         job->cv.notify_all();
         EnsureRegistryTable(db_connection);
         PersistRegistry(db_connection, job);
-
         EnsureActiveTransaction(db_connection);
         MarkTransactionWrite(db_connection);
+        EnsureTargetTable(db_connection, config);
+
         auto &table = ResolveTargetTable(*db_connection.context, config.target_table);
         std::unique_ptr<InternalAppender> appender = make_uniq<InternalAppender>(*db_connection.context, table);
 
@@ -1744,6 +1896,7 @@ void NatsIngestFunction::Register(ExtensionLoader &loader) {
     start_fn.named_parameters["batch_size"] = LogicalType(LogicalTypeId::UBIGINT);
     start_fn.named_parameters["poll_ms"] = LogicalType(LogicalTypeId::BIGINT);
     start_fn.named_parameters["fetch_timeout_ms"] = LogicalType(LogicalTypeId::BIGINT);
+    start_fn.named_parameters["create_target_table"] = LogicalType(LogicalTypeId::BOOLEAN);
     start_fn.named_parameters["subject"] = LogicalType(LogicalTypeId::VARCHAR);
     start_fn.named_parameters["subject_contains"] = LogicalType(LogicalTypeId::VARCHAR);
     start_fn.named_parameters["nats_subject"] = LogicalType(LogicalTypeId::VARCHAR);

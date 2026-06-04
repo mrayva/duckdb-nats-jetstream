@@ -5,6 +5,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 DUCKDB_BIN="${DUCKDB_BIN:-/home/mrayva/.duckdb/cli/1.5.3/duckdb}"
+DUCKDB_LIB="${DUCKDB_LIB:-$ROOT_DIR/build/release/src/libduckdb.so}"
 EXTENSION_PATH="${EXTENSION_PATH:-$ROOT_DIR/build/release/extension/nats_js/nats_js.duckdb_extension}"
 NATS_URL="${NATS_URL:-nats://127.0.0.1:4222}"
 NATS_CLI="${NATS_CLI:-$HOME/nats}"
@@ -30,37 +31,21 @@ if [ -z "$NATS_CLI" ]; then
   exit 1
 fi
 
-sql_escape() {
-  printf "%s" "$1" | sed "s/'/''/g"
-}
-
-db_file="$(mktemp /tmp/nats_ingest_rehydrate.XXXXXX.duckdb)"
-log_first="$(mktemp /tmp/nats_ingest_rehydrate.first.XXXXXX.log)"
-log_second="$(mktemp /tmp/nats_ingest_rehydrate.second.XXXXXX.log)"
-rm -f "$db_file"
-trap 'rm -f "$log_first" "$log_second" "$db_file"' EXIT
-
 echo "Checking NATS connection at $NATS_URL"
 "$NATS_CLI" server check connection --server "$NATS_URL"
 
 echo "Preparing JetStream streams"
 NATS_URL="$NATS_URL" NATS_CLI="$NATS_CLI" RESET_STREAMS="${RESET_STREAMS:-1}" "$ROOT_DIR/scripts/setup-streams.sh"
 
-run_duckdb() {
-  local sql="$1"
-  local log_file="$2"
-  set +e
-  "$DUCKDB_BIN" -unsigned "$db_file" -c "$sql" >"$log_file" 2>&1
-  local duckdb_status=$?
-  set -e
-  if [ "$duckdb_status" -ne 0 ]; then
-    cat "$log_file" >&2
-    exit "$duckdb_status"
-  fi
-}
+db_file="$(mktemp /tmp/nats_ingest_rehydrate.XXXXXX.duckdb)"
+log_first="$(mktemp /tmp/nats_ingest_rehydrate.first.XXXXXX.log)"
+log_second="$(mktemp /tmp/nats_ingest_rehydrate.second.XXXXXX.log)"
+rm -f "$db_file"
+trap 'rc=$?; rm -f "$log_first" "$log_second" "$db_file"; exit $rc' EXIT
 
-first_sql=$(cat <<SQL
-LOAD 'build/release/extension/nats_js/nats_js.duckdb_extension';
+if ! DUCKDB_LIB="$DUCKDB_LIB" NATS_INGEST_DISABLE_REHYDRATE=1 python3 "$ROOT_DIR/scripts/duckdb_session.py" --duckdb-bin "$DUCKDB_BIN" --db-file "$db_file" <<SQL >"$log_first" 2>&1
+SEND
+LOAD '${EXTENSION_PATH}';
 CREATE TABLE ingest_out(
     stream_name VARCHAR,
     subject VARCHAR,
@@ -80,64 +65,41 @@ FROM nats_start_ingest(
     fetch_timeout_ms := 100,
     start_seq := 1
 );
+END
+EXPECT start1=ingest_rehydrate|ingest_resume|ingest_out|duckdb_ingest_rehydrate 10
+SEND
+SELECT 'status1=' || running || '/' || rows_inserted || '/' || last_committed_seq || '/' || failed || '/' || stopped AS ingest_status
+FROM nats_ingest_status(job_name := 'ingest_rehydrate');
+END
+EXPECT status1=true/4/4/false/false 30
+QUIT
 SQL
-)
-
-run_duckdb "$first_sql" "$log_first"
-
-if ! grep -Fq "start1=ingest_rehydrate|ingest_resume|ingest_out|duckdb_ingest_rehydrate" "$log_first"; then
-  echo "Missing expected rehydrate start output" >&2
-  tail -n 80 "$log_first" >&2
+then
+  cat "$log_first" >&2
   exit 1
 fi
 
-echo "Publishing second ingest batch to ingest_resume"
-"$NATS_CLI" pub --jetstream --quiet --count 4 --server="$NATS_URL" "ingest_resume.items" "rehydrate-test-{{Count}}" >/dev/null
-
-second_sql=$(cat <<SQL
-LOAD 'build/release/extension/nats_js/nats_js.duckdb_extension';
-SELECT 'status1=' || running || '/' || rows_inserted || '/' || last_committed_seq || '/' || failed || '/' || stopped AS ingest_status
-FROM nats_ingest_status(job_name := 'ingest_rehydrate');
-SELECT SUM(i) FROM range(100000000) t(i);
+if ! DUCKDB_LIB="$DUCKDB_LIB" python3 "$ROOT_DIR/scripts/duckdb_session.py" --duckdb-bin "$DUCKDB_BIN" --db-file "$db_file" <<SQL >"$log_second" 2>&1
+SEND
+LOAD '${EXTENSION_PATH}';
 SELECT 'status2=' || running || '/' || rows_inserted || '/' || last_committed_seq || '/' || failed || '/' || stopped AS ingest_status
 FROM nats_ingest_status(job_name := 'ingest_rehydrate');
+END
+EXPECT status2=true/4/4/false/false 30
+SEND
 SELECT 'count=' || COUNT(*) AS inserted_rows FROM ingest_out;
 SELECT 'stop=' || job_name || '|' || stream_name || '|' || target_table || '|' || durable_name AS stop_result
 FROM nats_stop_ingest(job_name := 'ingest_rehydrate');
 SELECT 'stopped=' || stop_requested || '/' || stopped || '/' || failed AS stopped_status
 FROM nats_ingest_status(job_name := 'ingest_rehydrate');
+END
+EXPECT count=4 10
+EXPECT stop=ingest_rehydrate|ingest_resume|ingest_out|duckdb_ingest_rehydrate 10
+EXPECT stopped=true/false/false 10
+QUIT
 SQL
-)
-
-run_duckdb "$second_sql" "$log_second"
-
-if ! grep -Fq "status1=true/4/4/false/false" "$log_second"; then
-  echo "Missing expected initial rehydrate status" >&2
-  tail -n 120 "$log_second" >&2
-  exit 1
-fi
-
-if ! grep -Fq "status2=true/8/8/false/false" "$log_second"; then
-  echo "Missing expected progressed rehydrate status" >&2
-  tail -n 120 "$log_second" >&2
-  exit 1
-fi
-
-if ! grep -Fq "count=8" "$log_second"; then
-  echo "Missing expected rehydrate row count" >&2
-  tail -n 120 "$log_second" >&2
-  exit 1
-fi
-
-if ! grep -Fq "stop=ingest_rehydrate|ingest_resume|ingest_out|duckdb_ingest_rehydrate" "$log_second"; then
-  echo "Missing expected rehydrate stop output" >&2
-  tail -n 120 "$log_second" >&2
-  exit 1
-fi
-
-if ! grep -Fq "stopped=true/false/false" "$log_second"; then
-  echo "Missing expected rehydrate stop status" >&2
-  tail -n 120 "$log_second" >&2
+then
+  cat "$log_second" >&2
   exit 1
 fi
 

@@ -373,6 +373,9 @@ Run the deterministic ingest harness:
 HARNESS_MODE=redelivery ./scripts/run-ingest-harness.sh
 ```
 
+If you want DuckDB to create the ingest target table automatically, pass
+`create_target_table := true` to `nats_start_ingest(...)`.
+
 Run the ingest benchmark:
 
 ```bash

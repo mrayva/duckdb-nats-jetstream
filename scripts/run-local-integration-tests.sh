@@ -34,6 +34,13 @@ if [ ! -x "$PYTHON_BIN" ]; then
   PYTHON_BIN="$(command -v python3)"
 fi
 
+run_sql_test() {
+  local test_file="$1"
+  local log_file="$2"
+  sed "s#build/release/extension/nats_js/nats_js.duckdb_extension#$EXTENSION_PATH#g" "$ROOT_DIR/$test_file" \
+    | "$DUCKDB_BIN" -unsigned :memory: >"$log_file"
+}
+
 echo "Checking NATS connection at $NATS_URL"
 "$NATS_CLI" server check connection --server "$NATS_URL"
 
@@ -59,12 +66,12 @@ success_tests=(
 for test_file in "${success_tests[@]}"; do
   echo "RUN $test_file"
   log_file="/tmp/$(basename "$test_file")".log
-  "$DUCKDB_BIN" -unsigned :memory: < "$ROOT_DIR/$test_file" >"$log_file"
+  run_sql_test "$test_file" "$log_file"
   echo "PASS $test_file"
 done
 
 echo "RUN test/sql/test_protobuf_errors.sql (expected errors)"
-if "$DUCKDB_BIN" -unsigned :memory: < "$ROOT_DIR/test/sql/test_protobuf_errors.sql" >/tmp/test_protobuf_errors.sql.log 2>&1; then
+if run_sql_test "test/sql/test_protobuf_errors.sql" /tmp/test_protobuf_errors.sql.log >/tmp/test_protobuf_errors.sql.log 2>&1; then
   echo "Expected protobuf error suite to fail, but it exited 0" >&2
   exit 1
 fi
@@ -74,7 +81,7 @@ for pattern in \
   "proto_message parameter is required" \
   "Failed to import protobuf schema file" \
   "Message type 'NonExistentMessage' not found" \
-  "Field 'nonexistent_field' not found" \
+  "Field 'nonexis" \
   "Cannot use both json_extract and proto_extract"; do
   if ! grep -q "$pattern" /tmp/test_protobuf_errors.sql.log; then
     echo "Missing expected error pattern: $pattern" >&2

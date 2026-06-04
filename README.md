@@ -161,6 +161,8 @@ row count, and stops the job cleanly. The harness also supports
 
 Ingest jobs also persist a checkpoint keyed by `stream_name` and `durable_name`,
 so restarting with the same durable resumes from the last committed sequence.
+If you want DuckDB to create the destination table for you, pass
+`create_target_table := true` to `nats_start_ingest(...)`.
 
 For timing and throughput checks, use:
 

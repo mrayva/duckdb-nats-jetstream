@@ -1,4 +1,5 @@
 #include "nats_scan.hpp"
+#include "nats_message_decode.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
@@ -132,75 +133,6 @@ static const FieldDescriptor* GetFieldDescriptorForPath(const Descriptor* messag
     }
 
     return field;
-}
-
-static vector<const FieldDescriptor*> ResolveProtobufFieldPath(const Descriptor* message_desc, const string& field_path) {
-    auto path_parts = SplitFieldPath(field_path);
-    const Descriptor* current_desc = message_desc;
-    vector<const FieldDescriptor*> resolved_path;
-    resolved_path.reserve(path_parts.size());
-
-    for (size_t i = 0; i < path_parts.size(); i++) {
-        const FieldDescriptor* field = current_desc->FindFieldByName(path_parts[i]);
-        if (!field) {
-            throw std::runtime_error("Field '" + path_parts[i] + "' not found in message type '" +
-                                   string(current_desc->name()) + "' (field path: " + field_path + ")");
-        }
-        resolved_path.push_back(field);
-
-        if (i < path_parts.size() - 1) {
-            if (field->type() != FieldDescriptor::TYPE_MESSAGE) {
-                throw std::runtime_error("Field '" + path_parts[i] + "' is not a message type, cannot navigate to '" +
-                                       path_parts[i+1] + "' (field path: " + field_path + ")");
-            }
-            current_desc = field->message_type();
-        }
-    }
-
-    return resolved_path;
-}
-
-// Helper function to map protobuf field type to DuckDB LogicalType
-static LogicalType ProtobufTypeToDuckDBType(const FieldDescriptor* field) {
-    // Repeated fields are serialized as JSON arrays
-    if (field->is_repeated()) {
-        return LogicalType(LogicalTypeId::VARCHAR);
-    }
-    switch (field->type()) {
-        case FieldDescriptor::TYPE_STRING:
-            return LogicalType(LogicalTypeId::VARCHAR);
-        case FieldDescriptor::TYPE_BYTES:
-            return LogicalType(LogicalTypeId::BLOB);
-        case FieldDescriptor::TYPE_INT32:
-        case FieldDescriptor::TYPE_SINT32:
-        case FieldDescriptor::TYPE_SFIXED32:
-            return LogicalType(LogicalTypeId::INTEGER);
-        case FieldDescriptor::TYPE_INT64:
-        case FieldDescriptor::TYPE_SINT64:
-        case FieldDescriptor::TYPE_SFIXED64:
-            return LogicalType(LogicalTypeId::BIGINT);
-        case FieldDescriptor::TYPE_UINT32:
-        case FieldDescriptor::TYPE_FIXED32:
-            return LogicalType(LogicalTypeId::UINTEGER);
-        case FieldDescriptor::TYPE_UINT64:
-        case FieldDescriptor::TYPE_FIXED64:
-            return LogicalType(LogicalTypeId::UBIGINT);
-        case FieldDescriptor::TYPE_FLOAT:
-            return LogicalType(LogicalTypeId::FLOAT);
-        case FieldDescriptor::TYPE_DOUBLE:
-            return LogicalType(LogicalTypeId::DOUBLE);
-        case FieldDescriptor::TYPE_BOOL:
-            return LogicalType(LogicalTypeId::BOOLEAN);
-        case FieldDescriptor::TYPE_ENUM:
-            // Enums are represented as VARCHAR with the enum name
-            return LogicalType(LogicalTypeId::VARCHAR);
-        case FieldDescriptor::TYPE_MESSAGE:
-            // Nested messages not supported as column types (should be extracted as fields)
-            return LogicalType(LogicalTypeId::VARCHAR);
-        default:
-            // Unknown type - default to VARCHAR
-            return LogicalType(LogicalTypeId::VARCHAR);
-    }
 }
 
 struct NatsScanGlobalState : public GlobalTableFunctionState {
@@ -422,7 +354,7 @@ static unique_ptr<FunctionData> NatsScanBind(ClientContext &context, TableFuncti
 
         const FieldDescriptor* field_desc = GetFieldDescriptorForPath(descriptor, field_path);
         if (field_desc) {
-            return_types.emplace_back(ProtobufTypeToDuckDBType(field_desc));
+            return_types.emplace_back(ProtobufFieldDescriptorToDuckDBType(field_desc));
         } else {
             return_types.emplace_back(LogicalType(LogicalTypeId::VARCHAR));
         }
@@ -704,125 +636,6 @@ static unique_ptr<LocalTableFunctionState> NatsScanInitLocal(ExecutionContext &c
                                                                TableFunctionInitInput &input,
                                                                GlobalTableFunctionState *global_state) {
     return make_uniq<NatsScanLocalState>();
-}
-
-static Value ExtractProtobufValue(const Message* message, const vector<const FieldDescriptor*> &field_path) {
-    const Message* current_message = message;
-    const Reflection* reflection = message->GetReflection();
-
-    for (size_t i = 0; i < field_path.size(); i++) {
-        const FieldDescriptor* field = field_path[i];
-        if (!field) {
-            return Value();
-        }
-
-        if (i < field_path.size() - 1) {
-            if (field->type() != FieldDescriptor::TYPE_MESSAGE) {
-                return Value();
-            }
-            if (!reflection->HasField(*current_message, field)) {
-                return Value();
-            }
-            current_message = &reflection->GetMessage(*current_message, field);
-            reflection = current_message->GetReflection();
-        } else {
-            // Repeated fields: serialize as JSON array
-            if (field->is_repeated()) {
-                int count = reflection->FieldSize(*current_message, field);
-                if (count == 0) {
-                    return Value("[]");
-                }
-                string result = "[";
-                for (int j = 0; j < count; j++) {
-                    if (j > 0) result += ",";
-                    switch (field->type()) {
-                        case FieldDescriptor::TYPE_STRING:
-                            result += "\"" + reflection->GetRepeatedString(*current_message, field, j) + "\"";
-                            break;
-                        case FieldDescriptor::TYPE_INT32:
-                        case FieldDescriptor::TYPE_SINT32:
-                        case FieldDescriptor::TYPE_SFIXED32:
-                            result += std::to_string(reflection->GetRepeatedInt32(*current_message, field, j));
-                            break;
-                        case FieldDescriptor::TYPE_INT64:
-                        case FieldDescriptor::TYPE_SINT64:
-                        case FieldDescriptor::TYPE_SFIXED64:
-                            result += std::to_string(reflection->GetRepeatedInt64(*current_message, field, j));
-                            break;
-                        case FieldDescriptor::TYPE_UINT32:
-                        case FieldDescriptor::TYPE_FIXED32:
-                            result += std::to_string(reflection->GetRepeatedUInt32(*current_message, field, j));
-                            break;
-                        case FieldDescriptor::TYPE_UINT64:
-                        case FieldDescriptor::TYPE_FIXED64:
-                            result += std::to_string(reflection->GetRepeatedUInt64(*current_message, field, j));
-                            break;
-                        case FieldDescriptor::TYPE_FLOAT:
-                            result += std::to_string(reflection->GetRepeatedFloat(*current_message, field, j));
-                            break;
-                        case FieldDescriptor::TYPE_DOUBLE:
-                            result += std::to_string(reflection->GetRepeatedDouble(*current_message, field, j));
-                            break;
-                        case FieldDescriptor::TYPE_BOOL:
-                            result += reflection->GetRepeatedBool(*current_message, field, j) ? "true" : "false";
-                            break;
-                        case FieldDescriptor::TYPE_ENUM:
-                            result += "\"" + string(reflection->GetRepeatedEnum(*current_message, field, j)->name()) + "\"";
-                            break;
-                        default:
-                            result += "null";
-                            break;
-                    }
-                }
-                result += "]";
-                return Value(result);
-            }
-
-            // proto3 primitives always have defaults; only check message fields for presence
-            if (!reflection->HasField(*current_message, field) && field->type() == FieldDescriptor::TYPE_MESSAGE) {
-                return Value();
-            }
-
-            switch (field->type()) {
-                case FieldDescriptor::TYPE_STRING:
-                    return Value(reflection->GetString(*current_message, field));
-                case FieldDescriptor::TYPE_BYTES: {
-                    string bytes = reflection->GetString(*current_message, field);
-                    return Value::BLOB(const_data_ptr_cast(bytes.data()), bytes.size());
-                }
-                case FieldDescriptor::TYPE_INT32:
-                case FieldDescriptor::TYPE_SINT32:
-                case FieldDescriptor::TYPE_SFIXED32:
-                    return Value::INTEGER(reflection->GetInt32(*current_message, field));
-                case FieldDescriptor::TYPE_INT64:
-                case FieldDescriptor::TYPE_SINT64:
-                case FieldDescriptor::TYPE_SFIXED64:
-                    return Value::BIGINT(reflection->GetInt64(*current_message, field));
-                case FieldDescriptor::TYPE_UINT32:
-                case FieldDescriptor::TYPE_FIXED32:
-                    return Value::UINTEGER(reflection->GetUInt32(*current_message, field));
-                case FieldDescriptor::TYPE_UINT64:
-                case FieldDescriptor::TYPE_FIXED64:
-                    return Value::UBIGINT(reflection->GetUInt64(*current_message, field));
-                case FieldDescriptor::TYPE_FLOAT:
-                    return Value::FLOAT(reflection->GetFloat(*current_message, field));
-                case FieldDescriptor::TYPE_DOUBLE:
-                    return Value::DOUBLE(reflection->GetDouble(*current_message, field));
-                case FieldDescriptor::TYPE_BOOL:
-                    return Value::BOOLEAN(reflection->GetBool(*current_message, field));
-                case FieldDescriptor::TYPE_ENUM: {
-                    const EnumValueDescriptor* enum_val = reflection->GetEnum(*current_message, field);
-                    return Value(string(enum_val->name()));
-                }
-                case FieldDescriptor::TYPE_MESSAGE:
-                    return Value();
-                default:
-                    return Value();
-            }
-        }
-    }
-
-    return Value();  // Should not reach here
 }
 
 static void NatsScanExecute(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {

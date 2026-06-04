@@ -430,6 +430,9 @@ The implementation uses a small set of fast paths to keep common scans predictab
 Ingest jobs persist checkpoints in `duckdb_nats_ingest_checkpoints`, keyed by
 `(stream_name, durable_name)`. A restarted job with the same durable resumes from
 the last committed sequence rather than replaying from the original start.
+By default `nats_start_ingest` expects the destination table to already exist;
+pass `create_target_table := true` to have the extension create the target
+table before ingest begins, using the standard ingest column layout.
 
 ### Ingest Validation
 

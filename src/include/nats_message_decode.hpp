@@ -9,6 +9,8 @@ namespace duckdb {
 vector<const google::protobuf::FieldDescriptor *> ResolveProtobufFieldPath(
     const google::protobuf::Descriptor *message_desc, const string &field_path);
 
+LogicalType ProtobufFieldDescriptorToDuckDBType(const google::protobuf::FieldDescriptor *field);
+
 Value ExtractProtobufValue(const google::protobuf::Message *message,
                            const vector<const google::protobuf::FieldDescriptor *> &field_path);
 

@@ -40,6 +40,42 @@ vector<const google::protobuf::FieldDescriptor *> ResolveProtobufFieldPath(
     return resolved_path;
 }
 
+LogicalType ProtobufFieldDescriptorToDuckDBType(const google::protobuf::FieldDescriptor *field) {
+    if (field == nullptr || field->is_repeated()) {
+        return LogicalType(LogicalTypeId::VARCHAR);
+    }
+    switch (field->type()) {
+    case google::protobuf::FieldDescriptor::TYPE_STRING:
+        return LogicalType(LogicalTypeId::VARCHAR);
+    case google::protobuf::FieldDescriptor::TYPE_BYTES:
+        return LogicalType(LogicalTypeId::BLOB);
+    case google::protobuf::FieldDescriptor::TYPE_INT32:
+    case google::protobuf::FieldDescriptor::TYPE_SINT32:
+    case google::protobuf::FieldDescriptor::TYPE_SFIXED32:
+        return LogicalType(LogicalTypeId::INTEGER);
+    case google::protobuf::FieldDescriptor::TYPE_INT64:
+    case google::protobuf::FieldDescriptor::TYPE_SINT64:
+    case google::protobuf::FieldDescriptor::TYPE_SFIXED64:
+        return LogicalType(LogicalTypeId::BIGINT);
+    case google::protobuf::FieldDescriptor::TYPE_UINT32:
+    case google::protobuf::FieldDescriptor::TYPE_FIXED32:
+        return LogicalType(LogicalTypeId::UINTEGER);
+    case google::protobuf::FieldDescriptor::TYPE_UINT64:
+    case google::protobuf::FieldDescriptor::TYPE_FIXED64:
+        return LogicalType(LogicalTypeId::UBIGINT);
+    case google::protobuf::FieldDescriptor::TYPE_FLOAT:
+        return LogicalType(LogicalTypeId::FLOAT);
+    case google::protobuf::FieldDescriptor::TYPE_DOUBLE:
+        return LogicalType(LogicalTypeId::DOUBLE);
+    case google::protobuf::FieldDescriptor::TYPE_BOOL:
+        return LogicalType(LogicalTypeId::BOOLEAN);
+    case google::protobuf::FieldDescriptor::TYPE_ENUM:
+    case google::protobuf::FieldDescriptor::TYPE_MESSAGE:
+    default:
+        return LogicalType(LogicalTypeId::VARCHAR);
+    }
+}
+
 Value ExtractProtobufValue(const google::protobuf::Message *message,
                            const vector<const google::protobuf::FieldDescriptor *> &field_path) {
     const google::protobuf::Message *current_message = message;

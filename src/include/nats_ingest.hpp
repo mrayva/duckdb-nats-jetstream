@@ -33,6 +33,7 @@ struct NatsIngestConfig {
     int64_t poll_ms = 100;
     int64_t fetch_timeout_ms = 1000;
     bool resume_from_checkpoint = true;
+    bool create_target_table = false;
     vector<string> json_fields;
     string proto_file;
     string proto_message;
