@@ -218,6 +218,37 @@ static NatsSourceSchema BuildNatsSourceSchema(const vector<string> &json_fields,
     return schema;
 }
 
+static string ResolveNatsCopyStreamName(const string &file_path, const char *copy_mode) {
+    if (file_path.empty()) {
+        throw BinderException("%s FORMAT nats_js requires a stream name in the file path", copy_mode);
+    }
+    return file_path;
+}
+
+static string ResolveNatsCopyUrl(const case_insensitive_map_t<vector<Value>> &options, const char *copy_mode,
+                                 const string *default_url) {
+    auto url = GetCopyOptionString(options, "url");
+    if (url.has_value() && !url->empty()) {
+        return *url;
+    }
+    if (default_url != nullptr) {
+        return *default_url;
+    }
+    throw BinderException("%s FORMAT nats_js requires a \"url\" option", copy_mode);
+}
+
+static void ValidateNatsCopyFromSchema(const vector<string> &expected_names, const vector<LogicalType> &expected_types,
+                                       const NatsSourceSchema &schema) {
+    if (schema.names.size() != expected_names.size() || schema.return_types.size() != expected_types.size()) {
+        throw std::runtime_error("COPY FROM FORMAT nats_js requires the target table schema to match the nats_scan output schema");
+    }
+    for (idx_t i = 0; i < schema.return_types.size(); i++) {
+        if (!StringUtil::CIEquals(schema.names[i], expected_names[i]) || schema.return_types[i] != expected_types[i]) {
+            throw std::runtime_error("COPY FROM FORMAT nats_js requires the target table schema to match the nats_scan output schema");
+        }
+    }
+}
+
 static idx_t FindColumnIndex(const vector<string> &names, const string &column_name) {
     for (idx_t i = 0; i < names.size(); i++) {
         if (StringUtil::CIEquals(names[i], column_name)) {
@@ -294,15 +325,8 @@ static void DisconnectNats(natsConnection **conn) {
 static unique_ptr<FunctionData> NatsCopyToBind(ClientContext &context, CopyFunctionBindInput &input,
                                                const vector<string> &names, const vector<LogicalType> &sql_types) {
     auto result = make_uniq<NatsCopyToBindData>();
-    auto url = GetCopyOptionString(input.info.options, "url");
-    if (!url.has_value() || url->empty()) {
-        throw BinderException("COPY TO FORMAT nats_js requires a \"url\" option");
-    }
-    result->nats_url = *url;
-    result->stream_name = input.info.file_path;
-    if (result->stream_name.empty()) {
-        throw BinderException("COPY TO FORMAT nats_js requires a target stream name in the file path");
-    }
+    result->nats_url = ResolveNatsCopyUrl(input.info.options, "COPY TO", nullptr);
+    result->stream_name = ResolveNatsCopyStreamName(input.info.file_path, "COPY TO");
 
     auto subject = GetCopyOptionString(input.info.options, "subject");
     if (subject.has_value() && !subject->empty()) {
@@ -1502,15 +1526,12 @@ static TableFunction CreateNatsScanTableFunction() {
 
 static unique_ptr<FunctionData> NatsCopyFromBind(ClientContext &context, CopyFromFunctionBindInput &input,
                                                  vector<string> &expected_names, vector<LogicalType> &expected_types) {
-    if (input.info.file_path.empty()) {
-        throw std::runtime_error("COPY FROM FORMAT nats_js requires a stream name in the file path");
-    }
-
-    auto stream_name = input.info.file_path;
+    auto stream_name = ResolveNatsCopyStreamName(input.info.file_path, "COPY FROM");
     string subject_legacy;
     auto subject_contains = GetCopyOptionString(input.info.options, "subject_contains").value_or("");
     auto nats_subject = GetCopyOptionString(input.info.options, "nats_subject").value_or("");
-    auto nats_url = GetCopyOptionString(input.info.options, "url").value_or("nats://localhost:4222");
+    static const string DEFAULT_NATS_URL = "nats://localhost:4222";
+    auto nats_url = ResolveNatsCopyUrl(input.info.options, "COPY FROM", &DEFAULT_NATS_URL);
     uint64_t start_seq = GetCopyOptionUBigInt(input.info.options, "start_seq", 0);
     uint64_t end_seq = GetCopyOptionUBigInt(input.info.options, "end_seq", UINT64_MAX);
     int64_t start_time = 0;
@@ -1602,14 +1623,7 @@ static unique_ptr<FunctionData> NatsCopyFromBind(ClientContext &context, CopyFro
     }
 
     auto schema = BuildNatsSourceSchema(json_fields, proto_file, proto_message, proto_fields, descriptor);
-    if (schema.return_types.size() != expected_types.size()) {
-        throw std::runtime_error("COPY FROM FORMAT nats_js requires the target table schema to match the nats_scan output schema");
-    }
-    for (idx_t i = 0; i < schema.return_types.size(); i++) {
-        if (schema.return_types[i] != expected_types[i]) {
-            throw std::runtime_error("COPY FROM FORMAT nats_js requires the target table schema to match the nats_scan output schema");
-        }
-    }
+    ValidateNatsCopyFromSchema(expected_names, expected_types, schema);
 
     auto bind_data = make_uniq<NatsScanBindData>(stream_name, subject_contains, nats_subject, nats_url, start_seq, end_seq,
                                                  start_time, end_time, json_fields, proto_file, proto_message,

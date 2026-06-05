@@ -144,6 +144,11 @@ for pattern in \
 done
 echo "PASS test/sql/test_copy_to_errors.sql"
 
+echo "RUN test/sql/test_copy_roundtrip.sql"
+log_file="/tmp/test_copy_roundtrip.sql.log"
+run_copy_sql_test "test/sql/test_copy_roundtrip.sql" "$log_file"
+echo "PASS test/sql/test_copy_roundtrip.sql"
+
 echo "RUN scripts/run-ingest-harness.sh"
 NATS_URL="$NATS_URL" \
 NATS_CLI="$NATS_CLI" \

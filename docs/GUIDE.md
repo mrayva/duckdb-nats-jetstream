@@ -459,6 +459,8 @@ nats_js, url '...')` when the target table matches the scan output layout.
 [test/sql/test_copy_from_errors.sql](/home/mrayva/duckdb-nats-jetstream/test/sql/test_copy_from_errors.sql),
 [test/sql/test_copy_to.sql](/home/mrayva/duckdb-nats-jetstream/test/sql/test_copy_to.sql),
 and [test/sql/test_copy_to_errors.sql](/home/mrayva/duckdb-nats-jetstream/test/sql/test_copy_to_errors.sql);
+the round-trip regression is
+[test/sql/test_copy_roundtrip.sql](/home/mrayva/duckdb-nats-jetstream/test/sql/test_copy_roundtrip.sql);
 the end-to-end smoke tests are [scripts/run-copy-harness.sh](/home/mrayva/duckdb-nats-jetstream/scripts/run-copy-harness.sh)
 and [scripts/run-copy-to-harness.sh](/home/mrayva/duckdb-nats-jetstream/scripts/run-copy-to-harness.sh).
 

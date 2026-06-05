@@ -13,7 +13,7 @@ fi
 
 if [ "${RESET_STREAMS:-0}" = "1" ]; then
   echo "Resetting JetStream streams..."
-  for stream in telemetry environmental telemetry_proto events copy_out stats_gaps ingest_resume ingest_redelivery; do
+  for stream in telemetry environmental telemetry_proto events copy_out copy_roundtrip stats_gaps ingest_resume ingest_redelivery; do
     "$NATS_BIN" stream rm "$stream" --force --server="${NATS_URL}" >/dev/null 2>&1 || true
   done
   for consumer in duckdb_ingest_test duckdb_ingest_test_v1 duckdb_ingest_test_fresh duckdb_ingest_probe3; do
@@ -107,6 +107,23 @@ echo "Created stream: events"
   --defaults
 
 echo "Created stream: copy_out"
+
+# Create copy_roundtrip stream for COPY TO -> COPY FROM regression tests
+"$NATS_BIN" stream add copy_roundtrip \
+  --subjects "copy_roundtrip.>" \
+  --storage file \
+  --retention limits \
+  --max-msgs=-1 \
+  --max-bytes=-1 \
+  --max-age=7d \
+  --max-msg-size=1048576 \
+  --discard old \
+  --dupe-window=2m \
+  --replicas=1 \
+  --server="${NATS_URL}" \
+  --defaults
+
+echo "Created stream: copy_roundtrip"
 
 # Create a small deterministic stream with deleted sequence gaps for range stats tests
 "$NATS_BIN" stream add stats_gaps \
