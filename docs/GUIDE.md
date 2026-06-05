@@ -462,7 +462,8 @@ and [test/sql/test_copy_to_errors.sql](/home/mrayva/duckdb-nats-jetstream/test/s
 the round-trip regression is
 [test/sql/test_copy_roundtrip.sql](/home/mrayva/duckdb-nats-jetstream/test/sql/test_copy_roundtrip.sql);
 the end-to-end smoke tests are [scripts/run-copy-harness.sh](/home/mrayva/duckdb-nats-jetstream/scripts/run-copy-harness.sh)
-and [scripts/run-copy-to-harness.sh](/home/mrayva/duckdb-nats-jetstream/scripts/run-copy-to-harness.sh).
+and [scripts/run-copy-to-harness.sh](/home/mrayva/duckdb-nats-jetstream/scripts/run-copy-to-harness.sh);
+the export benchmark is [scripts/benchmark-copy-to.sh](/home/mrayva/duckdb-nats-jetstream/scripts/benchmark-copy-to.sh).
 
 Both scripts rely on the seeded `ingest_resume` and `ingest_redelivery` streams
 created by `scripts/setup-streams.sh`, so keep the same DuckDB binary and local

@@ -121,6 +121,9 @@ TO 'copy_out'
  subject 'copy_out.constant');
 ```
 
+Run `scripts/benchmark-copy-to.sh` to measure export throughput against the
+seeded JetStream streams.
+
 ## JSON Message Processing
 
 ### Extract JSON Fields

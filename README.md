@@ -174,6 +174,7 @@ columns, or a constant `subject` option plus a `payload` column. Regression
 coverage for the export path lives in `test/sql/test_copy_to.sql`,
 `test/sql/test_copy_to_errors.sql`, `test/sql/test_copy_roundtrip.sql`, and
 `scripts/run-copy-to-harness.sh`.
+For throughput checks, use `scripts/benchmark-copy-to.sh`.
 
 Ingest jobs also persist a checkpoint keyed by `stream_name` and `durable_name`,
 so restarting with the same durable resumes from the last committed sequence.
