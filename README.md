@@ -167,6 +167,12 @@ schema via `COPY target FROM 'ingest_resume' (FORMAT nats_js, url '...')`.
 Regression coverage for the format lives in `test/sql/test_copy_from.sql`,
 `test/sql/test_copy_from_errors.sql`, and `scripts/run-copy-harness.sh`.
 
+JetStream also registers a `nats_js` `COPY TO` format for publishing rows back
+into a stream. Use it when your source query provides `subject` and `payload`
+columns, or a constant `subject` option plus a `payload` column. Regression
+coverage for the export path lives in `test/sql/test_copy_to.sql`,
+`test/sql/test_copy_to_errors.sql`, and `scripts/run-copy-to-harness.sh`.
+
 Ingest jobs also persist a checkpoint keyed by `stream_name` and `durable_name`,
 so restarting with the same durable resumes from the last committed sequence.
 If you want DuckDB to create the destination table for you, pass

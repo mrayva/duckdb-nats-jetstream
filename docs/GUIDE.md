@@ -448,11 +448,19 @@ it exercises `nats_pause_ingest`, `nats_resume_ingest`, and the richer status
 fields such as `paused`, `pause_requested`, `fetches_completed`, and
 `last_batch_rows`.
 
-For a SQL-native write path, the extension also exposes a `nats_js` `COPY FROM`
-format that reuses the same source schema as `nats_scan`. It is intended for
-`COPY target FROM 'stream_name' (FORMAT nats_js, url '...')` when the target
-table matches the scan output layout.
-The regression tests for that path are [test/sql/test_copy_from.sql](/home/mrayva/duckdb-nats-jetstream/test/sql/test_copy_from.sql) and [test/sql/test_copy_from_errors.sql](/home/mrayva/duckdb-nats-jetstream/test/sql/test_copy_from_errors.sql); the end-to-end smoke test is [scripts/run-copy-harness.sh](/home/mrayva/duckdb-nats-jetstream/scripts/run-copy-harness.sh).
+For a SQL-native write path, the extension also exposes `nats_js` `COPY FROM`
+and `COPY TO` formats. `COPY FROM` reuses the same source schema as
+`nats_scan`, and is intended for `COPY target FROM 'stream_name' (FORMAT
+nats_js, url '...')` when the target table matches the scan output layout.
+`COPY TO` publishes rows into JetStream using a source query that provides
+`subject` and `payload` columns, or a constant `subject` option plus a
+`payload` column. The regression tests for those paths are
+[test/sql/test_copy_from.sql](/home/mrayva/duckdb-nats-jetstream/test/sql/test_copy_from.sql),
+[test/sql/test_copy_from_errors.sql](/home/mrayva/duckdb-nats-jetstream/test/sql/test_copy_from_errors.sql),
+[test/sql/test_copy_to.sql](/home/mrayva/duckdb-nats-jetstream/test/sql/test_copy_to.sql),
+and [test/sql/test_copy_to_errors.sql](/home/mrayva/duckdb-nats-jetstream/test/sql/test_copy_to_errors.sql);
+the end-to-end smoke tests are [scripts/run-copy-harness.sh](/home/mrayva/duckdb-nats-jetstream/scripts/run-copy-harness.sh)
+and [scripts/run-copy-to-harness.sh](/home/mrayva/duckdb-nats-jetstream/scripts/run-copy-to-harness.sh).
 
 Both scripts rely on the seeded `ingest_resume` and `ingest_redelivery` streams
 created by `scripts/setup-streams.sh`, so keep the same DuckDB binary and local

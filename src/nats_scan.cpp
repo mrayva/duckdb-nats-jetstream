@@ -15,6 +15,9 @@
 #include <filesystem>
 #include <algorithm>
 #include <optional>
+#include <mutex>
+#include <chrono>
+#include <thread>
 #include <cstring>
 
 // Windows defines GetMessage as a macro (GetMessageA/GetMessageW)
@@ -115,6 +118,26 @@ struct NatsCopyBindData : public TableFunctionData {
     unique_ptr<NatsScanBindData> scan_bind_data;
 };
 
+struct NatsCopyToBindData : public TableFunctionData {
+    string stream_name;
+    string nats_url;
+    string subject_column = "subject";
+    string payload_column = "payload";
+    bool constant_subject = false;
+    string subject_value;
+    idx_t subject_idx = DConstants::INVALID_INDEX;
+    idx_t payload_idx = DConstants::INVALID_INDEX;
+};
+
+struct NatsCopyToGlobalState : public GlobalFunctionData {
+    natsConnection *conn = nullptr;
+    mutex lock;
+    idx_t rows_written = 0;
+};
+
+struct NatsCopyToLocalState : public LocalFunctionData {
+};
+
 static std::optional<string> GetCopyOptionString(const case_insensitive_map_t<vector<Value>> &options,
                                                  const string &name) {
     auto it = options.find(name);
@@ -193,6 +216,208 @@ static NatsSourceSchema BuildNatsSourceSchema(const vector<string> &json_fields,
     }
 
     return schema;
+}
+
+static idx_t FindColumnIndex(const vector<string> &names, const string &column_name) {
+    for (idx_t i = 0; i < names.size(); i++) {
+        if (StringUtil::CIEquals(names[i], column_name)) {
+            return i;
+        }
+    }
+    return DConstants::INVALID_INDEX;
+}
+
+static void NatsCopyListOptions(ClientContext &, CopyOptionsInput &input) {
+    auto &copy_options = input.options;
+    copy_options["url"] = CopyOption(LogicalType::VARCHAR, CopyOptionMode::READ_WRITE);
+    copy_options["subject"] = CopyOption(LogicalType::VARCHAR, CopyOptionMode::READ_WRITE);
+    copy_options["subject_contains"] = CopyOption(LogicalType::VARCHAR, CopyOptionMode::READ_WRITE);
+    copy_options["nats_subject"] = CopyOption(LogicalType::VARCHAR, CopyOptionMode::READ_WRITE);
+    copy_options["start_seq"] = CopyOption(LogicalType::UBIGINT, CopyOptionMode::READ_WRITE);
+    copy_options["end_seq"] = CopyOption(LogicalType::UBIGINT, CopyOptionMode::READ_WRITE);
+    copy_options["start_time"] = CopyOption(LogicalType::TIMESTAMP, CopyOptionMode::READ_WRITE);
+    copy_options["end_time"] = CopyOption(LogicalType::TIMESTAMP, CopyOptionMode::READ_WRITE);
+    copy_options["json_extract"] = CopyOption(LogicalType::ANY, CopyOptionMode::READ_WRITE);
+    copy_options["proto_file"] = CopyOption(LogicalType::VARCHAR, CopyOptionMode::READ_WRITE);
+    copy_options["proto_message"] = CopyOption(LogicalType::VARCHAR, CopyOptionMode::READ_WRITE);
+    copy_options["proto_extract"] = CopyOption(LogicalType::ANY, CopyOptionMode::READ_WRITE);
+    copy_options["batch_size"] = CopyOption(LogicalType::UBIGINT, CopyOptionMode::READ_WRITE);
+    copy_options["fetch_timeout_ms"] = CopyOption(LogicalType::BIGINT, CopyOptionMode::READ_WRITE);
+    copy_options["subject_column"] = CopyOption(LogicalType::VARCHAR, CopyOptionMode::READ_WRITE);
+    copy_options["payload_column"] = CopyOption(LogicalType::VARCHAR, CopyOptionMode::READ_WRITE);
+}
+
+static void ConnectNats(const string &nats_url, natsConnection **conn) {
+    constexpr idx_t MAX_CONNECT_ATTEMPTS = 20;
+    natsStatus last_status = NATS_OK;
+    for (idx_t attempt = 0; attempt < MAX_CONNECT_ATTEMPTS; attempt++) {
+        natsOptions *opts = nullptr;
+        natsStatus s = natsOptions_Create(&opts);
+        if (s != NATS_OK) {
+            throw std::runtime_error(std::string("Failed to create NATS options: ") + natsStatus_GetText(s));
+        }
+
+        s = natsOptions_SetTimeout(opts, 5000);
+        if (s != NATS_OK) {
+            natsOptions_Destroy(opts);
+            throw std::runtime_error(std::string("Failed to set NATS timeout: ") + natsStatus_GetText(s));
+        }
+
+        s = natsOptions_SetURL(opts, nats_url.c_str());
+        if (s != NATS_OK) {
+            natsOptions_Destroy(opts);
+            throw std::runtime_error(std::string("Failed to set NATS URL: ") + natsStatus_GetText(s));
+        }
+
+        s = natsConnection_Connect(conn, opts);
+        natsOptions_Destroy(opts);
+        if (s == NATS_OK) {
+            return;
+        }
+
+        last_status = s;
+        if (attempt + 1 < MAX_CONNECT_ATTEMPTS) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+    }
+
+    throw std::runtime_error(std::string("Failed to connect to NATS: ") + natsStatus_GetText(last_status));
+}
+
+static void DisconnectNats(natsConnection **conn) {
+    if (conn && *conn != nullptr) {
+        natsConnection_Destroy(*conn);
+        *conn = nullptr;
+    }
+}
+
+static unique_ptr<FunctionData> NatsCopyToBind(ClientContext &context, CopyFunctionBindInput &input,
+                                               const vector<string> &names, const vector<LogicalType> &sql_types) {
+    auto result = make_uniq<NatsCopyToBindData>();
+    auto url = GetCopyOptionString(input.info.options, "url");
+    if (!url.has_value() || url->empty()) {
+        throw BinderException("COPY TO FORMAT nats_js requires a \"url\" option");
+    }
+    result->nats_url = *url;
+    result->stream_name = input.info.file_path;
+    if (result->stream_name.empty()) {
+        throw BinderException("COPY TO FORMAT nats_js requires a target stream name in the file path");
+    }
+
+    auto subject = GetCopyOptionString(input.info.options, "subject");
+    if (subject.has_value() && !subject->empty()) {
+        result->constant_subject = true;
+        result->subject_value = *subject;
+    } else {
+        auto subject_column = GetCopyOptionString(input.info.options, "subject_column");
+        if (subject_column.has_value() && !subject_column->empty()) {
+            result->subject_column = *subject_column;
+        }
+    }
+
+    auto payload_column = GetCopyOptionString(input.info.options, "payload_column");
+    if (payload_column.has_value() && !payload_column->empty()) {
+        result->payload_column = *payload_column;
+    }
+
+    result->payload_idx = FindColumnIndex(names, result->payload_column);
+    if (result->payload_idx == DConstants::INVALID_INDEX) {
+        throw BinderException("COPY TO FORMAT nats_js requires a source column named \"%s\"",
+                              result->payload_column);
+    }
+
+    auto payload_type = sql_types[result->payload_idx].id();
+    if (payload_type != LogicalTypeId::VARCHAR && payload_type != LogicalTypeId::BLOB) {
+        throw BinderException("COPY TO FORMAT nats_js requires payload column \"%s\" to be VARCHAR or BLOB",
+                              result->payload_column);
+    }
+
+    if (!result->constant_subject) {
+        result->subject_idx = FindColumnIndex(names, result->subject_column);
+        if (result->subject_idx == DConstants::INVALID_INDEX) {
+            throw BinderException(
+                "COPY TO FORMAT nats_js requires a source column named \"%s\" or a constant subject option",
+                result->subject_column);
+        }
+        if (sql_types[result->subject_idx].id() != LogicalTypeId::VARCHAR) {
+            throw BinderException("COPY TO FORMAT nats_js requires subject column \"%s\" to be VARCHAR",
+                                  result->subject_column);
+        }
+    }
+
+    return std::move(result);
+}
+
+static unique_ptr<LocalFunctionData> NatsCopyToInitializeLocal(ExecutionContext &, FunctionData &) {
+    return make_uniq_base<LocalFunctionData, NatsCopyToLocalState>();
+}
+
+static unique_ptr<GlobalFunctionData> NatsCopyToInitializeGlobal(ClientContext &, FunctionData &bind_data,
+                                                                 const string &) {
+    auto &bdata = bind_data.Cast<NatsCopyToBindData>();
+    auto result = make_uniq<NatsCopyToGlobalState>();
+    ConnectNats(bdata.nats_url, &result->conn);
+    return std::move(result);
+}
+
+static void NatsCopyToSink(ExecutionContext &, FunctionData &bind_data, GlobalFunctionData &gstate,
+                           LocalFunctionData &, DataChunk &input) {
+    auto &bdata = bind_data.Cast<NatsCopyToBindData>();
+    auto &state = gstate.Cast<NatsCopyToGlobalState>();
+    if (input.size() == 0) {
+        return;
+    }
+
+    lock_guard<mutex> guard(state.lock);
+
+    UnifiedVectorFormat payload_format;
+    input.data[bdata.payload_idx].ToUnifiedFormat(input.size(), payload_format);
+    auto payloads = UnifiedVectorFormat::GetData<string_t>(payload_format);
+
+    UnifiedVectorFormat subject_format;
+    const string_t *subjects = nullptr;
+    if (!bdata.constant_subject) {
+        input.data[bdata.subject_idx].ToUnifiedFormat(input.size(), subject_format);
+        subjects = UnifiedVectorFormat::GetData<string_t>(subject_format);
+    }
+
+    for (idx_t row_idx = 0; row_idx < input.size(); row_idx++) {
+        idx_t out_idx = payload_format.sel->get_index(row_idx);
+        if (!payload_format.validity.RowIsValid(out_idx)) {
+            throw BinderException("COPY TO FORMAT nats_js does not support NULL payload values");
+        }
+
+        string subject = bdata.constant_subject ? bdata.subject_value
+                                                : string(subjects[out_idx].GetData(), subjects[out_idx].GetSize());
+        if (!bdata.constant_subject && !subject_format.validity.RowIsValid(subject_format.sel->get_index(row_idx))) {
+            throw BinderException("COPY TO FORMAT nats_js does not support NULL subject values");
+        }
+
+        auto &payload = payloads[out_idx];
+        int payload_len = static_cast<int>(payload.GetSize());
+        natsStatus s = natsConnection_Publish(state.conn, subject.c_str(), payload.GetData(), payload_len);
+        if (s != NATS_OK) {
+            throw std::runtime_error(std::string("Failed to publish JetStream message: ") + natsStatus_GetText(s));
+        }
+
+        state.rows_written++;
+    }
+}
+
+static void NatsCopyToCombine(ExecutionContext &, FunctionData &, GlobalFunctionData &, LocalFunctionData &) {
+}
+
+static void NatsCopyToFinalize(ClientContext &, FunctionData &, GlobalFunctionData &gstate) {
+    auto &state = gstate.Cast<NatsCopyToGlobalState>();
+    lock_guard<mutex> guard(state.lock);
+    if (state.conn != nullptr) {
+        natsStatus s = natsConnection_FlushTimeout(state.conn, 5000);
+        if (s != NATS_OK) {
+            DisconnectNats(&state.conn);
+            throw std::runtime_error(std::string("Failed to flush NATS connection: ") + natsStatus_GetText(s));
+        }
+    }
+    DisconnectNats(&state.conn);
 }
 
 static vector<string> SplitFieldPath(const string& field_path) {
@@ -1424,6 +1649,16 @@ void NatsStreamStatsFunction::Register(ExtensionLoader &loader) {
 
 void NatsCopyFunction::Register(ExtensionLoader &loader) {
     CopyFunction function("nats_js");
+    function.copy_options = NatsCopyListOptions;
+    function.copy_to_bind = NatsCopyToBind;
+    function.copy_to_initialize_local = NatsCopyToInitializeLocal;
+    function.copy_to_initialize_global = NatsCopyToInitializeGlobal;
+    function.copy_to_sink = NatsCopyToSink;
+    function.copy_to_combine = NatsCopyToCombine;
+    function.copy_to_finalize = NatsCopyToFinalize;
+    function.execution_mode = [](bool, bool) {
+        return CopyFunctionExecutionMode::REGULAR_COPY_TO_FILE;
+    };
     function.copy_from_bind = NatsCopyFromBind;
     function.copy_from_function = CreateNatsScanTableFunction();
     function.extension = "nats_js";

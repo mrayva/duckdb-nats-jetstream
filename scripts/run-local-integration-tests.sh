@@ -123,6 +123,27 @@ for pattern in \
 done
 echo "PASS test/sql/test_copy_from_errors.sql"
 
+echo "RUN test/sql/test_copy_to.sql"
+log_file="/tmp/test_copy_to.sql.log"
+run_copy_sql_test "test/sql/test_copy_to.sql" "$log_file"
+echo "PASS test/sql/test_copy_to.sql"
+
+echo "RUN test/sql/test_copy_to_errors.sql (expected errors)"
+if run_copy_sql_test "test/sql/test_copy_to_errors.sql" /tmp/test_copy_to_errors.sql.log >/tmp/test_copy_to_errors.sql.log 2>&1; then
+  echo "Expected COPY TO error suite to fail, but it exited 0" >&2
+  exit 1
+fi
+
+for pattern in \
+  "requires a source column named \"payload\""; do
+  if ! grep -q "$pattern" /tmp/test_copy_to_errors.sql.log; then
+    echo "Missing expected COPY TO error pattern: $pattern" >&2
+    tail -n 80 /tmp/test_copy_to_errors.sql.log >&2
+    exit 1
+  fi
+done
+echo "PASS test/sql/test_copy_to_errors.sql"
+
 echo "RUN scripts/run-ingest-harness.sh"
 NATS_URL="$NATS_URL" \
 NATS_CLI="$NATS_CLI" \
@@ -161,6 +182,16 @@ NATS_CLI="$NATS_CLI" \
 RESET_STREAMS=1 \
 "$ROOT_DIR/scripts/run-copy-harness.sh"
 echo "PASS scripts/run-copy-harness.sh"
+
+echo "RUN scripts/run-copy-to-harness.sh"
+DUCKDB_BIN="$COPY_DUCKDB_BIN" \
+DUCKDB_LIB="$COPY_DUCKDB_LIB" \
+EXTENSION_PATH="$COPY_EXTENSION_PATH" \
+NATS_URL="$NATS_URL" \
+NATS_CLI="$NATS_CLI" \
+RESET_STREAMS=1 \
+"$ROOT_DIR/scripts/run-copy-to-harness.sh"
+echo "PASS scripts/run-copy-to-harness.sh"
 
 echo "RUN scripts/run-ingest-rehydrate-harness.sh"
 NATS_URL="$NATS_URL" \

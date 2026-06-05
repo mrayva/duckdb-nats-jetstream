@@ -91,6 +91,36 @@ FROM 'ingest_resume'
 The `nats_js` copy format uses the same source layout as `nats_scan`, so the
 target table should match the standard ingest column order and types.
 
+## Copying Back To JetStream
+
+Export a query back into a JetStream stream with `COPY TO`:
+
+```sql
+CREATE TABLE export_rows(
+    subject VARCHAR,
+    payload VARCHAR
+);
+
+INSERT INTO export_rows VALUES
+    ('copy_out.alpha', 'hello'),
+    ('copy_out.beta', 'world');
+
+COPY export_rows
+TO 'copy_out'
+(FORMAT nats_js, url 'nats://127.0.0.1:4222');
+```
+
+If your source table does not already carry a subject column, provide a
+constant subject:
+
+```sql
+COPY export_rows
+TO 'copy_out'
+(FORMAT nats_js,
+ url 'nats://127.0.0.1:4222',
+ subject 'copy_out.constant');
+```
+
 ## JSON Message Processing
 
 ### Extract JSON Fields
