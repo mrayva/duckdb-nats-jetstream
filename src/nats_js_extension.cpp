@@ -1,15 +1,18 @@
 #include "nats_js_extension.hpp"
 #include "nats_ingest.hpp"
+#include "nats_subscribe.hpp"
 #include "nats_scan.hpp"
 #include <nats/nats.h>
 
 namespace duckdb {
 
 void NatsJsExtension::Load(ExtensionLoader &loader) {
+    // Keep the load order explicit so new job APIs stay registered deterministically.
     NatsScanFunction::Register(loader);
     NatsStreamStatsFunction::Register(loader);
     NatsCopyFunction::Register(loader);
     NatsIngestFunction::Register(loader);
+    NatsSubscribeFunction::Register(loader);
 }
 
 std::string NatsJsExtension::Name() {

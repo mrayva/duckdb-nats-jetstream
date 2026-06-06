@@ -8,9 +8,10 @@ EXTENSION_PATH="${EXTENSION_PATH:-$ROOT_DIR/build/release/extension/nats_js/nats
 NATS_URL="${NATS_URL:-nats://127.0.0.1:4222}"
 NATS_CLI="${NATS_CLI:-$HOME/nats}"
 PYTHON_BIN="${PYTHON_BIN:-$ROOT_DIR/.venv/bin/python}"
-COPY_DUCKDB_BIN="${COPY_DUCKDB_BIN:-$DUCKDB_BIN}"
-COPY_DUCKDB_LIB="${COPY_DUCKDB_LIB:-$ROOT_DIR/build/release/src/libduckdb.so}"
-COPY_EXTENSION_PATH="${COPY_EXTENSION_PATH:-$EXTENSION_PATH}"
+TIP_ROOT="${TIP_ROOT:-/tmp/duckdb-tip-clean}"
+COPY_DUCKDB_BIN="${COPY_DUCKDB_BIN:-$TIP_ROOT/build/release/duckdb}"
+COPY_DUCKDB_LIB="${COPY_DUCKDB_LIB:-$TIP_ROOT/build/release/src/libduckdb.so}"
+COPY_EXTENSION_PATH="${COPY_EXTENSION_PATH:-$TIP_ROOT/build/nats_js-tip/extension/nats_js/nats_js.duckdb_extension}"
 
 if [ ! -x "$DUCKDB_BIN" ]; then
   echo "DuckDB binary not found: $DUCKDB_BIN" >&2
@@ -204,5 +205,11 @@ NATS_CLI="$NATS_CLI" \
 RESET_STREAMS=1 \
 "$ROOT_DIR/scripts/run-ingest-rehydrate-harness.sh"
 echo "PASS scripts/run-ingest-rehydrate-harness.sh"
+
+echo "RUN scripts/run-subscribe-harness.sh"
+NATS_URL="$NATS_URL" \
+NATS_CLI="$NATS_CLI" \
+"$ROOT_DIR/scripts/run-subscribe-harness.sh"
+echo "PASS scripts/run-subscribe-harness.sh"
 
 echo "All local integration tests passed"

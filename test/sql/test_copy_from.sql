@@ -11,9 +11,9 @@ LOAD 'build/release/extension/nats_js/nats_js.duckdb_extension';
 .print ========================================
 
 CREATE TABLE copy_plain(
-    stream_name VARCHAR,
+    stream VARCHAR,
     subject VARCHAR,
-    sequence UBIGINT,
+    seq UBIGINT,
     ts_nats TIMESTAMP,
     payload BLOB
 );
@@ -25,8 +25,8 @@ FROM 'ingest_resume'
 WITH copy_stats AS (
     SELECT
         COUNT(*) AS row_count,
-        MIN(sequence) AS min_seq,
-        MAX(sequence) AS max_seq,
+        MIN(seq) AS min_seq,
+        MAX(seq) AS max_seq,
         MIN(subject) AS min_subject,
         MAX(subject) AS max_subject
     FROM copy_plain
@@ -49,9 +49,9 @@ FROM copy_stats;
 .print ========================================
 
 CREATE TABLE copy_range(
-    stream_name VARCHAR,
+    stream VARCHAR,
     subject VARCHAR,
-    sequence UBIGINT,
+    seq UBIGINT,
     ts_nats TIMESTAMP,
     payload BLOB
 );
@@ -66,8 +66,8 @@ FROM 'ingest_resume'
 WITH copy_stats AS (
     SELECT
         COUNT(*) AS row_count,
-        MIN(sequence) AS min_seq,
-        MAX(sequence) AS max_seq,
+        MIN(seq) AS min_seq,
+        MAX(seq) AS max_seq,
         MIN(subject) AS min_subject,
         MAX(subject) AS max_subject
     FROM copy_range

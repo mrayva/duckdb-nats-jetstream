@@ -4,8 +4,9 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
-DUCKDB_BIN="${DUCKDB_BIN:-/home/mrayva/.duckdb/cli/1.5.3/duckdb}"
-EXTENSION_PATH="${EXTENSION_PATH:-$ROOT_DIR/build/release/extension/nats_js/nats_js.duckdb_extension}"
+TIP_ROOT="${TIP_ROOT:-/tmp/duckdb-tip-clean}"
+DUCKDB_BIN="${DUCKDB_BIN:-${TIP_DUCKDB_BIN:-$TIP_ROOT/build/release/duckdb}}"
+EXTENSION_PATH="${EXTENSION_PATH:-${TIP_EXTENSION_PATH:-$TIP_ROOT/build/nats_js-tip/extension/nats_js/nats_js.duckdb_extension}}"
 NATS_URL="${NATS_URL:-nats://localhost:4222}"
 NATS_CLI="${NATS_CLI:-$HOME/nats}"
 HARNESS_MODE="${HARNESS_MODE:-resume}"
@@ -19,7 +20,7 @@ fi
 
 if [ ! -f "$EXTENSION_PATH" ]; then
   echo "Extension not found: $EXTENSION_PATH" >&2
-  echo "Build first with: make release" >&2
+  echo "Build tip extension first or set TIP_EXTENSION_PATH." >&2
   exit 1
 fi
 

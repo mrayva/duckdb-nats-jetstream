@@ -24,9 +24,9 @@ TO 'copy_roundtrip'
 (FORMAT nats_js, url 'nats://127.0.0.1:4222');
 
 CREATE TABLE copy_roundtrip_dest(
-    stream_name VARCHAR,
+    stream VARCHAR,
     subject VARCHAR,
-    sequence UBIGINT,
+    seq UBIGINT,
     ts_nats TIMESTAMP,
     payload BLOB
 );
@@ -38,8 +38,8 @@ FROM 'copy_roundtrip'
 WITH roundtrip_stats AS (
     SELECT
         COUNT(*) AS row_count,
-        MIN(sequence) AS min_seq,
-        MAX(sequence) AS max_seq,
+        MIN(seq) AS min_seq,
+        MAX(seq) AS max_seq,
         COUNT(*) FILTER (WHERE subject = 'copy_roundtrip.alpha' AND CAST(payload AS VARCHAR) = 'hello') AS alpha_count,
         COUNT(*) FILTER (WHERE subject = 'copy_roundtrip.beta' AND CAST(payload AS VARCHAR) = 'world') AS beta_count
     FROM copy_roundtrip_dest
@@ -78,9 +78,9 @@ TO 'copy_roundtrip_const'
  subject 'copy_roundtrip_const.constant');
 
 CREATE TABLE copy_roundtrip_const_dest(
-    stream_name VARCHAR,
+    stream VARCHAR,
     subject VARCHAR,
-    sequence UBIGINT,
+    seq UBIGINT,
     ts_nats TIMESTAMP,
     payload BLOB
 );
@@ -92,8 +92,8 @@ FROM 'copy_roundtrip_const'
 WITH roundtrip_const_stats AS (
     SELECT
         COUNT(*) AS row_count,
-        MIN(sequence) AS min_seq,
-        MAX(sequence) AS max_seq,
+        MIN(seq) AS min_seq,
+        MAX(seq) AS max_seq,
         COUNT(*) FILTER (WHERE subject = 'copy_roundtrip_const.constant') AS constant_count,
         COUNT(*) FILTER (WHERE CAST(payload AS VARCHAR) = 'gamma') AS gamma_count,
         COUNT(*) FILTER (WHERE CAST(payload AS VARCHAR) = 'delta') AS delta_count

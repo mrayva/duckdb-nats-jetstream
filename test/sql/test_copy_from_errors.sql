@@ -12,9 +12,9 @@ LOAD 'build/release/extension/nats_js/nats_js.duckdb_extension';
 .print ========================================
 
 CREATE TABLE copy_bad_schema(
-    stream_name VARCHAR,
+    stream VARCHAR,
     subject VARCHAR,
-    sequence UBIGINT,
+    seq UBIGINT,
     ts_nats TIMESTAMP,
     payload VARCHAR
 );
@@ -30,9 +30,9 @@ FROM 'ingest_resume'
 .print ========================================
 
 CREATE TABLE copy_bad_options(
-    stream_name VARCHAR,
+    stream VARCHAR,
     subject VARCHAR,
-    sequence UBIGINT,
+    seq UBIGINT,
     ts_nats TIMESTAMP,
     payload BLOB
 );

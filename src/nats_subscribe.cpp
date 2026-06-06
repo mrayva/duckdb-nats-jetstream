@@ -1,0 +1,675 @@
+#include "nats_subscribe.hpp"
+
+#include "duckdb/common/types/timestamp.hpp"
+#include "duckdb/common/types/vector.hpp"
+#include "duckdb/main/appender.hpp"
+#include "duckdb/main/connection.hpp"
+#include "duckdb/main/database.hpp"
+#include "duckdb/common/exception.hpp"
+#include "duckdb/main/extension/extension_loader.hpp"
+#include "duckdb/parser/parsed_data/create_table_function_info.hpp"
+
+#include <algorithm>
+#include <chrono>
+#include <sstream>
+
+namespace duckdb {
+
+NatsSubscribeJobState::NatsSubscribeJobState(NatsSubscribeConfig config_p) : config(std::move(config_p)) {
+}
+
+NatsSubscribeJobState::~NatsSubscribeJobState() {
+    if (worker.joinable()) {
+        {
+            std::lock_guard<std::mutex> guard(mutex);
+            progress.stop_requested = true;
+            cv.notify_all();
+        }
+        worker.join();
+    }
+    if (sub != nullptr) {
+        natsSubscription_Destroy(sub);
+        sub = nullptr;
+    }
+    if (conn != nullptr) {
+        natsConnection_Destroy(conn);
+        conn = nullptr;
+    }
+}
+
+NatsSubscribeManager &NatsSubscribeManager::Get() {
+    static NatsSubscribeManager instance;
+    return instance;
+}
+
+shared_ptr<NatsSubscribeJobState> NatsSubscribeManager::CreateJob(NatsSubscribeConfig config) {
+    auto job = make_shared_ptr<NatsSubscribeJobState>(std::move(config));
+    lock_guard<std::mutex> guard(mutex_);
+    auto insert_result = jobs_.emplace(job->config.job_name, job);
+    if (!insert_result.second) {
+        throw BinderException("subscribe job '%s' already exists", job->config.job_name);
+    }
+    return job;
+}
+
+shared_ptr<NatsSubscribeJobState> NatsSubscribeManager::GetJob(const string &job_name) {
+    lock_guard<std::mutex> guard(mutex_);
+    auto entry = jobs_.find(job_name);
+    if (entry == jobs_.end()) {
+        return nullptr;
+    }
+    return entry->second;
+}
+
+vector<shared_ptr<NatsSubscribeJobState>> NatsSubscribeManager::ListJobs() {
+    lock_guard<std::mutex> guard(mutex_);
+    vector<shared_ptr<NatsSubscribeJobState>> result;
+    result.reserve(jobs_.size());
+    for (auto &entry : jobs_) {
+        result.push_back(entry.second);
+    }
+    return result;
+}
+
+bool NatsSubscribeManager::PauseJob(const string &job_name) {
+    auto job = GetJob(job_name);
+    if (!job) {
+        return false;
+    }
+    lock_guard<std::mutex> guard(job->mutex);
+    job->progress.paused = true;
+    job->progress.pause_requested = true;
+    job->cv.notify_all();
+    return true;
+}
+
+bool NatsSubscribeManager::ResumeJob(const string &job_name) {
+    auto job = GetJob(job_name);
+    if (!job) {
+        return false;
+    }
+    lock_guard<std::mutex> guard(job->mutex);
+    job->progress.paused = false;
+    job->progress.pause_requested = false;
+    job->cv.notify_all();
+    return true;
+}
+
+bool NatsSubscribeManager::StopJob(const string &job_name) {
+    auto job = GetJob(job_name);
+    if (!job) {
+        return false;
+    }
+    lock_guard<std::mutex> guard(job->mutex);
+    job->progress.stop_requested = true;
+    job->cv.notify_all();
+    return true;
+}
+
+bool NatsSubscribeManager::RemoveJob(const string &job_name) {
+    lock_guard<std::mutex> guard(mutex_);
+    return jobs_.erase(job_name) > 0;
+}
+
+struct NatsSubscribeSnapshot {
+    string job_name;
+    string target_table;
+    string nats_url;
+    string subject;
+    string queue_group;
+    bool running = false;
+    bool paused = false;
+    bool stop_requested = false;
+    bool failed = false;
+    bool create_target_table = false;
+    uint64_t rows_inserted = 0;
+    uint64_t batches_committed = 0;
+    string last_error;
+    timestamp_t last_start_time;
+    timestamp_t last_commit_time;
+    timestamp_t last_error_time;
+    timestamp_t last_message_time;
+};
+
+struct NatsSubscribeBindData : public TableFunctionData {
+    NatsSubscribeConfig config;
+};
+
+struct NatsSubscribeJobNameBindData : public TableFunctionData {
+    string job_name;
+};
+
+struct NatsSubscribeJobsBindData : public TableFunctionData {
+};
+
+struct NatsSubscribeControlGlobalState : public GlobalTableFunctionState {
+    bool done = false;
+    idx_t row_idx = 0;
+    vector<shared_ptr<NatsSubscribeJobState>> jobs;
+
+    idx_t MaxThreads() const override {
+        return 1;
+    }
+};
+
+static void AddSubscribeSnapshotColumns(vector<LogicalType> &return_types, vector<string> &names) {
+    return_types = {LogicalType(LogicalTypeId::VARCHAR),  LogicalType(LogicalTypeId::VARCHAR),
+                    LogicalType(LogicalTypeId::VARCHAR),  LogicalType(LogicalTypeId::VARCHAR),
+                    LogicalType(LogicalTypeId::VARCHAR),  LogicalType(LogicalTypeId::BOOLEAN),
+                    LogicalType(LogicalTypeId::BOOLEAN),   LogicalType(LogicalTypeId::BOOLEAN),
+                    LogicalType(LogicalTypeId::BOOLEAN),   LogicalType(LogicalTypeId::UBIGINT),
+                    LogicalType(LogicalTypeId::UBIGINT),   LogicalType(LogicalTypeId::TIMESTAMP),
+                    LogicalType(LogicalTypeId::TIMESTAMP),  LogicalType(LogicalTypeId::TIMESTAMP),
+                    LogicalType(LogicalTypeId::TIMESTAMP),  LogicalType(LogicalTypeId::VARCHAR)};
+    names = {"job_name",         "target_table",     "nats_url",        "subject",       "queue_group",
+             "running",          "paused",           "stop_requested",  "failed",        "rows_inserted",
+             "batches_committed", "last_start_time",  "last_commit_time", "last_error_time", "last_message_time",
+             "last_error"};
+}
+
+static void FillSubscribeSnapshotColumns(DataChunk &output, idx_t row, const NatsSubscribeSnapshot &snapshot) {
+    output.SetValue(0, row, Value(snapshot.job_name));
+    output.SetValue(1, row, Value(snapshot.target_table));
+    output.SetValue(2, row, Value(snapshot.nats_url));
+    output.SetValue(3, row, Value(snapshot.subject));
+    output.SetValue(4, row, Value(snapshot.queue_group));
+    output.SetValue(5, row, Value(snapshot.running));
+    output.SetValue(6, row, Value(snapshot.paused));
+    output.SetValue(7, row, Value(snapshot.stop_requested));
+    output.SetValue(8, row, Value(snapshot.failed));
+    output.SetValue(9, row, Value::UBIGINT(snapshot.rows_inserted));
+    output.SetValue(10, row, Value::UBIGINT(snapshot.batches_committed));
+    output.SetValue(11, row, Value::TIMESTAMP(snapshot.last_start_time));
+    output.SetValue(12, row, Value::TIMESTAMP(snapshot.last_commit_time));
+    output.SetValue(13, row, Value::TIMESTAMP(snapshot.last_error_time));
+    output.SetValue(14, row, Value::TIMESTAMP(snapshot.last_message_time));
+    output.SetValue(15, row, Value(snapshot.last_error));
+}
+
+static NatsSubscribeSnapshot SnapshotJob(const shared_ptr<NatsSubscribeJobState> &job) {
+    lock_guard<std::mutex> guard(job->mutex);
+    NatsSubscribeSnapshot snapshot;
+    snapshot.job_name = job->config.job_name;
+    snapshot.target_table = job->config.target_table;
+    snapshot.nats_url = job->config.nats_url;
+    snapshot.subject = job->config.subject;
+    snapshot.queue_group = job->config.queue_group;
+    snapshot.running = job->progress.running;
+    snapshot.paused = job->progress.paused;
+    snapshot.stop_requested = job->progress.stop_requested;
+    snapshot.failed = job->progress.failed;
+    snapshot.create_target_table = job->config.create_target_table;
+    snapshot.rows_inserted = job->progress.rows_inserted;
+    snapshot.batches_committed = job->progress.batches_committed;
+    snapshot.last_error = job->progress.last_error;
+    snapshot.last_start_time = job->progress.last_start_time;
+    snapshot.last_commit_time = job->progress.last_commit_time;
+    snapshot.last_error_time = job->progress.last_error_time;
+    snapshot.last_message_time = job->progress.last_message_time;
+    return snapshot;
+}
+
+static string GetNamedString(const case_insensitive_map_t<Value> &named_parameters, const string &name,
+                             const string &default_value = "") {
+    auto entry = named_parameters.find(name);
+    if (entry == named_parameters.end() || entry->second.IsNull()) {
+        return default_value;
+    }
+    return StringValue::Get(entry->second);
+}
+
+static uint64_t GetNamedUBigInt(const case_insensitive_map_t<Value> &named_parameters, const string &name,
+                                uint64_t default_value) {
+    auto entry = named_parameters.find(name);
+    if (entry == named_parameters.end() || entry->second.IsNull()) {
+        return default_value;
+    }
+    return UBigIntValue::Get(entry->second);
+}
+
+static int64_t GetNamedBigInt(const case_insensitive_map_t<Value> &named_parameters, const string &name,
+                              int64_t default_value) {
+    auto entry = named_parameters.find(name);
+    if (entry == named_parameters.end() || entry->second.IsNull()) {
+        return default_value;
+    }
+    return BigIntValue::Get(entry->second);
+}
+
+static bool GetNamedBool(const case_insensitive_map_t<Value> &named_parameters, const string &name,
+                         bool default_value) {
+    auto entry = named_parameters.find(name);
+    if (entry == named_parameters.end() || entry->second.IsNull()) {
+        return default_value;
+    }
+    return BooleanValue::Get(entry->second);
+}
+
+static vector<string> GetNamedStringList(const case_insensitive_map_t<Value> &named_parameters, const string &name) {
+    vector<string> result;
+    auto entry = named_parameters.find(name);
+    if (entry == named_parameters.end() || entry->second.IsNull()) {
+        return result;
+    }
+    auto &list = ListValue::GetChildren(entry->second);
+    for (auto &child : list) {
+        result.push_back(StringValue::Get(child));
+    }
+    return result;
+}
+
+static NatsSubscribeConfig ParseSubscribeConfig(TableFunctionBindInput &input) {
+    NatsSubscribeConfig config;
+    bool has_job_name = false;
+    bool has_target_table = false;
+    bool has_subject = false;
+    for (auto &kv : input.named_parameters) {
+        if (kv.first == "job_name") {
+            config.job_name = StringValue::Get(kv.second);
+            has_job_name = true;
+        } else if (kv.first == "target_table") {
+            config.target_table = StringValue::Get(kv.second);
+            has_target_table = true;
+        } else if (kv.first == "url") {
+            config.nats_url = StringValue::Get(kv.second);
+        } else if (kv.first == "subject") {
+            config.subject = StringValue::Get(kv.second);
+            has_subject = !config.subject.empty();
+        } else if (kv.first == "queue_group") {
+            config.queue_group = StringValue::Get(kv.second);
+        } else if (kv.first == "batch_size") {
+            config.batch_size = UBigIntValue::Get(kv.second);
+        } else if (kv.first == "poll_ms") {
+            config.poll_ms = BigIntValue::Get(kv.second);
+        } else if (kv.first == "create_target_table") {
+            config.create_target_table = BooleanValue::Get(kv.second);
+        } else if (kv.first == "subject_column") {
+            config.subject_column = StringValue::Get(kv.second);
+        } else if (kv.first == "payload_column") {
+            config.payload_column = StringValue::Get(kv.second);
+        } else if (kv.first == "json_extract") {
+            config.json_fields = GetNamedStringList(input.named_parameters, "json_extract");
+        } else if (kv.first == "proto_file") {
+            config.proto_file = StringValue::Get(kv.second);
+        } else if (kv.first == "proto_message") {
+            config.proto_message = StringValue::Get(kv.second);
+        } else if (kv.first == "proto_extract") {
+            config.proto_fields = GetNamedStringList(input.named_parameters, "proto_extract");
+        }
+    }
+    if (!has_job_name) {
+        throw std::runtime_error("job_name parameter is required");
+    }
+    if (!has_target_table) {
+        throw std::runtime_error("target_table parameter is required");
+    }
+    if (!has_subject) {
+        throw std::runtime_error("subject parameter is required");
+    }
+    if (!config.json_fields.empty() || !config.proto_fields.empty()) {
+        throw std::runtime_error("core NATS live subscriptions currently support subject/payload only");
+    }
+    if (config.batch_size == 0 || config.batch_size > 65536) {
+        throw std::runtime_error("batch_size must be between 1 and 65536");
+    }
+    if (config.poll_ms < 1) {
+        throw std::runtime_error("poll_ms must be at least 1");
+    }
+    return config;
+}
+
+static void EnsureTargetTable(Connection &conn, const NatsSubscribeConfig &config) {
+    if (!config.create_target_table) {
+        return;
+    }
+    std::ostringstream sql;
+    sql << "CREATE TABLE IF NOT EXISTS " << config.target_table << " ("
+        << config.subject_column << " VARCHAR,"
+        << config.payload_column << " VARCHAR,"
+        << "received_at TIMESTAMP"
+        << ")";
+    auto result = conn.Query(sql.str());
+    if (result->HasError()) {
+        throw std::runtime_error("Failed to create subscription target table: " + result->GetError());
+    }
+}
+
+static void ConnectNats(const string &nats_url, natsConnection **conn) {
+    natsOptions *opts = nullptr;
+    natsStatus s = natsOptions_Create(&opts);
+    if (s != NATS_OK) {
+        throw std::runtime_error(std::string("Failed to create NATS options: ") + natsStatus_GetText(s));
+    }
+    s = natsOptions_SetTimeout(opts, 5000);
+    if (s != NATS_OK) {
+        natsOptions_Destroy(opts);
+        throw std::runtime_error(std::string("Failed to set NATS timeout: ") + natsStatus_GetText(s));
+    }
+    s = natsOptions_SetURL(opts, nats_url.c_str());
+    if (s != NATS_OK) {
+        natsOptions_Destroy(opts);
+        throw std::runtime_error(std::string("Failed to set NATS URL: ") + natsStatus_GetText(s));
+    }
+    s = natsConnection_Connect(conn, opts);
+    natsOptions_Destroy(opts);
+    if (s != NATS_OK) {
+        throw std::runtime_error(std::string("Failed to connect to NATS: ") + natsStatus_GetText(s));
+    }
+}
+
+static void DisconnectNats(natsConnection **conn) {
+    if (conn && *conn) {
+        natsConnection_Destroy(*conn);
+        *conn = nullptr;
+    }
+}
+
+static void FlushSubscribeBatch(Connection &conn, const NatsSubscribeConfig &config,
+                                const vector<pair<string, string>> &batch) {
+    if (batch.empty()) {
+        return;
+    }
+    Appender appender(conn, config.target_table);
+    for (auto &entry : batch) {
+        appender.AppendRow(Value(entry.first), Value(entry.second), Value::TIMESTAMP(Timestamp::GetCurrentTimestamp()));
+    }
+    appender.Flush();
+}
+
+static void RunSubscribeWorker(const shared_ptr<NatsSubscribeJobState> &job) {
+    try {
+        Connection conn(*job->db);
+        EnsureTargetTable(conn, job->config);
+        ConnectNats(job->config.nats_url, &job->conn);
+
+        natsStatus s = NATS_OK;
+        if (!job->config.queue_group.empty()) {
+            s = natsConnection_QueueSubscribeSync(&job->sub, job->conn, job->config.subject.c_str(),
+                                                  job->config.queue_group.c_str());
+        } else {
+            s = natsConnection_SubscribeSync(&job->sub, job->conn, job->config.subject.c_str());
+        }
+        if (s != NATS_OK) {
+            throw std::runtime_error(std::string("Failed to create NATS subscription: ") + natsStatus_GetText(s));
+        }
+        s = natsConnection_FlushTimeout(job->conn, 5000);
+        if (s != NATS_OK) {
+            throw std::runtime_error(std::string("Failed to flush NATS subscription: ") + natsStatus_GetText(s));
+        }
+
+        {
+            lock_guard<std::mutex> guard(job->mutex);
+            job->progress.running = true;
+            job->progress.last_start_time = Timestamp::GetCurrentTimestamp();
+        }
+        job->cv.notify_all();
+
+        vector<pair<string, string>> batch;
+        batch.reserve(job->config.batch_size);
+
+        while (true) {
+            {
+                unique_lock<std::mutex> lock(job->mutex);
+                if (job->progress.stop_requested) {
+                    break;
+                }
+                if (job->progress.paused) {
+                    job->cv.wait_for(lock, std::chrono::milliseconds(job->config.poll_ms), [&]() {
+                        return !job->progress.paused || job->progress.stop_requested;
+                    });
+                    if (job->progress.stop_requested) {
+                        break;
+                    }
+                    if (job->progress.paused) {
+                        continue;
+                    }
+                }
+            }
+
+            natsMsg *msg = nullptr;
+            s = natsSubscription_NextMsg(&msg, job->sub, job->config.poll_ms);
+            if (s == NATS_TIMEOUT) {
+                if (!batch.empty()) {
+                    FlushSubscribeBatch(conn, job->config, batch);
+                    {
+                        lock_guard<std::mutex> guard(job->mutex);
+                        job->progress.batches_committed++;
+                        job->progress.rows_inserted += batch.size();
+                        job->progress.last_commit_time = Timestamp::GetCurrentTimestamp();
+                    }
+                    job->cv.notify_all();
+                    batch.clear();
+                }
+                continue;
+            }
+            if (s != NATS_OK) {
+                throw std::runtime_error(std::string("Failed to receive NATS message: ") + natsStatus_GetText(s));
+            }
+
+            string subject = natsMsg_GetSubject(msg);
+            string payload;
+            const char *data = static_cast<const char *>(natsMsg_GetData(msg));
+            int len = natsMsg_GetDataLength(msg);
+            if (data && len > 0) {
+                payload.assign(data, data + len);
+            }
+            natsMsg_Destroy(msg);
+
+            {
+                lock_guard<std::mutex> guard(job->mutex);
+                job->progress.last_message_time = Timestamp::GetCurrentTimestamp();
+            }
+
+            batch.emplace_back(std::move(subject), std::move(payload));
+            if (batch.size() >= job->config.batch_size) {
+                FlushSubscribeBatch(conn, job->config, batch);
+                {
+                    lock_guard<std::mutex> guard(job->mutex);
+                    job->progress.batches_committed++;
+                    job->progress.rows_inserted += batch.size();
+                    job->progress.last_commit_time = Timestamp::GetCurrentTimestamp();
+                }
+                job->cv.notify_all();
+                batch.clear();
+            }
+        }
+
+        if (!batch.empty()) {
+            FlushSubscribeBatch(conn, job->config, batch);
+            lock_guard<std::mutex> guard(job->mutex);
+            job->progress.batches_committed++;
+            job->progress.rows_inserted += batch.size();
+            job->progress.last_commit_time = Timestamp::GetCurrentTimestamp();
+        }
+
+        {
+            lock_guard<std::mutex> guard(job->mutex);
+            job->progress.running = false;
+        }
+    } catch (std::exception &ex) {
+        lock_guard<std::mutex> guard(job->mutex);
+        job->progress.running = false;
+        job->progress.failed = true;
+        job->progress.last_error = ex.what();
+        job->progress.last_error_time = Timestamp::GetCurrentTimestamp();
+    }
+    job->cv.notify_all();
+}
+
+static unique_ptr<FunctionData> NatsSubscribeStartBind(ClientContext &, TableFunctionBindInput &input,
+                                                       vector<LogicalType> &return_types, vector<string> &names) {
+    auto config = ParseSubscribeConfig(input);
+    AddSubscribeSnapshotColumns(return_types, names);
+    auto bind_data = make_uniq<NatsSubscribeBindData>();
+    bind_data->config = std::move(config);
+    return bind_data;
+}
+
+static unique_ptr<GlobalTableFunctionState> NatsSubscribeStartInitGlobal(ClientContext &context,
+                                                                         TableFunctionInitInput &input) {
+    auto &bind_data = input.bind_data->Cast<NatsSubscribeBindData>();
+    auto job = NatsSubscribeManager::Get().CreateJob(bind_data.config);
+    job->db = context.db;
+    job->worker = std::thread(RunSubscribeWorker, job);
+
+    auto state = make_uniq<NatsSubscribeControlGlobalState>();
+    state->jobs.push_back(job);
+    return state;
+}
+
+static void NatsSubscribeStartExecute(ClientContext &, TableFunctionInput &data_p, DataChunk &output) {
+    auto &state = data_p.global_state->Cast<NatsSubscribeControlGlobalState>();
+    if (state.done) {
+        output.SetCardinality(0);
+        return;
+    }
+    auto snapshot = SnapshotJob(state.jobs[0]);
+    FillSubscribeSnapshotColumns(output, 0, snapshot);
+    output.SetCardinality(1);
+    state.done = true;
+}
+
+static unique_ptr<FunctionData> NatsSubscribeStopBind(ClientContext &, TableFunctionBindInput &input,
+                                                      vector<LogicalType> &return_types, vector<string> &names) {
+    string job_name;
+    bool has_job_name = false;
+    for (auto &kv : input.named_parameters) {
+        if (kv.first == "job_name") {
+            job_name = StringValue::Get(kv.second);
+            has_job_name = true;
+        }
+    }
+    if (!has_job_name) {
+        throw std::runtime_error("job_name parameter is required");
+    }
+    AddSubscribeSnapshotColumns(return_types, names);
+    auto bind_data = make_uniq<NatsSubscribeJobNameBindData>();
+    bind_data->job_name = std::move(job_name);
+    return bind_data;
+}
+
+static unique_ptr<GlobalTableFunctionState> NatsSubscribeStopInitGlobal(ClientContext &, TableFunctionInitInput &input) {
+    auto &bind_data = input.bind_data->Cast<NatsSubscribeJobNameBindData>();
+    auto job = NatsSubscribeManager::Get().GetJob(bind_data.job_name);
+    if (!job) {
+        throw std::runtime_error("Subscribe job '" + bind_data.job_name + "' does not exist");
+    }
+    NatsSubscribeManager::Get().StopJob(bind_data.job_name);
+    auto state = make_uniq<NatsSubscribeControlGlobalState>();
+    state->jobs.push_back(job);
+    return state;
+}
+
+static void NatsSubscribeStopExecute(ClientContext &, TableFunctionInput &data_p, DataChunk &output) {
+    auto &state = data_p.global_state->Cast<NatsSubscribeControlGlobalState>();
+    if (state.done) {
+        output.SetCardinality(0);
+        return;
+    }
+    auto snapshot = SnapshotJob(state.jobs[0]);
+    FillSubscribeSnapshotColumns(output, 0, snapshot);
+    output.SetCardinality(1);
+    state.done = true;
+}
+
+static unique_ptr<FunctionData> NatsSubscribeStatusBind(ClientContext &, TableFunctionBindInput &input,
+                                                        vector<LogicalType> &return_types, vector<string> &names) {
+    string job_name;
+    bool has_job_name = false;
+    for (auto &kv : input.named_parameters) {
+        if (kv.first == "job_name") {
+            job_name = StringValue::Get(kv.second);
+            has_job_name = true;
+        }
+    }
+    if (!has_job_name) {
+        throw std::runtime_error("job_name parameter is required");
+    }
+    AddSubscribeSnapshotColumns(return_types, names);
+    auto bind_data = make_uniq<NatsSubscribeJobNameBindData>();
+    bind_data->job_name = std::move(job_name);
+    return bind_data;
+}
+
+static unique_ptr<GlobalTableFunctionState> NatsSubscribeStatusInitGlobal(ClientContext &, TableFunctionInitInput &input) {
+    auto &bind_data = input.bind_data->Cast<NatsSubscribeJobNameBindData>();
+    auto job = NatsSubscribeManager::Get().GetJob(bind_data.job_name);
+    if (!job) {
+        throw std::runtime_error("Subscribe job '" + bind_data.job_name + "' does not exist");
+    }
+    auto state = make_uniq<NatsSubscribeControlGlobalState>();
+    state->jobs.push_back(job);
+    return state;
+}
+
+static void NatsSubscribeStatusExecute(ClientContext &, TableFunctionInput &data_p, DataChunk &output) {
+    auto &state = data_p.global_state->Cast<NatsSubscribeControlGlobalState>();
+    if (state.done) {
+        output.SetCardinality(0);
+        return;
+    }
+    auto snapshot = SnapshotJob(state.jobs[0]);
+    FillSubscribeSnapshotColumns(output, 0, snapshot);
+    output.SetCardinality(1);
+    state.done = true;
+}
+
+static unique_ptr<FunctionData> NatsSubscribeJobsBind(ClientContext &, TableFunctionBindInput &,
+                                                      vector<LogicalType> &return_types, vector<string> &names) {
+    AddSubscribeSnapshotColumns(return_types, names);
+    return make_uniq<NatsSubscribeJobsBindData>();
+}
+
+static unique_ptr<GlobalTableFunctionState> NatsSubscribeJobsInitGlobal(ClientContext &, TableFunctionInitInput &) {
+    auto state = make_uniq<NatsSubscribeControlGlobalState>();
+    state->jobs = NatsSubscribeManager::Get().ListJobs();
+    return state;
+}
+
+static void NatsSubscribeJobsExecute(ClientContext &, TableFunctionInput &data_p, DataChunk &output) {
+    auto &state = data_p.global_state->Cast<NatsSubscribeControlGlobalState>();
+    idx_t row = 0;
+    while (row < STANDARD_VECTOR_SIZE && state.row_idx < state.jobs.size()) {
+        auto snapshot = SnapshotJob(state.jobs[state.row_idx]);
+        FillSubscribeSnapshotColumns(output, row, snapshot);
+        row++;
+        state.row_idx++;
+    }
+    output.SetCardinality(row);
+}
+
+void NatsSubscribeFunction::Register(ExtensionLoader &loader) {
+    TableFunction start_fn("nats_start_subscribe", {}, NatsSubscribeStartExecute, NatsSubscribeStartBind,
+                           NatsSubscribeStartInitGlobal);
+    start_fn.named_parameters["job_name"] = LogicalType(LogicalTypeId::VARCHAR);
+    start_fn.named_parameters["target_table"] = LogicalType(LogicalTypeId::VARCHAR);
+    start_fn.named_parameters["url"] = LogicalType(LogicalTypeId::VARCHAR);
+    start_fn.named_parameters["subject"] = LogicalType(LogicalTypeId::VARCHAR);
+    start_fn.named_parameters["queue_group"] = LogicalType(LogicalTypeId::VARCHAR);
+    start_fn.named_parameters["batch_size"] = LogicalType(LogicalTypeId::UBIGINT);
+    start_fn.named_parameters["poll_ms"] = LogicalType(LogicalTypeId::BIGINT);
+    start_fn.named_parameters["create_target_table"] = LogicalType(LogicalTypeId::BOOLEAN);
+    start_fn.named_parameters["subject_column"] = LogicalType(LogicalTypeId::VARCHAR);
+    start_fn.named_parameters["payload_column"] = LogicalType(LogicalTypeId::VARCHAR);
+    start_fn.named_parameters["json_extract"] = LogicalType::LIST(LogicalType(LogicalTypeId::VARCHAR));
+    start_fn.named_parameters["proto_file"] = LogicalType(LogicalTypeId::VARCHAR);
+    start_fn.named_parameters["proto_message"] = LogicalType(LogicalTypeId::VARCHAR);
+    start_fn.named_parameters["proto_extract"] = LogicalType::LIST(LogicalType(LogicalTypeId::VARCHAR));
+    loader.RegisterFunction(start_fn);
+
+    TableFunction stop_fn("nats_stop_subscribe", {}, NatsSubscribeStopExecute, NatsSubscribeStopBind,
+                          NatsSubscribeStopInitGlobal);
+    stop_fn.named_parameters["job_name"] = LogicalType(LogicalTypeId::VARCHAR);
+    loader.RegisterFunction(stop_fn);
+
+    TableFunction status_fn("nats_subscribe_status", {}, NatsSubscribeStatusExecute, NatsSubscribeStatusBind,
+                            NatsSubscribeStatusInitGlobal);
+    status_fn.named_parameters["job_name"] = LogicalType(LogicalTypeId::VARCHAR);
+    loader.RegisterFunction(status_fn);
+
+    TableFunction jobs_fn("nats_subscribe_jobs", {}, NatsSubscribeJobsExecute, NatsSubscribeJobsBind,
+                          NatsSubscribeJobsInitGlobal);
+    loader.RegisterFunction(jobs_fn);
+}
+
+} // namespace duckdb
