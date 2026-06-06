@@ -212,4 +212,10 @@ NATS_CLI="$NATS_CLI" \
 "$ROOT_DIR/scripts/run-subscribe-harness.sh"
 echo "PASS scripts/run-subscribe-harness.sh"
 
+echo "RUN scripts/run-subscribe-pause-resume-harness.sh"
+NATS_URL="$NATS_URL" \
+NATS_CLI="$NATS_CLI" \
+"$ROOT_DIR/scripts/run-subscribe-pause-resume-harness.sh"
+echo "PASS scripts/run-subscribe-pause-resume-harness.sh"
+
 echo "All local integration tests passed"

@@ -181,6 +181,13 @@ so restarting with the same durable resumes from the last committed sequence.
 If you want DuckDB to create the destination table for you, pass
 `create_target_table := true` to `nats_start_ingest(...)`.
 
+Core NATS live subscriptions are available through `nats_start_subscribe(...)`,
+`nats_pause_subscribe(...)`, `nats_resume_subscribe(...)`, and
+`nats_stop_subscribe(...)`. They are live-only, batch-insert jobs without
+JetStream replay or durable resume.
+Use `scripts/run-subscribe-pause-resume-harness.sh` to exercise the control
+path deterministically against local NATS.
+
 For timing and throughput checks, use:
 
 ```bash

@@ -91,6 +91,40 @@ FROM 'ingest_resume'
 The `nats_js` copy format uses the same source layout as `nats_scan`, so the
 target table should match the standard ingest column order and types.
 
+## Core NATS Subscriptions
+
+Use the live subscription API when you want to consume messages from a core
+NATS subject without JetStream replay:
+
+```sql
+SELECT * FROM nats_start_subscribe(
+    job_name := 'live_subscribe_probe',
+    target_table := 'subscribe_out',
+    url := 'nats://127.0.0.1:4222',
+    subject := 'live.subscribe',
+    batch_size := 2,
+    poll_ms := 100,
+    create_target_table := true
+);
+
+SELECT rows_inserted, batches_committed, paused
+FROM nats_subscribe_status(job_name := 'live_subscribe_probe');
+
+SELECT * FROM nats_pause_subscribe(job_name := 'live_subscribe_probe');
+SELECT * FROM nats_resume_subscribe(job_name := 'live_subscribe_probe');
+SELECT * FROM nats_stop_subscribe(job_name := 'live_subscribe_probe');
+```
+
+`nats_start_subscribe` is live-only: it does not checkpoint or resume after a
+process restart.
+
+To pause and resume an active subscription:
+
+```sql
+SELECT * FROM nats_pause_subscribe(job_name := 'live_subscribe_probe');
+SELECT * FROM nats_resume_subscribe(job_name := 'live_subscribe_probe');
+```
+
 ## Copying Back To JetStream
 
 Export a query back into a JetStream stream with `COPY TO`:

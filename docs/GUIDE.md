@@ -539,6 +539,18 @@ Extracted fields (JSON or protobuf) are appended as additional columns after the
 - **Backpressure management** - Flow control for high-throughput streams
 - **Push-based delivery** - Event-driven message consumption
 
+#### Core NATS Subscriptions
+- **Live subscription jobs** - `nats_start_subscribe` batches messages from a
+  core NATS subject into DuckDB.
+- **Operational controls** - `nats_pause_subscribe`, `nats_resume_subscribe`,
+  and `nats_stop_subscribe` manage the job lifecycle.
+- **Live-only semantics** - No JetStream replay, no durable resume, and no
+  server-side checkpointing.
+- **Status fields** - `nats_subscribe_status` reports pause state, row counts,
+  batch counts, and recent activity timestamps.
+- **Validation harness** - `scripts/run-subscribe-pause-resume-harness.sh`
+  exercises the pause/resume controls against local NATS.
+
 #### Performance Enhancements
 - **Parallel scanning** - Multi-threaded message retrieval for multi-subject streams
 - **Vectorized decoding** - SIMD optimizations for JSON/protobuf parsing
