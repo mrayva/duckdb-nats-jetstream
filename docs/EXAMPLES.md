@@ -118,6 +118,9 @@ SELECT * FROM nats_stop_subscribe(job_name := 'live_subscribe_probe');
 `nats_start_subscribe` is live-only: it does not checkpoint or resume after a
 process restart.
 
+Run `scripts/benchmark-subscribe.sh` to measure live subscription throughput
+and batch latency against the seeded `live.subscribe` subject.
+
 To pause and resume an active subscription:
 
 ```sql

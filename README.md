@@ -161,6 +161,9 @@ row count, and stops the job cleanly. The harness also supports
 Use `scripts/run-ingest-pause-resume-harness.sh` to exercise the pause/resume
 control path and the richer ingest status fields.
 
+Use `scripts/benchmark-subscribe.sh` to measure live core NATS subscription
+throughput and batch latency against the seeded `live.subscribe` subject.
+
 JetStream also registers a `nats_js` `COPY FROM` format that reuses the same
 source path. Use it when you want to load a table with the standard scan
 schema via `COPY target FROM 'ingest_resume' (FORMAT nats_js, url '...')`.

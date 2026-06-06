@@ -550,6 +550,8 @@ Extracted fields (JSON or protobuf) are appended as additional columns after the
   batch counts, and recent activity timestamps.
 - **Validation harness** - `scripts/run-subscribe-pause-resume-harness.sh`
   exercises the pause/resume controls against local NATS.
+- **Benchmarking** - `scripts/benchmark-subscribe.sh` measures live subscribe
+  throughput and batch latency against the seeded `live.subscribe` subject.
 
 #### Performance Enhancements
 - **Parallel scanning** - Multi-threaded message retrieval for multi-subject streams
