@@ -65,7 +65,7 @@ verify_patterns() {
   done
 }
 
-sql_start=$(cat <<'SQL'
+sql_start=$(cat <<SQL
 LOAD '${EXTENSION_PATH}';
 SELECT 'start=' || job_name || '|' || stream_name || '|' || target_table || '|' || durable_name AS start_result
 FROM nats_start_ingest(
@@ -91,7 +91,7 @@ verify_patterns \
   "start=ingest_autocreate|ingest_resume|ingest_out|duckdb_ingest_autocreate" \
   "status=4/1/4"
 
-run_duckdb "$(cat <<'SQL'
+run_duckdb "$(cat <<SQL
 LOAD '${EXTENSION_PATH}';
 SELECT 'stop=' || job_name || '|' || stream_name || '|' || target_table || '|' || durable_name AS stop_result
 FROM nats_stop_ingest(job_name := 'ingest_autocreate');

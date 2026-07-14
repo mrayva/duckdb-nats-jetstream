@@ -160,8 +160,8 @@ row count, and stops the job cleanly. The harness also supports
 `HARNESS_MODE=redelivery` for a second deterministic checkpoint/resume pass.
 Use `scripts/run-ingest-pause-resume-harness.sh` to exercise the pause/resume
 control path and the richer ingest status fields.
-If your DuckDB host library is built separately, set `DUCKDB_HOST_LIB` once to
-point every harness and benchmark at that clean host `libduckdb.so`.
+The harnesses and benchmarks auto-resolve a clean host `libduckdb.so` when one
+is available. Set `DUCKDB_HOST_LIB` if you want to override that selection.
 
 Use `scripts/benchmark-subscribe.sh` to measure live core NATS subscription
 throughput and batch latency against the seeded `live.subscribe` subject.
