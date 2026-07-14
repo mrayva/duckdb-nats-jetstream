@@ -102,6 +102,24 @@ for pattern in \
 done
 echo "PASS test/sql/test_protobuf_errors.sql"
 
+echo "RUN test/sql/test_connection_options_errors.sql (expected errors)"
+if run_sql_test "test/sql/test_connection_options_errors.sql" /tmp/test_connection_options_errors.sql.log \
+    >/tmp/test_connection_options_errors.sql.log 2>&1; then
+  echo "Expected connection option error suite to fail, but it exited 0" >&2
+  exit 1
+fi
+
+for pattern in \
+  "tls_cert_file and tls_key_file must be specified together" \
+  "credentials_file does not exist"; do
+  if ! grep -q "$pattern" /tmp/test_connection_options_errors.sql.log; then
+    echo "Missing expected connection option error pattern: $pattern" >&2
+    tail -n 80 /tmp/test_connection_options_errors.sql.log >&2
+    exit 1
+  fi
+done
+echo "PASS test/sql/test_connection_options_errors.sql"
+
 echo "RUN test/sql/test_copy_from.sql"
 log_file="/tmp/test_copy_from.sql.log"
 run_copy_sql_test "test/sql/test_copy_from.sql" "$log_file"

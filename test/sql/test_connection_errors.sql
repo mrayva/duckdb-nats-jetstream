@@ -14,6 +14,7 @@ LOAD 'build/release/extension/nats_js/nats_js.duckdb_extension';
 SELECT COUNT(*) as count_custom_url
 FROM nats_scan('telemetry_proto',
     url := 'nats://localhost:4222',
+    tls_skip_verify := false,
     proto_file := 'test/proto/telemetry.proto',
     proto_message := 'Telemetry',
     proto_extract := ['device_id']
@@ -204,4 +205,3 @@ SELECT * FROM telemetry_data, environmental_data;
 .print ========================================
 .print Note: Error tests (E1-E6) are commented out
 .print ========================================
-

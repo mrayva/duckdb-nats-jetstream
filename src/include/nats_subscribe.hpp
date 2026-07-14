@@ -3,6 +3,7 @@
 #include "duckdb.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/common/types/timestamp.hpp"
+#include "nats_connection.hpp"
 #include <condition_variable>
 #include <google/protobuf/descriptor.h>
 #include <mutex>
@@ -23,7 +24,7 @@ public:
 struct NatsSubscribeConfig {
     string job_name;
     string target_table;
-    string nats_url = "nats://localhost:4222";
+    NatsConnectionConfig connection;
     string subject;
     string queue_group;
     uint64_t batch_size = 1024;

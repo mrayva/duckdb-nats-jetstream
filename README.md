@@ -191,6 +191,30 @@ JetStream replay or durable resume.
 Use `scripts/run-subscribe-pause-resume-harness.sh` to exercise the control
 path deterministically against local NATS.
 
+## Authentication And TLS
+
+All scan, stream stats, COPY, ingest, and live-subscribe connection APIs accept
+the same file-based security options:
+
+```sql
+SELECT *
+FROM nats_scan(
+    'telemetry',
+    url := 'nats://nats.example.com:4222',
+    credentials_file := '/run/secrets/nats.creds',
+    tls_ca_file := '/run/secrets/ca.pem',
+    tls_cert_file := '/run/secrets/client.pem',
+    tls_key_file := '/run/secrets/client-key.pem',
+    tls_server_name := 'nats.example.com'
+);
+```
+
+`credentials_file` uses the standard NATS credentials format containing a user
+JWT and NKey seed. The extension stores only file paths when persisting ingest
+jobs, not credential or private-key contents. `tls_cert_file` and
+`tls_key_file` must be supplied together. `tls_skip_verify := true` is available
+for local testing only and disables server certificate verification.
+
 For timing and throughput checks, use:
 
 ```bash

@@ -93,6 +93,12 @@ struct NatsIngestSnapshot {
     string target_table;
     string durable_name;
     string nats_url = "nats://localhost:4222";
+    string credentials_file;
+    string tls_ca_file;
+    string tls_cert_file;
+    string tls_key_file;
+    string tls_server_name;
+    bool tls_skip_verify = false;
     uint64_t start_seq = 1;
     uint64_t batch_size = 1000;
     int64_t poll_ms = 100;
@@ -250,6 +256,12 @@ static void EnsureRegistryTable(Connection &conn) {
         << "last_commit_time TIMESTAMP,"
         << "last_error_time TIMESTAMP,"
         << "last_error VARCHAR,"
+        << "credentials_file VARCHAR,"
+        << "tls_ca_file VARCHAR,"
+        << "tls_cert_file VARCHAR,"
+        << "tls_key_file VARCHAR,"
+        << "tls_server_name VARCHAR,"
+        << "tls_skip_verify BOOLEAN NOT NULL DEFAULT FALSE,"
         << "updated_at TIMESTAMP NOT NULL"
         << ")";
     ExecuteOrThrow(conn, sql.str(), "Failed to create ingest registry table");
@@ -261,6 +273,16 @@ static void EnsureRegistryTable(Connection &conn) {
                    "UPDATE " + string(NATS_INGEST_REGISTRY_TABLE) +
                        " SET create_target_table = COALESCE(create_target_table, FALSE)",
                    "Failed to backfill ingest registry table");
+    for (const auto &column : {"credentials_file VARCHAR", "tls_ca_file VARCHAR", "tls_cert_file VARCHAR",
+                               "tls_key_file VARCHAR", "tls_server_name VARCHAR",
+                               "tls_skip_verify BOOLEAN DEFAULT FALSE"}) {
+        ExecuteOrThrow(conn, "ALTER TABLE " + string(NATS_INGEST_REGISTRY_TABLE) + " ADD COLUMN IF NOT EXISTS " + column,
+                       "Failed to migrate ingest registry connection settings");
+    }
+    ExecuteOrThrow(conn,
+                   "UPDATE " + string(NATS_INGEST_REGISTRY_TABLE) +
+                       " SET tls_skip_verify = COALESCE(tls_skip_verify, FALSE)",
+                   "Failed to backfill ingest registry TLS settings");
 }
 
 static void UpsertRegistry(Connection &conn, const NatsIngestSnapshot &snapshot) {
@@ -270,7 +292,8 @@ static void UpsertRegistry(Connection &conn, const NatsIngestSnapshot &snapshot)
            "fetch_timeout_ms, resume_from_checkpoint, create_target_table, subject_contains, nats_subject, json_fields, proto_file, "
            "proto_message, proto_fields, running, stop_requested, stopped, failed, paused, pause_requested, "
            "last_committed_seq, last_delivered_seq, rows_inserted, batches_committed, fetches_completed, last_batch_rows, "
-           "sequence_lag, last_start_time, last_fetch_time, last_ack_time, last_commit_time, last_error_time, last_error, updated_at) VALUES ("
+           "sequence_lag, last_start_time, last_fetch_time, last_ack_time, last_commit_time, last_error_time, last_error, "
+           "credentials_file, tls_ca_file, tls_cert_file, tls_key_file, tls_server_name, tls_skip_verify, updated_at) VALUES ("
         << SqlStringLiteral(snapshot.job_name) << ", "
         << SqlStringLiteral(snapshot.stream_name) << ", "
         << SqlStringLiteral(snapshot.target_table) << ", "
@@ -307,6 +330,12 @@ static void UpsertRegistry(Connection &conn, const NatsIngestSnapshot &snapshot)
         << (snapshot.last_commit_time.value == 0 ? "NULL" : SqlStringLiteral(Timestamp::ToString(snapshot.last_commit_time))) << ", "
         << (snapshot.last_error_time.value == 0 ? "NULL" : SqlStringLiteral(Timestamp::ToString(snapshot.last_error_time))) << ", "
         << (snapshot.last_error.empty() ? "NULL" : SqlStringLiteral(snapshot.last_error)) << ", "
+        << (snapshot.credentials_file.empty() ? "NULL" : SqlStringLiteral(snapshot.credentials_file)) << ", "
+        << (snapshot.tls_ca_file.empty() ? "NULL" : SqlStringLiteral(snapshot.tls_ca_file)) << ", "
+        << (snapshot.tls_cert_file.empty() ? "NULL" : SqlStringLiteral(snapshot.tls_cert_file)) << ", "
+        << (snapshot.tls_key_file.empty() ? "NULL" : SqlStringLiteral(snapshot.tls_key_file)) << ", "
+        << (snapshot.tls_server_name.empty() ? "NULL" : SqlStringLiteral(snapshot.tls_server_name)) << ", "
+        << (snapshot.tls_skip_verify ? "TRUE" : "FALSE") << ", "
         << "CURRENT_TIMESTAMP"
         << ") ON CONFLICT(job_name) DO UPDATE SET "
         << "stream_name = excluded.stream_name, "
@@ -344,6 +373,12 @@ static void UpsertRegistry(Connection &conn, const NatsIngestSnapshot &snapshot)
         << "last_commit_time = excluded.last_commit_time, "
         << "last_error_time = excluded.last_error_time, "
         << "last_error = excluded.last_error, "
+        << "credentials_file = excluded.credentials_file, "
+        << "tls_ca_file = excluded.tls_ca_file, "
+        << "tls_cert_file = excluded.tls_cert_file, "
+        << "tls_key_file = excluded.tls_key_file, "
+        << "tls_server_name = excluded.tls_server_name, "
+        << "tls_skip_verify = excluded.tls_skip_verify, "
         << "updated_at = excluded.updated_at";
     ExecuteOrThrow(conn, sql.str(), "Failed to update ingest registry");
 }
@@ -358,7 +393,8 @@ static bool LoadRegistrySnapshot(Connection &conn, const string &job_name, NatsI
            "fetch_timeout_ms, resume_from_checkpoint, create_target_table, subject_contains, nats_subject, json_fields, proto_file, "
            "proto_message, proto_fields, running, stop_requested, stopped, failed, paused, pause_requested, last_committed_seq, "
            "last_delivered_seq, rows_inserted, batches_committed, fetches_completed, last_batch_rows, sequence_lag, last_start_time, "
-           "last_fetch_time, last_ack_time, last_commit_time, last_error_time, last_error "
+           "last_fetch_time, last_ack_time, last_commit_time, last_error_time, last_error, credentials_file, tls_ca_file, "
+           "tls_cert_file, tls_key_file, tls_server_name, tls_skip_verify "
         << "FROM " << NATS_INGEST_REGISTRY_TABLE << " WHERE job_name = " << SqlStringLiteral(job_name);
 
     auto result = conn.Query(sql.str());
@@ -435,6 +471,22 @@ static bool LoadRegistrySnapshot(Connection &conn, const string &job_name, NatsI
     if (!chunk->GetValue(35, 0).IsNull()) {
         snapshot.last_error = chunk->GetValue(35, 0).GetValue<string>();
     }
+    if (!chunk->GetValue(36, 0).IsNull()) {
+        snapshot.credentials_file = chunk->GetValue(36, 0).GetValue<string>();
+    }
+    if (!chunk->GetValue(37, 0).IsNull()) {
+        snapshot.tls_ca_file = chunk->GetValue(37, 0).GetValue<string>();
+    }
+    if (!chunk->GetValue(38, 0).IsNull()) {
+        snapshot.tls_cert_file = chunk->GetValue(38, 0).GetValue<string>();
+    }
+    if (!chunk->GetValue(39, 0).IsNull()) {
+        snapshot.tls_key_file = chunk->GetValue(39, 0).GetValue<string>();
+    }
+    if (!chunk->GetValue(40, 0).IsNull()) {
+        snapshot.tls_server_name = chunk->GetValue(40, 0).GetValue<string>();
+    }
+    snapshot.tls_skip_verify = chunk->GetValue(41, 0).GetValue<bool>();
     return true;
 }
 
@@ -444,7 +496,8 @@ static vector<NatsIngestSnapshot> LoadRegistrySnapshots(Connection &conn) {
            "fetch_timeout_ms, resume_from_checkpoint, create_target_table, subject_contains, nats_subject, json_fields, proto_file, "
            "proto_message, proto_fields, running, stop_requested, stopped, failed, paused, pause_requested, last_committed_seq, "
            "last_delivered_seq, rows_inserted, batches_committed, fetches_completed, last_batch_rows, sequence_lag, last_start_time, "
-           "last_fetch_time, last_ack_time, last_commit_time, last_error_time, last_error "
+           "last_fetch_time, last_ack_time, last_commit_time, last_error_time, last_error, credentials_file, tls_ca_file, "
+           "tls_cert_file, tls_key_file, tls_server_name, tls_skip_verify "
         << "FROM " << NATS_INGEST_REGISTRY_TABLE << " ORDER BY job_name";
 
     auto result = conn.Query(sql.str());
@@ -520,6 +573,22 @@ static vector<NatsIngestSnapshot> LoadRegistrySnapshots(Connection &conn) {
             if (!chunk->GetValue(35, row).IsNull()) {
                 snapshot.last_error = chunk->GetValue(35, row).GetValue<string>();
             }
+            if (!chunk->GetValue(36, row).IsNull()) {
+                snapshot.credentials_file = chunk->GetValue(36, row).GetValue<string>();
+            }
+            if (!chunk->GetValue(37, row).IsNull()) {
+                snapshot.tls_ca_file = chunk->GetValue(37, row).GetValue<string>();
+            }
+            if (!chunk->GetValue(38, row).IsNull()) {
+                snapshot.tls_cert_file = chunk->GetValue(38, row).GetValue<string>();
+            }
+            if (!chunk->GetValue(39, row).IsNull()) {
+                snapshot.tls_key_file = chunk->GetValue(39, row).GetValue<string>();
+            }
+            if (!chunk->GetValue(40, row).IsNull()) {
+                snapshot.tls_server_name = chunk->GetValue(40, row).GetValue<string>();
+            }
+            snapshot.tls_skip_verify = chunk->GetValue(41, row).GetValue<bool>();
             snapshots.push_back(std::move(snapshot));
         }
     }
@@ -614,50 +683,6 @@ static bool CanUseServerSubjectFilter(const string &subject_filter, const jsStre
     return false;
 }
 
-static void ConnectJetStream(const string &nats_url, natsConnection **conn, jsCtx **js) {
-    constexpr idx_t MAX_CONNECT_ATTEMPTS = 20;
-    natsStatus last_status = NATS_OK;
-    for (idx_t attempt = 0; attempt < MAX_CONNECT_ATTEMPTS; attempt++) {
-        natsOptions *opts = nullptr;
-        natsStatus s = natsOptions_Create(&opts);
-        if (s != NATS_OK) {
-            throw std::runtime_error(std::string("Failed to create NATS options: ") + natsStatus_GetText(s));
-        }
-
-        s = natsOptions_SetTimeout(opts, 5000);
-        if (s != NATS_OK) {
-            natsOptions_Destroy(opts);
-            throw std::runtime_error(std::string("Failed to set NATS timeout: ") + natsStatus_GetText(s));
-        }
-
-        s = natsOptions_SetURL(opts, nats_url.c_str());
-        if (s != NATS_OK) {
-            natsOptions_Destroy(opts);
-            throw std::runtime_error(std::string("Failed to set NATS URL: ") + natsStatus_GetText(s));
-        }
-
-        s = natsConnection_Connect(conn, opts);
-        natsOptions_Destroy(opts);
-        if (s == NATS_OK) {
-            s = natsConnection_JetStream(js, *conn, nullptr);
-            if (s == NATS_OK) {
-                return;
-            }
-            natsConnection_Destroy(*conn);
-            *conn = nullptr;
-            last_status = s;
-        } else {
-            last_status = s;
-        }
-
-        if (attempt + 1 < MAX_CONNECT_ATTEMPTS) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        }
-    }
-
-    throw std::runtime_error(std::string("Failed to connect to NATS: ") + natsStatus_GetText(last_status));
-}
-
 static void DisconnectJetStream(natsConnection **conn, jsCtx **js) {
     if (js && *js != nullptr) {
         jsCtx_Destroy(*js);
@@ -732,8 +757,7 @@ static NatsIngestConfig ParseStartConfig(TableFunctionBindInput &input) {
         } else if (kv.first == "durable_name") {
             config.durable_name = StringValue::Get(kv.second);
             has_durable_name = true;
-        } else if (kv.first == "url") {
-            config.nats_url = StringValue::Get(kv.second);
+        } else if (ParseNatsConnectionParameter(config.connection, kv.first, kv.second)) {
         } else if (kv.first == "start_seq") {
             config.start_seq = UBigIntValue::Get(kv.second);
         } else if (kv.first == "batch_size") {
@@ -810,6 +834,7 @@ static NatsIngestConfig ParseStartConfig(TableFunctionBindInput &input) {
     }
 
     config.create_target_table = create_target_table;
+    ValidateNatsConnectionConfig(config.connection);
 
     return config;
 }
@@ -821,7 +846,13 @@ static NatsIngestSnapshot SnapshotJob(const shared_ptr<NatsIngestJobState> &job)
     snapshot.stream_name = job->config.stream_name;
     snapshot.target_table = job->config.target_table;
     snapshot.durable_name = job->config.durable_name;
-    snapshot.nats_url = job->config.nats_url;
+    snapshot.nats_url = job->config.connection.url;
+    snapshot.credentials_file = job->config.connection.credentials_file;
+    snapshot.tls_ca_file = job->config.connection.tls_ca_file;
+    snapshot.tls_cert_file = job->config.connection.tls_cert_file;
+    snapshot.tls_key_file = job->config.connection.tls_key_file;
+    snapshot.tls_server_name = job->config.connection.tls_server_name;
+    snapshot.tls_skip_verify = job->config.connection.tls_skip_verify;
     snapshot.start_seq = job->config.start_seq;
     snapshot.batch_size = job->config.batch_size;
     snapshot.poll_ms = job->config.poll_ms;
@@ -864,7 +895,13 @@ static NatsIngestConfig SnapshotToConfig(const NatsIngestSnapshot &snapshot) {
     config.stream_name = snapshot.stream_name;
     config.target_table = snapshot.target_table;
     config.durable_name = snapshot.durable_name;
-    config.nats_url = snapshot.nats_url;
+    config.connection.url = snapshot.nats_url;
+    config.connection.credentials_file = snapshot.credentials_file;
+    config.connection.tls_ca_file = snapshot.tls_ca_file;
+    config.connection.tls_cert_file = snapshot.tls_cert_file;
+    config.connection.tls_key_file = snapshot.tls_key_file;
+    config.connection.tls_server_name = snapshot.tls_server_name;
+    config.connection.tls_skip_verify = snapshot.tls_skip_verify;
     config.start_seq = snapshot.start_seq;
     config.batch_size = snapshot.batch_size;
     config.poll_ms = snapshot.poll_ms;
@@ -1023,7 +1060,12 @@ static void InitializeIngestResources(const shared_ptr<NatsIngestJobState> &job)
 
     natsConnection *conn = nullptr;
     jsCtx *js = nullptr;
-    ConnectJetStream(config.nats_url, &conn, &js);
+    ConnectNats(config.connection, &conn, 20);
+    auto jetstream_status = natsConnection_JetStream(&js, conn, nullptr);
+    if (jetstream_status != NATS_OK) {
+        natsConnection_Destroy(conn);
+        throw std::runtime_error(string("Failed to create JetStream context: ") + natsStatus_GetText(jetstream_status));
+    }
 
     jsOptions stream_info_opts;
     jsOptions_Init(&stream_info_opts);
@@ -2212,7 +2254,7 @@ void NatsIngestFunction::Register(ExtensionLoader &loader) {
     start_fn.named_parameters["stream_name"] = LogicalType(LogicalTypeId::VARCHAR);
     start_fn.named_parameters["target_table"] = LogicalType(LogicalTypeId::VARCHAR);
     start_fn.named_parameters["durable_name"] = LogicalType(LogicalTypeId::VARCHAR);
-    start_fn.named_parameters["url"] = LogicalType(LogicalTypeId::VARCHAR);
+    RegisterNatsConnectionParameters(start_fn);
     start_fn.named_parameters["start_seq"] = LogicalType(LogicalTypeId::UBIGINT);
     start_fn.named_parameters["batch_size"] = LogicalType(LogicalTypeId::UBIGINT);
     start_fn.named_parameters["poll_ms"] = LogicalType(LogicalTypeId::BIGINT);

@@ -199,7 +199,7 @@ static NatsSubscribeSnapshot SnapshotJob(const shared_ptr<NatsSubscribeJobState>
     NatsSubscribeSnapshot snapshot;
     snapshot.job_name = job->config.job_name;
     snapshot.target_table = job->config.target_table;
-    snapshot.nats_url = job->config.nats_url;
+    snapshot.nats_url = job->config.connection.url;
     snapshot.subject = job->config.subject;
     snapshot.queue_group = job->config.queue_group;
     snapshot.running = job->progress.running;
@@ -279,8 +279,7 @@ static NatsSubscribeConfig ParseSubscribeConfig(TableFunctionBindInput &input) {
         } else if (kv.first == "target_table") {
             config.target_table = StringValue::Get(kv.second);
             has_target_table = true;
-        } else if (kv.first == "url") {
-            config.nats_url = StringValue::Get(kv.second);
+        } else if (ParseNatsConnectionParameter(config.connection, kv.first, kv.second)) {
         } else if (kv.first == "subject") {
             config.subject = StringValue::Get(kv.second);
             has_subject = !config.subject.empty();
@@ -330,6 +329,7 @@ static NatsSubscribeConfig ParseSubscribeConfig(TableFunctionBindInput &input) {
     if (config.payload_column.empty()) {
         throw std::runtime_error("payload_column must not be empty");
     }
+    ValidateNatsConnectionConfig(config.connection);
     return config;
 }
 
@@ -368,29 +368,6 @@ static void EnsureTargetTable(Connection &conn, const NatsSubscribeConfig &confi
     auto result = conn.Query(sql.str());
     if (result->HasError()) {
         throw std::runtime_error("Failed to create subscription target table: " + result->GetError());
-    }
-}
-
-static void ConnectNats(const string &nats_url, natsConnection **conn) {
-    natsOptions *opts = nullptr;
-    natsStatus s = natsOptions_Create(&opts);
-    if (s != NATS_OK) {
-        throw std::runtime_error(std::string("Failed to create NATS options: ") + natsStatus_GetText(s));
-    }
-    s = natsOptions_SetTimeout(opts, 5000);
-    if (s != NATS_OK) {
-        natsOptions_Destroy(opts);
-        throw std::runtime_error(std::string("Failed to set NATS timeout: ") + natsStatus_GetText(s));
-    }
-    s = natsOptions_SetURL(opts, nats_url.c_str());
-    if (s != NATS_OK) {
-        natsOptions_Destroy(opts);
-        throw std::runtime_error(std::string("Failed to set NATS URL: ") + natsStatus_GetText(s));
-    }
-    s = natsConnection_Connect(conn, opts);
-    natsOptions_Destroy(opts);
-    if (s != NATS_OK) {
-        throw std::runtime_error(std::string("Failed to connect to NATS: ") + natsStatus_GetText(s));
     }
 }
 
@@ -436,7 +413,7 @@ static void RunSubscribeWorker(const shared_ptr<NatsSubscribeJobState> &job) {
     try {
         Connection conn(*job->db);
         EnsureTargetTable(conn, job->config);
-        ConnectNats(job->config.nats_url, &job->conn);
+        ConnectNats(job->config.connection, &job->conn);
 
         natsStatus s = NATS_OK;
         if (!job->config.queue_group.empty()) {
@@ -826,7 +803,7 @@ void NatsSubscribeFunction::Register(ExtensionLoader &loader) {
                            NatsSubscribeStartInitGlobal);
     start_fn.named_parameters["job_name"] = LogicalType(LogicalTypeId::VARCHAR);
     start_fn.named_parameters["target_table"] = LogicalType(LogicalTypeId::VARCHAR);
-    start_fn.named_parameters["url"] = LogicalType(LogicalTypeId::VARCHAR);
+    RegisterNatsConnectionParameters(start_fn);
     start_fn.named_parameters["subject"] = LogicalType(LogicalTypeId::VARCHAR);
     start_fn.named_parameters["queue_group"] = LogicalType(LogicalTypeId::VARCHAR);
     start_fn.named_parameters["batch_size"] = LogicalType(LogicalTypeId::UBIGINT);

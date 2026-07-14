@@ -3,6 +3,7 @@
 #include "duckdb.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/common/types/timestamp.hpp"
+#include "nats_connection.hpp"
 #include <google/protobuf/descriptor.h>
 #include <condition_variable>
 #include <mutex>
@@ -25,7 +26,7 @@ struct NatsIngestConfig {
     string stream_name;
     string target_table;
     string durable_name;
-    string nats_url = "nats://localhost:4222";
+    NatsConnectionConfig connection;
     string subject_contains;
     string nats_subject;
     uint64_t start_seq = 1;

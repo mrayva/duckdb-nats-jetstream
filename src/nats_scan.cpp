@@ -1,4 +1,5 @@
 #include "nats_scan.hpp"
+#include "nats_connection.hpp"
 #include "nats_message_decode.hpp"
 #include "duckdb/function/copy_function.hpp"
 #include "duckdb/function/table_function.hpp"
@@ -66,7 +67,7 @@ struct NatsScanBindData : public TableFunctionData {
     string stream_name;
     string subject_contains;
     string nats_subject;
-    string nats_url;
+    NatsConnectionConfig connection;
     uint64_t start_seq;
     uint64_t end_seq;
     int64_t start_time;  // nanoseconds since epoch, 0 = not set
@@ -85,14 +86,15 @@ struct NatsScanBindData : public TableFunctionData {
     shared_ptr<Importer> proto_importer;
     const Descriptor* proto_descriptor = nullptr;
 
-    NatsScanBindData(string stream, string subject_substr, string nats_subj, string url, uint64_t start, uint64_t end,
+    NatsScanBindData(string stream, string subject_substr, string nats_subj, NatsConnectionConfig connection_p,
+                     uint64_t start, uint64_t end,
                      int64_t start_ts, int64_t end_ts, vector<string> json_flds,
                      string proto_f, string proto_msg, vector<string> proto_flds,
                      vector<vector<const FieldDescriptor*>> proto_paths, uint64_t batch_sz, int64_t fetch_timeout)
         : stream_name(std::move(stream))
         , subject_contains(std::move(subject_substr))
         , nats_subject(std::move(nats_subj))
-        , nats_url(std::move(url))
+        , connection(std::move(connection_p))
         , start_seq(start)
         , end_seq(end)
         , start_time(start_ts)
@@ -120,7 +122,7 @@ struct NatsCopyBindData : public TableFunctionData {
 
 struct NatsCopyToBindData : public TableFunctionData {
     string stream_name;
-    string nats_url;
+    NatsConnectionConfig connection;
     string subject_column = "subject";
     string payload_column = "payload";
     bool constant_subject = false;
@@ -261,6 +263,12 @@ static idx_t FindColumnIndex(const vector<string> &names, const string &column_n
 static void NatsCopyListOptions(ClientContext &, CopyOptionsInput &input) {
     auto &copy_options = input.options;
     copy_options["url"] = CopyOption(LogicalType::VARCHAR, CopyOptionMode::READ_WRITE);
+    copy_options["credentials_file"] = CopyOption(LogicalType::VARCHAR, CopyOptionMode::READ_WRITE);
+    copy_options["tls_ca_file"] = CopyOption(LogicalType::VARCHAR, CopyOptionMode::READ_WRITE);
+    copy_options["tls_cert_file"] = CopyOption(LogicalType::VARCHAR, CopyOptionMode::READ_WRITE);
+    copy_options["tls_key_file"] = CopyOption(LogicalType::VARCHAR, CopyOptionMode::READ_WRITE);
+    copy_options["tls_server_name"] = CopyOption(LogicalType::VARCHAR, CopyOptionMode::READ_WRITE);
+    copy_options["tls_skip_verify"] = CopyOption(LogicalType::BOOLEAN, CopyOptionMode::READ_WRITE);
     copy_options["subject"] = CopyOption(LogicalType::VARCHAR, CopyOptionMode::READ_WRITE);
     copy_options["subject_contains"] = CopyOption(LogicalType::VARCHAR, CopyOptionMode::READ_WRITE);
     copy_options["nats_subject"] = CopyOption(LogicalType::VARCHAR, CopyOptionMode::READ_WRITE);
@@ -278,43 +286,6 @@ static void NatsCopyListOptions(ClientContext &, CopyOptionsInput &input) {
     copy_options["payload_column"] = CopyOption(LogicalType::VARCHAR, CopyOptionMode::READ_WRITE);
 }
 
-static void ConnectNats(const string &nats_url, natsConnection **conn) {
-    constexpr idx_t MAX_CONNECT_ATTEMPTS = 20;
-    natsStatus last_status = NATS_OK;
-    for (idx_t attempt = 0; attempt < MAX_CONNECT_ATTEMPTS; attempt++) {
-        natsOptions *opts = nullptr;
-        natsStatus s = natsOptions_Create(&opts);
-        if (s != NATS_OK) {
-            throw std::runtime_error(std::string("Failed to create NATS options: ") + natsStatus_GetText(s));
-        }
-
-        s = natsOptions_SetTimeout(opts, 5000);
-        if (s != NATS_OK) {
-            natsOptions_Destroy(opts);
-            throw std::runtime_error(std::string("Failed to set NATS timeout: ") + natsStatus_GetText(s));
-        }
-
-        s = natsOptions_SetURL(opts, nats_url.c_str());
-        if (s != NATS_OK) {
-            natsOptions_Destroy(opts);
-            throw std::runtime_error(std::string("Failed to set NATS URL: ") + natsStatus_GetText(s));
-        }
-
-        s = natsConnection_Connect(conn, opts);
-        natsOptions_Destroy(opts);
-        if (s == NATS_OK) {
-            return;
-        }
-
-        last_status = s;
-        if (attempt + 1 < MAX_CONNECT_ATTEMPTS) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        }
-    }
-
-    throw std::runtime_error(std::string("Failed to connect to NATS: ") + natsStatus_GetText(last_status));
-}
-
 static void DisconnectNats(natsConnection **conn) {
     if (conn && *conn != nullptr) {
         natsConnection_Destroy(*conn);
@@ -325,7 +296,13 @@ static void DisconnectNats(natsConnection **conn) {
 static unique_ptr<FunctionData> NatsCopyToBind(ClientContext &context, CopyFunctionBindInput &input,
                                                const vector<string> &names, const vector<LogicalType> &sql_types) {
     auto result = make_uniq<NatsCopyToBindData>();
-    result->nats_url = ResolveNatsCopyUrl(input.info.options, "COPY TO", nullptr);
+    result->connection.url = ResolveNatsCopyUrl(input.info.options, "COPY TO", nullptr);
+    for (const auto &option : input.info.options) {
+        if (!option.second.empty()) {
+            ParseNatsConnectionParameter(result->connection, option.first, option.second.front());
+        }
+    }
+    ValidateNatsConnectionConfig(result->connection);
     result->stream_name = ResolveNatsCopyStreamName(input.info.file_path, "COPY TO");
 
     auto subject = GetCopyOptionString(input.info.options, "subject");
@@ -380,7 +357,7 @@ static unique_ptr<GlobalFunctionData> NatsCopyToInitializeGlobal(ClientContext &
                                                                  const string &) {
     auto &bdata = bind_data.Cast<NatsCopyToBindData>();
     auto result = make_uniq<NatsCopyToGlobalState>();
-    ConnectNats(bdata.nats_url, &result->conn);
+    ConnectNats(bdata.connection, &result->conn, 20);
     return std::move(result);
 }
 
@@ -541,7 +518,7 @@ static unique_ptr<FunctionData> NatsScanBind(ClientContext &context, TableFuncti
     string subject_legacy = "";
     string subject_contains = "";
     string nats_subject = "";
-    string nats_url = "nats://localhost:4222";
+    NatsConnectionConfig connection;
     uint64_t start_seq = 0;
     uint64_t end_seq = UINT64_MAX;
     int64_t start_time = 0;
@@ -560,8 +537,7 @@ static unique_ptr<FunctionData> NatsScanBind(ClientContext &context, TableFuncti
             subject_contains = StringValue::Get(kv.second);
         } else if (kv.first == "nats_subject") {
             nats_subject = StringValue::Get(kv.second);
-        } else if (kv.first == "url") {
-            nats_url = StringValue::Get(kv.second);
+        } else if (ParseNatsConnectionParameter(connection, kv.first, kv.second)) {
         } else if (kv.first == "start_seq") {
             start_seq = UBigIntValue::Get(kv.second);
         } else if (kv.first == "end_seq") {
@@ -623,6 +599,7 @@ static unique_ptr<FunctionData> NatsScanBind(ClientContext &context, TableFuncti
             throw std::runtime_error("proto_message parameter is required when using proto_extract");
         }
     }
+    ValidateNatsConnectionConfig(connection);
 
     shared_ptr<DiskSourceTree> source_tree;
     shared_ptr<ProtobufErrorCollector> error_collector;
@@ -671,7 +648,7 @@ static unique_ptr<FunctionData> NatsScanBind(ClientContext &context, TableFuncti
     names = schema.names;
     return_types = schema.return_types;
 
-    auto bind_data = make_uniq<NatsScanBindData>(stream_name, subject_contains, nats_subject, nats_url, start_seq, end_seq,
+    auto bind_data = make_uniq<NatsScanBindData>(stream_name, subject_contains, nats_subject, std::move(connection), start_seq, end_seq,
                                                   start_time, end_time, json_fields, proto_file, proto_message, proto_fields,
                                                   std::move(proto_field_paths), batch_size, fetch_timeout_ms);
 
@@ -794,37 +771,6 @@ static uint64_t CountAvailableInSequenceRange(const jsStreamState &state, uint64
     return overlap_messages >= deleted_in_range ? overlap_messages - deleted_in_range : 0;
 }
 
-static void ConnectJetStream(const string &nats_url, natsConnection **conn, jsCtx **js) {
-    natsOptions *opts = nullptr;
-    natsStatus s = natsOptions_Create(&opts);
-    if (s != NATS_OK) {
-        throw std::runtime_error(std::string("Failed to create NATS options: ") + natsStatus_GetText(s));
-    }
-
-    s = natsOptions_SetTimeout(opts, 5000);
-    if (s != NATS_OK) {
-        natsOptions_Destroy(opts);
-        throw std::runtime_error(std::string("Failed to set NATS timeout: ") + natsStatus_GetText(s));
-    }
-
-    s = natsOptions_SetURL(opts, nats_url.c_str());
-    if (s != NATS_OK) {
-        natsOptions_Destroy(opts);
-        throw std::runtime_error(std::string("Failed to set NATS URL: ") + natsStatus_GetText(s));
-    }
-
-    s = natsConnection_Connect(conn, opts);
-    natsOptions_Destroy(opts);
-    if (s != NATS_OK) {
-        throw std::runtime_error(std::string("Failed to connect to NATS: ") + natsStatus_GetText(s));
-    }
-
-    s = natsConnection_JetStream(js, *conn, nullptr);
-    if (s != NATS_OK) {
-        throw std::runtime_error(std::string("Failed to create JetStream context: ") + natsStatus_GetText(s));
-    }
-}
-
 static unique_ptr<GlobalTableFunctionState> NatsScanInitGlobal(ClientContext &context,
                                                                  TableFunctionInitInput &input) {
     auto &bind_data = input.bind_data->Cast<NatsScanBindData>();
@@ -841,7 +787,7 @@ static unique_ptr<GlobalTableFunctionState> NatsScanInitGlobal(ClientContext &co
     }
 
     // Connect to NATS and validate stream at init time (fail-fast on typos / unreachable server)
-    ConnectJetStream(bind_data.nats_url, &state->conn, &state->js);
+    ConnectJetStream(bind_data.connection, &state->conn, &state->js);
 
     jsOptions stream_info_opts;
     jsOptions_Init(&stream_info_opts);
@@ -1203,21 +1149,21 @@ static void NatsScanExecute(ClientContext &context, TableFunctionInput &data_p, 
 
 struct NatsStreamStatsBindData : public TableFunctionData {
     string stream_name;
-    string nats_url;
+    NatsConnectionConfig connection;
 
-    NatsStreamStatsBindData(string stream, string url)
-        : stream_name(std::move(stream)), nats_url(std::move(url)) {
+    NatsStreamStatsBindData(string stream, NatsConnectionConfig connection_p)
+        : stream_name(std::move(stream)), connection(std::move(connection_p)) {
     }
 };
 
 struct NatsStreamRangeStatsBindData : public TableFunctionData {
     string stream_name;
-    string nats_url;
+    NatsConnectionConfig connection;
     uint64_t start_seq;
     uint64_t end_seq;
 
-    NatsStreamRangeStatsBindData(string stream, string url, uint64_t start, uint64_t end)
-        : stream_name(std::move(stream)), nats_url(std::move(url)), start_seq(start), end_seq(end) {
+    NatsStreamRangeStatsBindData(string stream, NatsConnectionConfig connection_p, uint64_t start, uint64_t end)
+        : stream_name(std::move(stream)), connection(std::move(connection_p)), start_seq(start), end_seq(end) {
     }
 };
 
@@ -1236,13 +1182,12 @@ static unique_ptr<FunctionData> NatsStreamStatsBind(ClientContext &context, Tabl
     }
 
     auto stream_name = input.inputs[0].GetValue<string>();
-    string nats_url = "nats://localhost:4222";
+    NatsConnectionConfig connection;
 
     for (auto &kv : input.named_parameters) {
-        if (kv.first == "url") {
-            nats_url = StringValue::Get(kv.second);
-        }
+        ParseNatsConnectionParameter(connection, kv.first, kv.second);
     }
+    ValidateNatsConnectionConfig(connection);
 
     names.emplace_back("stream");
     return_types.emplace_back(LogicalType(LogicalTypeId::VARCHAR));
@@ -1265,7 +1210,7 @@ static unique_ptr<FunctionData> NatsStreamStatsBind(ClientContext &context, Tabl
     names.emplace_back("subject_count");
     return_types.emplace_back(LogicalType(LogicalTypeId::BIGINT));
 
-    return make_uniq<NatsStreamStatsBindData>(stream_name, nats_url);
+    return make_uniq<NatsStreamStatsBindData>(stream_name, std::move(connection));
 }
 
 static unique_ptr<FunctionData> NatsStreamRangeStatsBind(ClientContext &context, TableFunctionBindInput &input,
@@ -1275,21 +1220,21 @@ static unique_ptr<FunctionData> NatsStreamRangeStatsBind(ClientContext &context,
     }
 
     auto stream_name = input.inputs[0].GetValue<string>();
-    string nats_url = "nats://localhost:4222";
+    NatsConnectionConfig connection;
     uint64_t start_seq = 0;
     uint64_t end_seq = 0;
     bool has_start_seq = false;
     bool has_end_seq = false;
 
     for (auto &kv : input.named_parameters) {
-        if (kv.first == "url") {
-            nats_url = StringValue::Get(kv.second);
-        } else if (kv.first == "start_seq") {
+        if (kv.first == "start_seq") {
             start_seq = UBigIntValue::Get(kv.second);
             has_start_seq = true;
         } else if (kv.first == "end_seq") {
             end_seq = UBigIntValue::Get(kv.second);
             has_end_seq = true;
+        } else {
+            ParseNatsConnectionParameter(connection, kv.first, kv.second);
         }
     }
 
@@ -1332,7 +1277,8 @@ static unique_ptr<FunctionData> NatsStreamRangeStatsBind(ClientContext &context,
     names.emplace_back("ends_after_last");
     return_types.emplace_back(LogicalType(LogicalTypeId::BOOLEAN));
 
-    return make_uniq<NatsStreamRangeStatsBindData>(stream_name, nats_url, start_seq, end_seq);
+    ValidateNatsConnectionConfig(connection);
+    return make_uniq<NatsStreamRangeStatsBindData>(stream_name, std::move(connection), start_seq, end_seq);
 }
 
 static unique_ptr<GlobalTableFunctionState> NatsStreamStatsInitGlobal(ClientContext &context,
@@ -1362,7 +1308,7 @@ static void NatsStreamStatsExecute(ClientContext &context, TableFunctionInput &d
     jsStreamInfo *stream_info = nullptr;
 
     try {
-        ConnectJetStream(bind_data.nats_url, &conn, &js);
+        ConnectJetStream(bind_data.connection, &conn, &js);
 
         natsStatus s = js_GetStreamInfo(&stream_info, js, bind_data.stream_name.c_str(), nullptr, nullptr);
         if (s != NATS_OK) {
@@ -1421,7 +1367,7 @@ static void NatsStreamRangeStatsExecute(ClientContext &context, TableFunctionInp
     jsStreamInfo *stream_info = nullptr;
 
     try {
-        ConnectJetStream(bind_data.nats_url, &conn, &js);
+        ConnectJetStream(bind_data.connection, &conn, &js);
 
         jsOptions opts;
         jsOptions_Init(&opts);
@@ -1509,7 +1455,7 @@ static TableFunction CreateNatsScanTableFunction() {
     nats_scan.named_parameters["subject"] = LogicalType(LogicalTypeId::VARCHAR);
     nats_scan.named_parameters["subject_contains"] = LogicalType(LogicalTypeId::VARCHAR);
     nats_scan.named_parameters["nats_subject"] = LogicalType(LogicalTypeId::VARCHAR);
-    nats_scan.named_parameters["url"] = LogicalType(LogicalTypeId::VARCHAR);
+    RegisterNatsConnectionParameters(nats_scan);
     nats_scan.named_parameters["start_seq"] = LogicalType(LogicalTypeId::UBIGINT);
     nats_scan.named_parameters["end_seq"] = LogicalType(LogicalTypeId::UBIGINT);
     nats_scan.named_parameters["start_time"] = LogicalType(LogicalTypeId::TIMESTAMP);
@@ -1531,7 +1477,14 @@ static unique_ptr<FunctionData> NatsCopyFromBind(ClientContext &context, CopyFro
     auto subject_contains = GetCopyOptionString(input.info.options, "subject_contains").value_or("");
     auto nats_subject = GetCopyOptionString(input.info.options, "nats_subject").value_or("");
     static const string DEFAULT_NATS_URL = "nats://localhost:4222";
-    auto nats_url = ResolveNatsCopyUrl(input.info.options, "COPY FROM", &DEFAULT_NATS_URL);
+    NatsConnectionConfig connection;
+    connection.url = ResolveNatsCopyUrl(input.info.options, "COPY FROM", &DEFAULT_NATS_URL);
+    for (const auto &option : input.info.options) {
+        if (!option.second.empty()) {
+            ParseNatsConnectionParameter(connection, option.first, option.second.front());
+        }
+    }
+    ValidateNatsConnectionConfig(connection);
     uint64_t start_seq = GetCopyOptionUBigInt(input.info.options, "start_seq", 0);
     uint64_t end_seq = GetCopyOptionUBigInt(input.info.options, "end_seq", UINT64_MAX);
     int64_t start_time = 0;
@@ -1625,7 +1578,7 @@ static unique_ptr<FunctionData> NatsCopyFromBind(ClientContext &context, CopyFro
     auto schema = BuildNatsSourceSchema(json_fields, proto_file, proto_message, proto_fields, descriptor);
     ValidateNatsCopyFromSchema(expected_names, expected_types, schema);
 
-    auto bind_data = make_uniq<NatsScanBindData>(stream_name, subject_contains, nats_subject, nats_url, start_seq, end_seq,
+    auto bind_data = make_uniq<NatsScanBindData>(stream_name, subject_contains, nats_subject, std::move(connection), start_seq, end_seq,
                                                  start_time, end_time, json_fields, proto_file, proto_message,
                                                  proto_fields, std::move(proto_field_paths), batch_size, fetch_timeout_ms);
 
@@ -1648,14 +1601,14 @@ void NatsStreamStatsFunction::Register(ExtensionLoader &loader) {
     for (const auto &function_name : {"nats_stream_stats", "nats_stream_info"}) {
         TableFunction nats_stream_stats(function_name, {LogicalType(LogicalTypeId::VARCHAR)}, NatsStreamStatsExecute,
                                         NatsStreamStatsBind, NatsStreamStatsInitGlobal);
-        nats_stream_stats.named_parameters["url"] = LogicalType(LogicalTypeId::VARCHAR);
+        RegisterNatsConnectionParameters(nats_stream_stats);
         loader.RegisterFunction(nats_stream_stats);
     }
 
     TableFunction nats_stream_range_stats("nats_stream_range_stats", {LogicalType(LogicalTypeId::VARCHAR)},
                                           NatsStreamRangeStatsExecute, NatsStreamRangeStatsBind,
                                           NatsStreamRangeStatsInitGlobal);
-    nats_stream_range_stats.named_parameters["url"] = LogicalType(LogicalTypeId::VARCHAR);
+    RegisterNatsConnectionParameters(nats_stream_range_stats);
     nats_stream_range_stats.named_parameters["start_seq"] = LogicalType(LogicalTypeId::UBIGINT);
     nats_stream_range_stats.named_parameters["end_seq"] = LogicalType(LogicalTypeId::UBIGINT);
     loader.RegisterFunction(nats_stream_range_stats);
