@@ -75,10 +75,10 @@ END
 EXPECT start=ingest_pause_resume|ingest_resume|ingest_out|duckdb_ingest_pause_resume 10
 SEND
 SELECT 'status1=' || paused || '/' || pause_requested || '/' || rows_inserted || '/' || batches_committed || '/' ||
-       last_batch_rows || '/' || last_committed_seq AS ingest_status
+       fetches_completed || '/' || last_batch_rows || '/' || last_committed_seq AS ingest_status
 FROM nats_ingest_status(job_name := 'ingest_pause_resume');
 END
-EXPECT status1=false/false/4/1/4/4 30
+EXPECT status1=false/false/4/1/1/4/4 30
 SEND
 SELECT 'pause=' || job_name || '|' || stream_name || '|' || target_table || '|' || durable_name || '|' ||
        paused || '/' || pause_requested AS pause_result
@@ -88,10 +88,10 @@ EXPECT pause=ingest_pause_resume|ingest_resume|ingest_out|duckdb_ingest_pause_re
 SLEEP 3
 SEND
 SELECT 'status2=' || paused || '/' || pause_requested || '/' || rows_inserted || '/' || batches_committed || '/' ||
-       last_batch_rows || '/' || last_committed_seq AS ingest_status
+       fetches_completed || '/' || last_batch_rows || '/' || last_committed_seq AS ingest_status
 FROM nats_ingest_status(job_name := 'ingest_pause_resume');
 END
-EXPECT status2=true/true/4/1/4/4 30
+EXPECT status2=true/true/4/1/1/4/4 30
 SEND
 SELECT 'resume=' || job_name || '|' || stream_name || '|' || target_table || '|' || durable_name || '|' ||
        paused || '/' || pause_requested AS resume_result
@@ -101,13 +101,13 @@ EXPECT resume=ingest_pause_resume|ingest_resume|ingest_out|duckdb_ingest_pause_r
 SLEEP 3
 SEND
 SELECT 'status3=' || paused || '/' || pause_requested || '/' || rows_inserted || '/' || batches_committed || '/' ||
-       last_batch_rows || '/' || last_committed_seq AS ingest_status
+       fetches_completed || '/' || last_batch_rows || '/' || last_committed_seq AS ingest_status
 FROM nats_ingest_status(job_name := 'ingest_pause_resume');
 SELECT 'count=' || COUNT(*) AS inserted_rows FROM ingest_out;
 SELECT 'stop=' || job_name || '|' || stream_name || '|' || target_table || '|' || durable_name AS stop_result
 FROM nats_stop_ingest(job_name := 'ingest_pause_resume');
 END
-EXPECT status3=false/false/8/2/4/8 30
+EXPECT status3=false/false/8/2/2/4/8 30
 EXPECT count=8 10
 EXPECT stop=ingest_pause_resume|ingest_resume|ingest_out|duckdb_ingest_pause_resume 10
 QUIT

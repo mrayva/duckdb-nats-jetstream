@@ -11,7 +11,7 @@ import argparse
 import json
 import random
 import sys
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, Any
 
 try:
@@ -150,7 +150,7 @@ class TelemetryGenerator:
     
     async def generate_historical_data(self, hours: int = 24, interval_seconds: int = 60):
         """Generate historical data for the specified time period."""
-        end_time = datetime.utcnow()
+        end_time = datetime.now(timezone.utc)
         start_time = end_time - timedelta(hours=hours)
         
         current_time = start_time
@@ -185,11 +185,11 @@ class TelemetryGenerator:
         print(f"Generating real-time data for {duration_seconds} seconds...")
         print(f"Interval: {interval_seconds} seconds")
         
-        end_time = datetime.utcnow() + timedelta(seconds=duration_seconds)
+        end_time = datetime.now(timezone.utc) + timedelta(seconds=duration_seconds)
         message_count = 0
         
-        while datetime.utcnow() < end_time:
-            current_time = datetime.utcnow()
+        while datetime.now(timezone.utc) < end_time:
+            current_time = datetime.now(timezone.utc)
             
             # Publish readings for all devices
             for meter in self.power_meters:

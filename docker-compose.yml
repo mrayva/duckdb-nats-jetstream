@@ -1,7 +1,6 @@
 services:
   nats:
-    image: nats:latest
-    platform: linux/arm64
+    image: nats:2.14.3
     container_name: nats-jetstream
     ports:
       - "4222:4222"  # Client connections
@@ -29,4 +28,3 @@ volumes:
 networks:
   nats-network:
     driver: bridge
-

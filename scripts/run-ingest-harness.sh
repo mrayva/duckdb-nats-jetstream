@@ -101,6 +101,33 @@ END
 EXPECT stop1=${start_job_a}|${stream_name}|ingest_out|${durable_name} 10
 EXPECT count=4 10
 EXPECT checkpoint=4 10
+SEND
+CREATE TABLE ingest_bad_target(
+    stream_name INTEGER,
+    subject INTEGER,
+    sequence INTEGER,
+    ts INTEGER,
+    payload INTEGER
+);
+SELECT 'failed_start=' || failed || '/' || stopped AS failed_start
+FROM nats_start_ingest(
+    job_name := '${start_job_a}_bad_target',
+    stream_name := '${stream_name}',
+    target_table := 'ingest_bad_target',
+    durable_name := '${durable_name}_bad_target',
+    url := '${NATS_URL}',
+    batch_size := 4,
+    poll_ms := 100,
+    fetch_timeout_ms := 100,
+    start_seq := 1
+);
+END
+EXPECT failed_start=true/true 10
+SEND
+SELECT 'failed_status=' || failed || '/' || stopped || '/' || (length(last_error) > 0) AS failed_status
+FROM nats_ingest_status(job_name := '${start_job_a}_bad_target');
+END
+EXPECT failed_status=true/true/true 10
 QUIT
 SQL
 then

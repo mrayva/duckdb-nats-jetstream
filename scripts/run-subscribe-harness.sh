@@ -54,34 +54,34 @@ trap 'rc=$?; rm -f "$log_file" "$db_file"; exit $rc' EXIT
 if ! DUCKDB_LIB="$DUCKDB_LIB" "$PYTHON_BIN" "$ROOT_DIR/scripts/duckdb_session.py" --duckdb-bin "$DUCKDB_BIN" --db-file "$db_file" <<SQL >"$log_file" 2>&1
 SEND
 LOAD '${EXTENSION_PATH}';
-CREATE TABLE subscribe_out(
-    subject VARCHAR,
-    payload VARCHAR,
-    received_at TIMESTAMP
-);
 SELECT 'start=' || job_name || '|' || target_table || '|' || subject AS start_result
 FROM nats_start_subscribe(
     job_name := 'live_subscribe_probe',
-    target_table := 'subscribe_out',
+    target_table := 'main.subscribe_out',
     url := '${NATS_URL}',
     subject := 'live.subscribe',
     batch_size := 2,
     poll_ms := 100,
-    create_target_table := false
+    create_target_table := true,
+    subject_column := 'select',
+    payload_column := 'payload data'
 );
 END
-EXPECT start=live_subscribe_probe|subscribe_out|live.subscribe 10
+EXPECT start=live_subscribe_probe|main.subscribe_out|live.subscribe 10
 SLEEP 3
 SEND
 SELECT 'status=' || rows_inserted || '/' || batches_committed || '/' || running || '/' || failed AS subscribe_status
 FROM nats_subscribe_status(job_name := 'live_subscribe_probe');
-SELECT 'count=' || COUNT(*) AS inserted_rows FROM subscribe_out;
+SELECT 'count=' || COUNT(*) AS inserted_rows FROM main.subscribe_out;
+SELECT 'types=' || string_agg(type, '/' ORDER BY cid) AS target_types
+FROM pragma_table_info('subscribe_out');
 SELECT 'stop=' || job_name || '|' || target_table || '|' || subject AS stop_result
 FROM nats_stop_subscribe(job_name := 'live_subscribe_probe');
 END
 EXPECT status=4/2/true/false 30
 EXPECT count=4 10
-EXPECT stop=live_subscribe_probe|subscribe_out|live.subscribe 10
+EXPECT types=VARCHAR/BLOB/TIMESTAMP 10
+EXPECT stop=live_subscribe_probe|main.subscribe_out|live.subscribe 10
 QUIT
 SQL
 then

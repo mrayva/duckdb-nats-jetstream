@@ -7,6 +7,7 @@
 #include "duckdb/main/database.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
+#include "duckdb/parser/qualified_name.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 
 #include <algorithm>
@@ -323,17 +324,45 @@ static NatsSubscribeConfig ParseSubscribeConfig(TableFunctionBindInput &input) {
     if (config.poll_ms < 1) {
         throw std::runtime_error("poll_ms must be at least 1");
     }
+    if (config.subject_column.empty()) {
+        throw std::runtime_error("subject_column must not be empty");
+    }
+    if (config.payload_column.empty()) {
+        throw std::runtime_error("payload_column must not be empty");
+    }
     return config;
+}
+
+static string QuoteIdentifier(const string &identifier) {
+    string result = "\"";
+    for (char ch : identifier) {
+        result += ch == '"' ? "\"\"" : string(1, ch);
+    }
+    result += "\"";
+    return result;
+}
+
+static string QuoteQualifiedTableName(const QualifiedName &name) {
+    std::ostringstream result;
+    if (!name.catalog.empty()) {
+        result << QuoteIdentifier(name.catalog) << ".";
+    }
+    if (!name.schema.empty()) {
+        result << QuoteIdentifier(name.schema) << ".";
+    }
+    result << QuoteIdentifier(name.name);
+    return result.str();
 }
 
 static void EnsureTargetTable(Connection &conn, const NatsSubscribeConfig &config) {
     if (!config.create_target_table) {
         return;
     }
+    auto qualified_name = QualifiedName::Parse(config.target_table);
     std::ostringstream sql;
-    sql << "CREATE TABLE IF NOT EXISTS " << config.target_table << " ("
-        << config.subject_column << " VARCHAR,"
-        << config.payload_column << " VARCHAR,"
+    sql << "CREATE TABLE IF NOT EXISTS " << QuoteQualifiedTableName(qualified_name) << " ("
+        << QuoteIdentifier(config.subject_column) << " VARCHAR,"
+        << QuoteIdentifier(config.payload_column) << " BLOB,"
         << "received_at TIMESTAMP"
         << ")";
     auto result = conn.Query(sql.str());
@@ -372,16 +401,35 @@ static void DisconnectNats(natsConnection **conn) {
     }
 }
 
+static unique_ptr<Appender> CreateSubscribeAppender(Connection &conn, const string &target_table) {
+    auto qualified_name = QualifiedName::Parse(target_table);
+    if (!qualified_name.catalog.empty()) {
+        return make_uniq<Appender>(conn, qualified_name.catalog, qualified_name.schema, qualified_name.name);
+    }
+    if (!qualified_name.schema.empty()) {
+        return make_uniq<Appender>(conn, qualified_name.schema, qualified_name.name);
+    }
+    return make_uniq<Appender>(conn, qualified_name.name);
+}
+
 static void FlushSubscribeBatch(Connection &conn, const NatsSubscribeConfig &config,
                                 const vector<pair<string, string>> &batch) {
     if (batch.empty()) {
         return;
     }
-    Appender appender(conn, config.target_table);
-    for (auto &entry : batch) {
-        appender.AppendRow(Value(entry.first), Value(entry.second), Value::TIMESTAMP(Timestamp::GetCurrentTimestamp()));
+    auto appender = CreateSubscribeAppender(conn, config.target_table);
+    const auto &types = appender->GetActiveTypes();
+    if (types.size() != 3 || types[0].id() != LogicalTypeId::VARCHAR ||
+        (types[1].id() != LogicalTypeId::VARCHAR && types[1].id() != LogicalTypeId::BLOB) ||
+        types[2].id() != LogicalTypeId::TIMESTAMP) {
+        throw std::runtime_error("Subscription target table must have exactly three columns: "
+                                 "VARCHAR subject, VARCHAR or BLOB payload, and TIMESTAMP received_at");
     }
-    appender.Flush();
+    for (auto &entry : batch) {
+        auto payload = types[1].id() == LogicalTypeId::BLOB ? Value::BLOB_RAW(entry.second) : Value(entry.second);
+        appender->AppendRow(Value(entry.first), payload, Value::TIMESTAMP(Timestamp::GetCurrentTimestamp()));
+    }
+    appender->Flush();
 }
 
 static void RunSubscribeWorker(const shared_ptr<NatsSubscribeJobState> &job) {
@@ -501,6 +549,11 @@ static void RunSubscribeWorker(const shared_ptr<NatsSubscribeJobState> &job) {
         job->progress.last_error = ex.what();
         job->progress.last_error_time = Timestamp::GetCurrentTimestamp();
     }
+    if (job->sub != nullptr) {
+        natsSubscription_Destroy(job->sub);
+        job->sub = nullptr;
+    }
+    DisconnectNats(&job->conn);
     job->cv.notify_all();
 }
 

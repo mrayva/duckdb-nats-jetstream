@@ -1652,7 +1652,7 @@ static void RunIngestWorker(const shared_ptr<NatsIngestJobState> &job) {
 
                 uint64_t committed_rows = progress_snapshot.rows_inserted + inserted_rows;
                 uint64_t committed_batches = progress_snapshot.batches_committed + 1;
-                uint64_t committed_fetches = progress_snapshot.fetches_completed + 1;
+                uint64_t committed_fetches = progress_snapshot.fetches_completed;
                 uint64_t committed_seq = batch_last_delivered_seq;
                 if (committed_seq == 0) {
                     committed_seq = progress_snapshot.last_committed_seq;
@@ -1662,17 +1662,17 @@ static void RunIngestWorker(const shared_ptr<NatsIngestJobState> &job) {
                 }
 
                 try {
-                    batch_stage = "commit transaction";
-                    db_connection.Commit();
-                } catch (const std::exception &ex) {
-                    throw std::runtime_error(string("Failed to commit ingest transaction: ") + ex.what());
-                }
-                try {
                     batch_stage = "write checkpoint";
                     UpsertCheckpoint(db_connection, *job, committed_seq, batch_last_delivered_seq, committed_rows,
                                      committed_batches);
                 } catch (const std::exception &ex) {
                     throw std::runtime_error(string("Failed to write ingest checkpoint: ") + ex.what());
+                }
+                try {
+                    batch_stage = "commit transaction";
+                    db_connection.Commit();
+                } catch (const std::exception &ex) {
+                    throw std::runtime_error(string("Failed to commit ingest transaction: ") + ex.what());
                 }
 
                 {
@@ -1750,12 +1750,14 @@ static void RunIngestWorker(const shared_ptr<NatsIngestJobState> &job) {
         job->cv.notify_all();
         PersistRegistry(db_connection, job);
     } catch (const std::exception &ex) {
-        lock_guard<std::mutex> guard(job->job_mutex);
-        job->progress.running = false;
-        job->progress.stopped = true;
-        job->progress.failed = true;
-        job->progress.last_error_time = Timestamp::GetCurrentTimestamp();
-        job->progress.last_error = ex.what();
+        {
+            lock_guard<std::mutex> guard(job->job_mutex);
+            job->progress.running = false;
+            job->progress.stopped = true;
+            job->progress.failed = true;
+            job->progress.last_error_time = Timestamp::GetCurrentTimestamp();
+            job->progress.last_error = ex.what();
+        }
         job->cv.notify_all();
         if (job->db) {
             Connection db_connection(*job->db);
@@ -1766,12 +1768,14 @@ static void RunIngestWorker(const shared_ptr<NatsIngestJobState> &job) {
             }
         }
     } catch (...) {
-        lock_guard<std::mutex> guard(job->job_mutex);
-        job->progress.running = false;
-        job->progress.stopped = true;
-        job->progress.failed = true;
-        job->progress.last_error_time = Timestamp::GetCurrentTimestamp();
-        job->progress.last_error = "Unknown ingest worker failure";
+        {
+            lock_guard<std::mutex> guard(job->job_mutex);
+            job->progress.running = false;
+            job->progress.stopped = true;
+            job->progress.failed = true;
+            job->progress.last_error_time = Timestamp::GetCurrentTimestamp();
+            job->progress.last_error = "Unknown ingest worker failure";
+        }
         job->cv.notify_all();
         if (job->db) {
             Connection db_connection(*job->db);
