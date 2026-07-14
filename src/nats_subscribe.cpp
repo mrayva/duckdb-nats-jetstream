@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <limits>
 #include <sstream>
 
 namespace duckdb {
@@ -126,6 +127,12 @@ struct NatsSubscribeSnapshot {
     bool create_target_table = false;
     uint64_t rows_inserted = 0;
     uint64_t batches_committed = 0;
+    uint64_t pending_messages = 0;
+    uint64_t pending_bytes = 0;
+    uint64_t max_pending_messages = 0;
+    uint64_t max_pending_bytes = 0;
+    uint64_t messages_delivered = 0;
+    uint64_t messages_dropped = 0;
     string last_error;
     timestamp_t last_start_time;
     timestamp_t last_commit_time;
@@ -165,13 +172,17 @@ static void AddSubscribeSnapshotColumns(vector<LogicalType> &return_types, vecto
                     LogicalType(LogicalTypeId::BOOLEAN),   LogicalType(LogicalTypeId::BOOLEAN),
                     LogicalType(LogicalTypeId::BOOLEAN),   LogicalType(LogicalTypeId::BOOLEAN),
                     LogicalType(LogicalTypeId::UBIGINT),    LogicalType(LogicalTypeId::UBIGINT),
+                    LogicalType(LogicalTypeId::UBIGINT),    LogicalType(LogicalTypeId::UBIGINT),
+                    LogicalType(LogicalTypeId::UBIGINT),    LogicalType(LogicalTypeId::UBIGINT),
+                    LogicalType(LogicalTypeId::UBIGINT),    LogicalType(LogicalTypeId::UBIGINT),
                     LogicalType(LogicalTypeId::TIMESTAMP),  LogicalType(LogicalTypeId::TIMESTAMP),
                     LogicalType(LogicalTypeId::TIMESTAMP),  LogicalType(LogicalTypeId::TIMESTAMP),
                     LogicalType(LogicalTypeId::VARCHAR)};
     names = {"job_name",         "target_table",     "nats_url",        "subject",       "queue_group",
              "running",          "paused",           "pause_requested", "stop_requested", "failed",
-             "rows_inserted",    "batches_committed", "last_start_time",  "last_commit_time", "last_error_time",
-             "last_message_time", "last_error"};
+             "rows_inserted",    "batches_committed", "pending_messages", "pending_bytes",
+             "max_pending_messages", "max_pending_bytes", "messages_delivered", "messages_dropped",
+             "last_start_time", "last_commit_time", "last_error_time", "last_message_time", "last_error"};
 }
 
 static void FillSubscribeSnapshotColumns(DataChunk &output, idx_t row, const NatsSubscribeSnapshot &snapshot) {
@@ -187,11 +198,17 @@ static void FillSubscribeSnapshotColumns(DataChunk &output, idx_t row, const Nat
     output.SetValue(9, row, Value(snapshot.failed));
     output.SetValue(10, row, Value::UBIGINT(snapshot.rows_inserted));
     output.SetValue(11, row, Value::UBIGINT(snapshot.batches_committed));
-    output.SetValue(12, row, Value::TIMESTAMP(snapshot.last_start_time));
-    output.SetValue(13, row, Value::TIMESTAMP(snapshot.last_commit_time));
-    output.SetValue(14, row, Value::TIMESTAMP(snapshot.last_error_time));
-    output.SetValue(15, row, Value::TIMESTAMP(snapshot.last_message_time));
-    output.SetValue(16, row, Value(snapshot.last_error));
+    output.SetValue(12, row, Value::UBIGINT(snapshot.pending_messages));
+    output.SetValue(13, row, Value::UBIGINT(snapshot.pending_bytes));
+    output.SetValue(14, row, Value::UBIGINT(snapshot.max_pending_messages));
+    output.SetValue(15, row, Value::UBIGINT(snapshot.max_pending_bytes));
+    output.SetValue(16, row, Value::UBIGINT(snapshot.messages_delivered));
+    output.SetValue(17, row, Value::UBIGINT(snapshot.messages_dropped));
+    output.SetValue(18, row, Value::TIMESTAMP(snapshot.last_start_time));
+    output.SetValue(19, row, Value::TIMESTAMP(snapshot.last_commit_time));
+    output.SetValue(20, row, Value::TIMESTAMP(snapshot.last_error_time));
+    output.SetValue(21, row, Value::TIMESTAMP(snapshot.last_message_time));
+    output.SetValue(22, row, Value(snapshot.last_error));
 }
 
 static NatsSubscribeSnapshot SnapshotJob(const shared_ptr<NatsSubscribeJobState> &job) {
@@ -210,6 +227,12 @@ static NatsSubscribeSnapshot SnapshotJob(const shared_ptr<NatsSubscribeJobState>
     snapshot.create_target_table = job->config.create_target_table;
     snapshot.rows_inserted = job->progress.rows_inserted;
     snapshot.batches_committed = job->progress.batches_committed;
+    snapshot.pending_messages = job->progress.pending_messages;
+    snapshot.pending_bytes = job->progress.pending_bytes;
+    snapshot.max_pending_messages = job->progress.max_pending_messages;
+    snapshot.max_pending_bytes = job->progress.max_pending_bytes;
+    snapshot.messages_delivered = job->progress.messages_delivered;
+    snapshot.messages_dropped = job->progress.messages_dropped;
     snapshot.last_error = job->progress.last_error;
     snapshot.last_start_time = job->progress.last_start_time;
     snapshot.last_commit_time = job->progress.last_commit_time;
@@ -289,6 +312,18 @@ static NatsSubscribeConfig ParseSubscribeConfig(TableFunctionBindInput &input) {
             config.batch_size = UBigIntValue::Get(kv.second);
         } else if (kv.first == "poll_ms") {
             config.poll_ms = BigIntValue::Get(kv.second);
+        } else if (kv.first == "pending_message_limit") {
+            auto value = BigIntValue::Get(kv.second);
+            if (value < -1 || value == 0 || value > std::numeric_limits<int>::max()) {
+                throw std::runtime_error("pending_message_limit must be -1 or between 1 and 2147483647");
+            }
+            config.pending_message_limit = static_cast<int>(value);
+        } else if (kv.first == "pending_bytes_limit") {
+            auto value = BigIntValue::Get(kv.second);
+            if (value < -1 || value == 0 || value > std::numeric_limits<int>::max()) {
+                throw std::runtime_error("pending_bytes_limit must be -1 or between 1 and 2147483647");
+            }
+            config.pending_bytes_limit = static_cast<int>(value);
         } else if (kv.first == "create_target_table") {
             config.create_target_table = BooleanValue::Get(kv.second);
         } else if (kv.first == "subject_column") {
@@ -409,6 +444,27 @@ static void FlushSubscribeBatch(Connection &conn, const NatsSubscribeConfig &con
     appender->Flush();
 }
 
+static void RefreshSubscribeMetrics(const shared_ptr<NatsSubscribeJobState> &job) {
+    int pending_messages = 0;
+    int pending_bytes = 0;
+    int max_pending_messages = 0;
+    int max_pending_bytes = 0;
+    int64_t messages_delivered = 0;
+    int64_t messages_dropped = 0;
+    auto status = natsSubscription_GetStats(job->sub, &pending_messages, &pending_bytes, &max_pending_messages,
+                                            &max_pending_bytes, &messages_delivered, &messages_dropped);
+    if (status != NATS_OK) {
+        return;
+    }
+    lock_guard<std::mutex> guard(job->mutex);
+    job->progress.pending_messages = static_cast<uint64_t>(std::max(pending_messages, 0));
+    job->progress.pending_bytes = static_cast<uint64_t>(std::max(pending_bytes, 0));
+    job->progress.max_pending_messages = static_cast<uint64_t>(std::max(max_pending_messages, 0));
+    job->progress.max_pending_bytes = static_cast<uint64_t>(std::max(max_pending_bytes, 0));
+    job->progress.messages_delivered = static_cast<uint64_t>(std::max<int64_t>(messages_delivered, 0));
+    job->progress.messages_dropped = static_cast<uint64_t>(std::max<int64_t>(messages_dropped, 0));
+}
+
 static void RunSubscribeWorker(const shared_ptr<NatsSubscribeJobState> &job) {
     try {
         Connection conn(*job->db);
@@ -424,6 +480,12 @@ static void RunSubscribeWorker(const shared_ptr<NatsSubscribeJobState> &job) {
         }
         if (s != NATS_OK) {
             throw std::runtime_error(std::string("Failed to create NATS subscription: ") + natsStatus_GetText(s));
+        }
+        s = natsSubscription_SetPendingLimits(job->sub, job->config.pending_message_limit,
+                                              job->config.pending_bytes_limit);
+        if (s != NATS_OK) {
+            throw std::runtime_error(std::string("Failed to set NATS subscription pending limits: ") +
+                                     natsStatus_GetText(s));
         }
         s = natsConnection_FlushTimeout(job->conn, 5000);
         if (s != NATS_OK) {
@@ -447,6 +509,9 @@ static void RunSubscribeWorker(const shared_ptr<NatsSubscribeJobState> &job) {
                     break;
                 }
                 if (job->progress.paused) {
+                    lock.unlock();
+                    RefreshSubscribeMetrics(job);
+                    lock.lock();
                     job->cv.wait_for(lock, std::chrono::milliseconds(job->config.poll_ms), [&]() {
                         return !job->progress.paused || job->progress.stop_requested;
                     });
@@ -461,6 +526,7 @@ static void RunSubscribeWorker(const shared_ptr<NatsSubscribeJobState> &job) {
 
             natsMsg *msg = nullptr;
             s = natsSubscription_NextMsg(&msg, job->sub, job->config.poll_ms);
+            RefreshSubscribeMetrics(job);
             if (s == NATS_TIMEOUT) {
                 if (!batch.empty()) {
                     FlushSubscribeBatch(conn, job->config, batch);
@@ -473,6 +539,9 @@ static void RunSubscribeWorker(const shared_ptr<NatsSubscribeJobState> &job) {
                     job->cv.notify_all();
                     batch.clear();
                 }
+                continue;
+            }
+            if (s == NATS_SLOW_CONSUMER) {
                 continue;
             }
             if (s != NATS_OK) {
@@ -514,6 +583,7 @@ static void RunSubscribeWorker(const shared_ptr<NatsSubscribeJobState> &job) {
             job->progress.rows_inserted += batch.size();
             job->progress.last_commit_time = Timestamp::GetCurrentTimestamp();
         }
+        RefreshSubscribeMetrics(job);
 
         {
             lock_guard<std::mutex> guard(job->mutex);
@@ -808,6 +878,8 @@ void NatsSubscribeFunction::Register(ExtensionLoader &loader) {
     start_fn.named_parameters["queue_group"] = LogicalType(LogicalTypeId::VARCHAR);
     start_fn.named_parameters["batch_size"] = LogicalType(LogicalTypeId::UBIGINT);
     start_fn.named_parameters["poll_ms"] = LogicalType(LogicalTypeId::BIGINT);
+    start_fn.named_parameters["pending_message_limit"] = LogicalType(LogicalTypeId::BIGINT);
+    start_fn.named_parameters["pending_bytes_limit"] = LogicalType(LogicalTypeId::BIGINT);
     start_fn.named_parameters["create_target_table"] = LogicalType(LogicalTypeId::BOOLEAN);
     start_fn.named_parameters["subject_column"] = LogicalType(LogicalTypeId::VARCHAR);
     start_fn.named_parameters["payload_column"] = LogicalType(LogicalTypeId::VARCHAR);

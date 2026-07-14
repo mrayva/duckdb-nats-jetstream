@@ -188,8 +188,16 @@ Core NATS live subscriptions are available through `nats_start_subscribe(...)`,
 `nats_pause_subscribe(...)`, `nats_resume_subscribe(...)`, and
 `nats_stop_subscribe(...)`. They are live-only, batch-insert jobs without
 JetStream replay or durable resume.
+The client-side pending queue is bounded by default to 65,536 messages and
+64 MiB. Override these with `pending_message_limit` and `pending_bytes_limit`.
+`nats_subscribe_status(...)` reports current and peak pending values plus
+`messages_delivered` and `messages_dropped`. Core NATS is lossy under overload,
+including while a job is paused; use JetStream ingest when replay and no-loss
+delivery are required.
 Use `scripts/run-subscribe-pause-resume-harness.sh` to exercise the control
 path deterministically against local NATS.
+Use `scripts/run-subscribe-backpressure-harness.sh` to verify bounded pending
+queues and dropped-message reporting under overload.
 
 ## Authentication And TLS
 

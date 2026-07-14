@@ -29,6 +29,8 @@ struct NatsSubscribeConfig {
     string queue_group;
     uint64_t batch_size = 1024;
     int64_t poll_ms = 100;
+    int pending_message_limit = 65536;
+    int pending_bytes_limit = 64 * 1024 * 1024;
     bool create_target_table = false;
     string subject_column = "subject";
     string payload_column = "payload";
@@ -47,6 +49,12 @@ struct NatsSubscribeProgress {
     bool failed = false;
     uint64_t rows_inserted = 0;
     uint64_t batches_committed = 0;
+    uint64_t pending_messages = 0;
+    uint64_t pending_bytes = 0;
+    uint64_t max_pending_messages = 0;
+    uint64_t max_pending_bytes = 0;
+    uint64_t messages_delivered = 0;
+    uint64_t messages_dropped = 0;
     string last_error;
     timestamp_t last_start_time;
     timestamp_t last_commit_time;

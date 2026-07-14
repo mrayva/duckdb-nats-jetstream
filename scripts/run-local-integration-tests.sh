@@ -236,4 +236,10 @@ NATS_CLI="$NATS_CLI" \
 "$ROOT_DIR/scripts/run-subscribe-pause-resume-harness.sh"
 echo "PASS scripts/run-subscribe-pause-resume-harness.sh"
 
+echo "RUN scripts/run-subscribe-backpressure-harness.sh"
+NATS_URL="$NATS_URL" \
+NATS_CLI="$NATS_CLI" \
+"$ROOT_DIR/scripts/run-subscribe-backpressure-harness.sh"
+echo "PASS scripts/run-subscribe-backpressure-harness.sh"
+
 echo "All local integration tests passed"
