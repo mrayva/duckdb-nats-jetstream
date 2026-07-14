@@ -44,7 +44,8 @@ log_second="$(mktemp /tmp/nats_ingest_rehydrate.second.XXXXXX.log)"
 rm -f "$db_file"
 trap 'rc=$?; rm -f "$log_first" "$log_second" "$db_file"; exit $rc' EXIT
 
-if ! DUCKDB_LIB="$DUCKDB_LIB" NATS_INGEST_DISABLE_REHYDRATE=1 python3 "$ROOT_DIR/scripts/duckdb_session.py" --duckdb-bin "$DUCKDB_BIN" --db-file "$db_file" <<SQL >"$log_first" 2>&1
+if DUCKDB_LIB="$DUCKDB_LIB" NATS_INGEST_FAIL_AFTER_COMMIT=1 NATS_INGEST_DISABLE_REHYDRATE=1 \
+  python3 "$ROOT_DIR/scripts/duckdb_session.py" --duckdb-bin "$DUCKDB_BIN" --db-file "$db_file" <<SQL >"$log_first" 2>&1
 SEND
 LOAD '${EXTENSION_PATH}';
 CREATE TABLE ingest_out(
@@ -68,15 +69,11 @@ FROM nats_start_ingest(
 );
 END
 EXPECT start1=ingest_rehydrate|ingest_resume|ingest_out|duckdb_ingest_rehydrate 10
-SEND
-SELECT 'status1=' || running || '/' || rows_inserted || '/' || last_committed_seq || '/' || failed || '/' || stopped AS ingest_status
-FROM nats_ingest_status(job_name := 'ingest_rehydrate');
-END
-EXPECT status1=true/4/4/false/false 30
-SLEEP 2
+SLEEP 5
 QUIT
 SQL
 then
+  echo "Expected the first rehydrate process to terminate after its committed batch" >&2
   cat "$log_first" >&2
   exit 1
 fi
