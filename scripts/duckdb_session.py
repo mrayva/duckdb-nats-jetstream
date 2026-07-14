@@ -144,6 +144,7 @@ def format_value(lib: ctypes.CDLL, result: DuckDBResult, col: int, row: int) -> 
 class DuckDBBridge:
     def __init__(self, duckdb_lib_path: str, db_file: str):
         self.lib = ctypes.CDLL(duckdb_lib_path)
+        self._validate_host_library(duckdb_lib_path)
 
         self.lib.duckdb_create_config.argtypes = [ctypes.POINTER(ctypes.c_void_p)]
         self.lib.duckdb_create_config.restype = ctypes.c_int
@@ -218,6 +219,16 @@ class DuckDBBridge:
         if state != 0:
             self.lib.duckdb_close(ctypes.byref(self.database))
             raise DuckDBSessionError(f"duckdb_connect failed for {db_file}")
+
+    def _validate_host_library(self, duckdb_lib_path: str) -> None:
+        # Harnesses load nats_js separately. If the host library already exports the
+        # extension entry points, it can create duplicate registration state and make
+        # loadable-extension tests behave differently from production.
+        if hasattr(self.lib, "nats_js_duckdb_cpp_init") or hasattr(self.lib, "nats_js_duckdb_cpp_version"):
+            raise DuckDBSessionError(
+                f"{duckdb_lib_path} already exports nats_js extension symbols; use a clean libduckdb.so "
+                "built without the nats_js extension baked in."
+            )
 
     def close(self) -> None:
         if self.connection.value:
