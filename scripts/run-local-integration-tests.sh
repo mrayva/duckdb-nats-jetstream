@@ -9,8 +9,9 @@ NATS_URL="${NATS_URL:-nats://127.0.0.1:4222}"
 NATS_CLI="${NATS_CLI:-$HOME/nats}"
 PYTHON_BIN="${PYTHON_BIN:-$ROOT_DIR/.venv/bin/python}"
 TIP_ROOT="${TIP_ROOT:-/tmp/duckdb-tip-clean}"
+DUCKDB_HOST_LIB="${DUCKDB_HOST_LIB:-$TIP_ROOT/build/release/src/libduckdb.so}"
 COPY_DUCKDB_BIN="${COPY_DUCKDB_BIN:-$TIP_ROOT/build/release/duckdb}"
-COPY_DUCKDB_LIB="${COPY_DUCKDB_LIB:-$TIP_ROOT/build/release/src/libduckdb.so}"
+COPY_DUCKDB_LIB="${COPY_DUCKDB_LIB:-$DUCKDB_HOST_LIB}"
 COPY_EXTENSION_PATH="${COPY_EXTENSION_PATH:-$TIP_ROOT/build/nats_js-tip/extension/nats_js/nats_js.duckdb_extension}"
 
 if [ ! -x "$DUCKDB_BIN" ]; then
