@@ -1,6 +1,7 @@
 #include "nats_scan.hpp"
 #include "nats_connection.hpp"
 #include "nats_message_decode.hpp"
+#include "nats_source.hpp"
 #include "duckdb/function/copy_function.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/parser/parsed_data/copy_info.hpp"
@@ -460,8 +461,7 @@ struct NatsScanGlobalState : public GlobalTableFunctionState {
     jsCtx *js = nullptr;
     jsStreamInfo *stream_info = nullptr;
     natsSubscription *sub = nullptr;
-    natsMsgList fetched_msgs {nullptr, 0};
-    int fetched_idx = 0;
+    unique_ptr<NatsJetStreamBatchSource> message_source;
     uint64_t current_seq = 0;
     uint64_t end_seq = 0;
     uint64_t target_message_count = UINT64_MAX;
@@ -474,7 +474,7 @@ struct NatsScanGlobalState : public GlobalTableFunctionState {
     const Message* proto_prototype = nullptr;
 
     ~NatsScanGlobalState() {
-        natsMsgList_Destroy(&fetched_msgs);
+        message_source.reset();
         if (sub != nullptr) {
             natsSubscription_Unsubscribe(sub);
             natsSubscription_Destroy(sub);
@@ -886,6 +886,8 @@ static unique_ptr<GlobalTableFunctionState> NatsScanInitGlobal(ClientContext &co
                                bind_data.stream_name + "': " + natsStatus_GetText(s));
     }
 
+    state->message_source = make_uniq<NatsJetStreamBatchSource>(state->sub);
+
     return state;
 }
 
@@ -953,47 +955,15 @@ static void NatsScanExecute(ClientContext &context, TableFunctionInput &data_p, 
             break;
         }
 
-        if (global_state.fetched_idx >= global_state.fetched_msgs.Count) {
-            natsMsgList_Destroy(&global_state.fetched_msgs);
-            global_state.fetched_msgs = {nullptr, 0};
-            global_state.fetched_idx = 0;
-
-            uint64_t remaining = global_state.end_seq >= global_state.current_seq ?
-                                 global_state.end_seq - global_state.current_seq + 1 : 0;
-            int batch = static_cast<int>(std::min<uint64_t>(bind_data.batch_size, remaining));
-            if (batch <= 0) {
-                global_state.done = true;
-                break;
-            }
-
-            jsFetchRequest request;
-            natsStatus s = jsFetchRequest_Init(&request);
-            if (s != NATS_OK) {
-                throw std::runtime_error(std::string("Failed to initialize JetStream fetch request: ") +
-                                       natsStatus_GetText(s));
-            }
-            request.Batch = batch;
-            request.Expires = bind_data.fetch_timeout_ms * 1000LL * 1000LL;
-            request.NoWait = true;
-
-            s = natsSubscription_FetchRequest(&global_state.fetched_msgs, global_state.sub, &request);
-            if (s == NATS_TIMEOUT || s == NATS_NOT_FOUND) {
-                global_state.done = true;
-                break;
-            }
-            if (s != NATS_OK) {
-                throw std::runtime_error(std::string("Failed to fetch JetStream message batch from '") +
-                                       bind_data.stream_name + "': " + natsStatus_GetText(s));
-            }
-            if (global_state.fetched_msgs.Count == 0) {
-                global_state.done = true;
-                break;
-            }
+        uint64_t remaining = global_state.end_seq >= global_state.current_seq ?
+                             global_state.end_seq - global_state.current_seq + 1 : 0;
+        natsMsg *msg = nullptr;
+        if (remaining == 0 ||
+            !global_state.message_source->Next(&msg, std::min<uint64_t>(bind_data.batch_size, remaining),
+                                               bind_data.fetch_timeout_ms, bind_data.stream_name)) {
+            global_state.done = true;
+            break;
         }
-
-        natsMsg *msg = global_state.fetched_msgs.Msgs[global_state.fetched_idx];
-        global_state.fetched_msgs.Msgs[global_state.fetched_idx] = nullptr;
-        global_state.fetched_idx++;
         if (msg == nullptr) {
             continue;
         }
