@@ -15,11 +15,15 @@ public:
     NatsJetStreamBatchSource(const NatsJetStreamBatchSource &) = delete;
     NatsJetStreamBatchSource &operator=(const NatsJetStreamBatchSource &) = delete;
 
+    // Fetches one complete batch. Existing buffered messages are discarded.
+    bool FetchBatch(uint64_t batch_size, int64_t fetch_timeout_ms, const string &stream_name, bool no_wait = true);
+    bool HasBufferedMessages() const;
+
     // Returns false when the source is exhausted for this bounded read.
     bool Next(natsMsg **message, uint64_t batch_size, int64_t fetch_timeout_ms, const string &stream_name);
 
 private:
-    bool Fetch(uint64_t batch_size, int64_t fetch_timeout_ms, const string &stream_name);
+    bool Fetch(uint64_t batch_size, int64_t fetch_timeout_ms, const string &stream_name, bool no_wait);
     void ClearBatch();
 
     natsSubscription *subscription_ = nullptr;

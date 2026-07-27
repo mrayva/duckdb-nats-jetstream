@@ -1,5 +1,6 @@
 #include "nats_ingest.hpp"
 #include "nats_message_decode.hpp"
+#include "nats_source.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
@@ -1478,6 +1479,7 @@ static void RunIngestWorker(const shared_ptr<NatsIngestJobState> &job) {
         if (!sub) {
             throw std::runtime_error("Ingest worker did not initialize a JetStream subscription");
         }
+        NatsJetStreamBatchSource message_source(sub);
 
         while (true) {
             bool pause_requested = false;
@@ -1535,32 +1537,9 @@ static void RunIngestWorker(const shared_ptr<NatsIngestJobState> &job) {
                 break;
             }
 
-            natsMsgList fetched_msgs {nullptr, 0};
-            jsFetchRequest request;
-            natsStatus s = jsFetchRequest_Init(&request);
-            if (s != NATS_OK) {
-                throw std::runtime_error(std::string("Failed to initialize JetStream fetch request: ") +
-                                         natsStatus_GetText(s));
-            }
-            request.Batch = static_cast<int>(config.batch_size);
-            request.Expires = config.fetch_timeout_ms * 1000LL * 1000LL;
-            request.NoWait = false;
-
-            s = natsSubscription_FetchRequest(&fetched_msgs, sub, &request);
-            if (s == NATS_TIMEOUT || s == NATS_NOT_FOUND) {
-                natsMsgList_Destroy(&fetched_msgs);
-                if (config.poll_ms > 0) {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(config.poll_ms));
-                }
-                continue;
-            }
-            if (s != NATS_OK) {
-                natsMsgList_Destroy(&fetched_msgs);
-                throw std::runtime_error(std::string("Failed to fetch JetStream message batch from '") +
-                                         config.stream_name + "': " + natsStatus_GetText(s));
-            }
-            if (fetched_msgs.Count == 0) {
-                natsMsgList_Destroy(&fetched_msgs);
+            bool fetched = message_source.FetchBatch(config.batch_size, config.fetch_timeout_ms, config.stream_name,
+                                                     false);
+            if (!fetched) {
                 if (config.poll_ms > 0) {
                     std::this_thread::sleep_for(std::chrono::milliseconds(config.poll_ms));
                 }
@@ -1574,11 +1553,12 @@ static void RunIngestWorker(const shared_ptr<NatsIngestJobState> &job) {
             }
 
             std::vector<natsMsg *> ack_msgs;
-            ack_msgs.reserve(fetched_msgs.Count);
+            ack_msgs.reserve(static_cast<size_t>(config.batch_size));
             uint64_t batch_last_delivered_seq = 0;
             string batch_stage = "begin";
+            natsStatus s = NATS_OK;
             std::unordered_set<uint64_t> batch_seen_sequences;
-            batch_seen_sequences.reserve(static_cast<size_t>(fetched_msgs.Count));
+            batch_seen_sequences.reserve(static_cast<size_t>(config.batch_size));
 
             try {
                 batch_stage = "ensure transaction";
@@ -1591,9 +1571,11 @@ static void RunIngestWorker(const shared_ptr<NatsIngestJobState> &job) {
                     progress_snapshot = job->progress;
                 }
 
-                for (int i = 0; i < fetched_msgs.Count; i++) {
-                    natsMsg *msg = fetched_msgs.Msgs[i];
-                    fetched_msgs.Msgs[i] = nullptr;
+                while (message_source.HasBufferedMessages()) {
+                    natsMsg *msg = nullptr;
+                    if (!message_source.Next(&msg, config.batch_size, config.fetch_timeout_ms, config.stream_name)) {
+                        break;
+                    }
                     if (!msg) {
                         continue;
                     }
@@ -1668,7 +1650,6 @@ static void RunIngestWorker(const shared_ptr<NatsIngestJobState> &job) {
                         }
                         natsMsg_Destroy(msg);
                     }
-                    natsMsgList_Destroy(&fetched_msgs);
                     continue;
                 }
 
@@ -1765,7 +1746,6 @@ static void RunIngestWorker(const shared_ptr<NatsIngestJobState> &job) {
                         natsMsg_Destroy(msg);
                     }
                 }
-                natsMsgList_Destroy(&fetched_msgs);
                 throw std::runtime_error("Ingest failed at stage '" + batch_stage + "': " + ex.what());
             } catch (...) {
                 try {
@@ -1777,11 +1757,8 @@ static void RunIngestWorker(const shared_ptr<NatsIngestJobState> &job) {
                         natsMsg_Destroy(msg);
                     }
                 }
-                natsMsgList_Destroy(&fetched_msgs);
                 throw std::runtime_error("Ingest failed at stage '" + batch_stage + "': unknown exception");
             }
-
-            natsMsgList_Destroy(&fetched_msgs);
         }
 
         {

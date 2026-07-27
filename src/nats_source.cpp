@@ -20,7 +20,8 @@ void NatsJetStreamBatchSource::ClearBatch() {
     next_index_ = 0;
 }
 
-bool NatsJetStreamBatchSource::Fetch(uint64_t batch_size, int64_t fetch_timeout_ms, const string &stream_name) {
+bool NatsJetStreamBatchSource::Fetch(uint64_t batch_size, int64_t fetch_timeout_ms, const string &stream_name,
+                                     bool no_wait) {
     if (batch_size == 0) {
         throw std::runtime_error("JetStream batch source requires a non-zero batch size");
     }
@@ -37,7 +38,7 @@ bool NatsJetStreamBatchSource::Fetch(uint64_t batch_size, int64_t fetch_timeout_
 
     request.Batch = static_cast<int>(std::min<uint64_t>(batch_size, 65536));
     request.Expires = fetch_timeout_ms * 1000LL * 1000LL;
-    request.NoWait = true;
+    request.NoWait = no_wait;
 
     status = natsSubscription_FetchRequest(&messages_, subscription_, &request);
     if (status == NATS_TIMEOUT || status == NATS_NOT_FOUND) {
@@ -55,6 +56,16 @@ bool NatsJetStreamBatchSource::Fetch(uint64_t batch_size, int64_t fetch_timeout_
     return true;
 }
 
+bool NatsJetStreamBatchSource::FetchBatch(uint64_t batch_size, int64_t fetch_timeout_ms, const string &stream_name,
+                                          bool no_wait) {
+    ClearBatch();
+    return Fetch(batch_size, fetch_timeout_ms, stream_name, no_wait);
+}
+
+bool NatsJetStreamBatchSource::HasBufferedMessages() const {
+    return next_index_ < messages_.Count;
+}
+
 bool NatsJetStreamBatchSource::Next(natsMsg **message, uint64_t batch_size, int64_t fetch_timeout_ms,
                                     const string &stream_name) {
     if (message == nullptr) {
@@ -64,7 +75,7 @@ bool NatsJetStreamBatchSource::Next(natsMsg **message, uint64_t batch_size, int6
 
     if (next_index_ >= messages_.Count) {
         ClearBatch();
-        if (!Fetch(batch_size, fetch_timeout_ms, stream_name)) {
+        if (!Fetch(batch_size, fetch_timeout_ms, stream_name, true)) {
             return false;
         }
     }
