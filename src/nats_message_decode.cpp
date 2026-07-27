@@ -6,40 +6,42 @@ using namespace duckdb_yyjson;
 
 namespace duckdb {
 
-vector<Value> DecodeJsonFields(const NatsPayloadView &payload, const vector<string> &field_names) {
-    vector<Value> values;
-    values.reserve(field_names.size());
+void DecodeJsonFields(const NatsPayloadView &payload, const vector<string> &field_names, vector<Value> &values) {
+    // Reuse the caller-owned buffer across messages; JSON strings and nested values still allocate as needed.
+    values.resize(field_names.size());
 
     yyjson_doc *doc = yyjson_read(payload.data, payload.size, 0);
     if (!doc) {
-        values.resize(field_names.size());
-        return values;
+        for (auto &value : values) {
+            value = Value();
+        }
+        return;
     }
 
     yyjson_val *root = yyjson_doc_get_root(doc);
-    for (const auto &field_name : field_names) {
+    for (idx_t i = 0; i < field_names.size(); i++) {
+        const auto &field_name = field_names[i];
         yyjson_val *field = yyjson_obj_get(root, field_name.c_str());
         if (!field || yyjson_is_null(field)) {
-            values.emplace_back(Value());
+            values[i] = Value();
         } else if (yyjson_is_str(field)) {
-            values.emplace_back(Value(yyjson_get_str(field)));
+            values[i] = Value(yyjson_get_str(field));
         } else if (yyjson_is_num(field)) {
-            values.emplace_back(Value(yyjson_get_num(field)));
+            values[i] = Value(yyjson_get_num(field));
         } else if (yyjson_is_bool(field)) {
-            values.emplace_back(Value::BOOLEAN(yyjson_get_bool(field)));
+            values[i] = Value::BOOLEAN(yyjson_get_bool(field));
         } else {
             char *json_string = yyjson_val_write(field, 0, nullptr);
             if (json_string) {
-                values.emplace_back(Value(json_string));
+                values[i] = Value(json_string);
                 free(json_string);
             } else {
-                values.emplace_back(Value());
+                values[i] = Value();
             }
         }
     }
 
     yyjson_doc_free(doc);
-    return values;
 }
 
 bool DecodeProtobufPayload(google::protobuf::Message &message, const NatsPayloadView &payload) {

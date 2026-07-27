@@ -1312,8 +1312,8 @@ static TableCatalogEntry &ResolveTargetTable(ClientContext &context, const strin
 }
 
 static void AppendJsonFields(DataChunk &chunk, idx_t row_idx, const NatsIngestConfig &config,
-                             const NatsPayloadView &payload) {
-    auto values = DecodeJsonFields(payload, config.json_fields);
+                             const NatsPayloadView &payload, vector<Value> &values) {
+    DecodeJsonFields(payload, config.json_fields, values);
     for (idx_t i = 0; i < values.size(); i++) {
         chunk.SetValue(5 + i, row_idx, values[i]);
     }
@@ -1336,7 +1336,7 @@ static void AppendProtoFields(DataChunk &chunk, idx_t row_idx, const NatsIngestC
 
 static void AppendMessageRow(DataChunk &chunk, idx_t row_idx, const NatsIngestConfig &config,
                              const NatsMessageEnvelope &envelope,
-                             Message *proto_msg) {
+                             Message *proto_msg, vector<Value> &json_values) {
     const char *subject = envelope.Subject();
     uint64_t stream_seq = envelope.Sequence();
     int64_t timestamp_ns = envelope.TimestampNs();
@@ -1362,7 +1362,7 @@ static void AppendMessageRow(DataChunk &chunk, idx_t row_idx, const NatsIngestCo
     }
 
     if (!config.json_fields.empty()) {
-        AppendJsonFields(chunk, row_idx, config, payload);
+        AppendJsonFields(chunk, row_idx, config, payload, json_values);
     } else if (!config.proto_fields.empty()) {
         AppendProtoFields(chunk, row_idx, config, proto_msg, payload);
     }
@@ -1414,6 +1414,8 @@ static void RunIngestWorker(const shared_ptr<NatsIngestJobState> &job) {
         DataChunk write_chunk;
         write_chunk.Initialize(Allocator::Get(*db_connection.context), appender->GetActiveTypes(), STANDARD_VECTOR_SIZE);
         idx_t write_row = 0;
+        vector<Value> json_values;
+        json_values.reserve(config.json_fields.size());
 
         natsSubscription *sub = nullptr;
         {
@@ -1548,11 +1550,11 @@ static void RunIngestWorker(const shared_ptr<NatsIngestJobState> &job) {
 
                     if (!proto_template) {
                         batch_stage = "append row";
-                        AppendMessageRow(write_chunk, write_row, config, envelope, nullptr);
+                        AppendMessageRow(write_chunk, write_row, config, envelope, nullptr, json_values);
                     } else {
                         std::unique_ptr<Message> row_proto(proto_template->New());
                         batch_stage = "append proto row";
-                        AppendMessageRow(write_chunk, write_row, config, envelope, row_proto.get());
+                        AppendMessageRow(write_chunk, write_row, config, envelope, row_proto.get(), json_values);
                     }
                     write_row++;
                     write_chunk.SetCardinality(write_row);

@@ -11,7 +11,7 @@ struct NatsPayloadView {
     idx_t size = 0;
 };
 
-vector<Value> DecodeJsonFields(const NatsPayloadView &payload, const vector<string> &field_names);
+void DecodeJsonFields(const NatsPayloadView &payload, const vector<string> &field_names, vector<Value> &values);
 
 bool DecodeProtobufPayload(google::protobuf::Message &message, const NatsPayloadView &payload);
 
