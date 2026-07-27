@@ -13,6 +13,7 @@ NATS_URL="${NATS_URL:-nats://localhost:4222}"
 NATS_CLI="${NATS_CLI:-$HOME/nats}"
 HARNESS_MODE="${HARNESS_MODE:-resume}"
 RUN_BOTH_MODES="${RUN_BOTH_MODES:-1}"
+MATRIX_BATCH_SIZES="${MATRIX_BATCH_SIZES:-1 4 16}"
 
 if [ ! -x "$DUCKDB_BIN" ]; then
   echo "DuckDB binary not found: $DUCKDB_BIN" >&2
@@ -63,6 +64,7 @@ bench_mode() {
   local stream="$2"
   local durable="$3"
   local job_a="$4"
+  local batch_size="$5"
   local db_file
   local log_file
   local start_ns
@@ -87,7 +89,7 @@ FROM nats_start_ingest(
     target_table := 'ingest_out',
     durable_name := '${durable}',
     url := '${NATS_URL}',
-    batch_size := 4,
+    batch_size := ${batch_size},
     poll_ms := 10000,
     fetch_timeout_ms := 100,
     start_seq := 1
@@ -98,12 +100,12 @@ SQL
 session_plan+=$'\n'
   session_plan+=$(cat <<SQL
 EXPECT start1=${job_a}|${stream}|ingest_out|${durable} 10
-POLL status1=4/1/4 10
+POLL status1=4/ 10
 SELECT 'status1=' || rows_inserted || '/' || batches_committed || '/' || last_committed_seq AS ingest_status
 FROM nats_ingest_status(job_name := '${job_a}');
 END
 RUN env -u LD_PRELOAD ${NATS_CLI} pub --jetstream --quiet --count 4 --server=${NATS_URL} ${stream}.items benchmark-test-{{Count}}
-POLL status2=8/2/8 10
+POLL status2=8/ 10
 SELECT 'status2=' || rows_inserted || '/' || batches_committed || '/' || last_committed_seq AS ingest_status
 FROM nats_ingest_status(job_name := '${job_a}');
 END
@@ -131,7 +133,7 @@ SQL
   end_ns="$(date +%s%N)"
   total_ms="$(((end_ns - start_ns) / 1000000))"
 
-  if ! grep -Fq "status2=8/2/8" "$log_file"; then
+  if ! grep -Eq "status2=8/[0-9]+/8" "$log_file"; then
     echo "Missing expected final status for mode $mode" >&2
     tail -n 80 "$log_file" >&2
     exit 1
@@ -145,13 +147,13 @@ SQL
 
   result="$(grep -o 'status2=[0-9/]*' "$log_file" | tail -n 1)"
   rows_per_sec="$(awk -v ms="$total_ms" 'BEGIN { if (ms <= 0) { print "inf"; } else { printf "%.2f", 8000 / (ms / 1000.0); } }')"
-  printf '%s,%s,%s,%s,%s,%s\n' "$mode" "$total_ms" "8" "$rows_per_sec" "$result" "single_session"
+  printf '%s,%s,%s,%s,%s,%s,%s\n' "$mode" "$batch_size" "$total_ms" "8" "$rows_per_sec" "$result" "single_session"
 
   rm -f "$log_file" "$db_file"
   trap - RETURN
 }
 
-echo "mode,total_ms,rows_inserted,approx_rows_per_sec,status,driver"
+echo "mode,batch_size,total_ms,rows_inserted,approx_rows_per_sec,status,driver"
 
 echo "Checking NATS connection at $NATS_URL" >&2
 "$NATS_CLI" server check connection --server "$NATS_URL" >&2
@@ -159,9 +161,43 @@ echo "Checking NATS connection at $NATS_URL" >&2
 echo "Preparing JetStream streams" >&2
 NATS_URL="$NATS_URL" NATS_CLI="$NATS_CLI" RESET_STREAMS="${RESET_STREAMS:-1}" "$ROOT_DIR/scripts/setup-streams.sh" >&2
 
+prepare_case_stream() {
+  local stream="$1"
+  "$NATS_CLI" stream rm "$stream" --force --server="$NATS_URL" >/dev/null 2>&1 || true
+  "$NATS_CLI" stream add "$stream" \
+    --subjects "${stream}.>" \
+    --storage file \
+    --retention limits \
+    --max-msgs=-1 \
+    --max-bytes=-1 \
+    --max-age=7d \
+    --max-msg-size=1048576 \
+    --discard old \
+    --dupe-window=2m \
+    --replicas=1 \
+    --server="$NATS_URL" \
+    --defaults >/dev/null
+  "$NATS_CLI" pub --jetstream --quiet --count 4 --server="$NATS_URL" \
+    "${stream}.items" "benchmark-seed-{{Count}}" >/dev/null
+}
+
+run_mode_matrix() {
+  local mode="$1"
+  local stream="$2"
+  local durable_prefix="$3"
+  local job_prefix="$4"
+  local batch_size
+  for batch_size in $MATRIX_BATCH_SIZES; do
+    local case_stream="bench_${mode}_${batch_size}"
+    prepare_case_stream "$case_stream"
+    bench_mode "$mode" "$case_stream" "${durable_prefix}_${batch_size}" "${job_prefix}_${batch_size}" "$batch_size"
+    "$NATS_CLI" stream rm "$case_stream" --force --server="$NATS_URL" >/dev/null 2>&1 || true
+  done
+}
+
 if [ "$RUN_BOTH_MODES" = "1" ]; then
-  bench_mode "resume" "ingest_resume" "duckdb_ingest_resume" "ingest_probe3_a" "ingest_probe3_b"
-  bench_mode "redelivery" "ingest_redelivery" "duckdb_ingest_redelivery" "ingest_redelivery_a" "ingest_redelivery_b"
+  run_mode_matrix "resume" "ingest_resume" "duckdb_ingest_resume" "ingest_probe3_a"
+  run_mode_matrix "redelivery" "ingest_redelivery" "duckdb_ingest_redelivery" "ingest_redelivery_a"
 else
-  bench_mode "$HARNESS_MODE" "$stream_name" "$durable_name" "$start_job_a" "$start_job_b"
+  run_mode_matrix "$HARNESS_MODE" "$stream_name" "$durable_name" "$start_job_a"
 fi
