@@ -68,8 +68,6 @@ bench_mode() {
   local start_ns
   local end_ns
   local total_ms
-  local first_ms
-  local second_ms
   local result
 
   db_file="$(mktemp /tmp/nats_ingest_benchmark.XXXXXX.duckdb)"
@@ -77,8 +75,9 @@ bench_mode() {
   rm -f "$db_file"
   trap 'rm -f "$log_file" "$db_file"' RETURN
 
-  local sql_start_a
-  sql_start_a=$(cat <<SQL
+  local session_plan
+  session_plan=$(cat <<SQL
+SEND
 LOAD '$(sql_escape "$EXTENSION_PATH")';
 CREATE TABLE ingest_out(stream_name VARCHAR, subject VARCHAR, sequence UBIGINT, ts TIMESTAMP, payload BLOB);
 SELECT 'start1=' || job_name || '|' || stream_name || '|' || target_table || '|' || durable_name AS start_result
@@ -93,14 +92,36 @@ FROM nats_start_ingest(
     fetch_timeout_ms := 100,
     start_seq := 1
 );
+END
+SQL
+)
+session_plan+=$'\n'
+  session_plan+=$(cat <<SQL
+EXPECT start1=${job_a}|${stream}|ingest_out|${durable} 10
+POLL status1=4/1/4 10
 SELECT 'status1=' || rows_inserted || '/' || batches_committed || '/' || last_committed_seq AS ingest_status
 FROM nats_ingest_status(job_name := '${job_a}');
+END
+RUN env -u LD_PRELOAD ${NATS_CLI} pub --jetstream --quiet --count 4 --server=${NATS_URL} ${stream}.items benchmark-test-{{Count}}
+POLL status2=8/2/8 10
+SELECT 'status2=' || rows_inserted || '/' || batches_committed || '/' || last_committed_seq AS ingest_status
+FROM nats_ingest_status(job_name := '${job_a}');
+END
+SEND
+SELECT 'count=' || COUNT(*) AS inserted_rows FROM ingest_out;
+SELECT 'stop2=' || job_name || '|' || stream_name || '|' || target_table || '|' || durable_name AS stop_result
+FROM nats_stop_ingest(job_name := '${job_a}');
+END
+EXPECT count=8 10
+EXPECT stop2=${job_a}|${stream}|ingest_out|${durable} 10
+QUIT
 SQL
 )
 
   start_ns="$(date +%s%N)"
   set +e
-  NATS_INGEST_DISABLE_REHYDRATE=1 "$DUCKDB_BIN" -unsigned "$db_file" -c "$sql_start_a" >"$log_file" 2>&1
+  NATS_INGEST_DISABLE_REHYDRATE=1 DUCKDB_LIB="$DUCKDB_LIB" python3 "$ROOT_DIR/scripts/duckdb_session.py" \
+    --duckdb-bin "$DUCKDB_BIN" --db-file "$db_file" <<<"$session_plan" >"$log_file" 2>&1
   local duckdb_status=$?
   set -e
   if [ "$duckdb_status" -ne 0 ]; then
@@ -108,51 +129,10 @@ SQL
     exit "$duckdb_status"
   fi
   end_ns="$(date +%s%N)"
-  first_ms="$(((end_ns - start_ns) / 1000000))"
-
-  if ! grep -Fq "status1=4/1/4" "$log_file"; then
-    echo "Missing expected first checkpoint status for mode $mode" >&2
-    tail -n 80 "$log_file" >&2
-    exit 1
-  fi
-
-  "$NATS_CLI" pub --jetstream --quiet --count 4 --server="$NATS_URL" "${stream}.items" "benchmark-test-{{Count}}" >/dev/null
-
-  local sql_start_b
-  sql_start_b=$(cat <<SQL
-LOAD '$(sql_escape "$EXTENSION_PATH")';
-SELECT 'status1=' || running || '/' || rows_inserted || '/' || last_committed_seq || '/' || failed || '/' || stopped AS ingest_status
-FROM nats_ingest_status(job_name := '${job_a}');
-SELECT SUM(i) FROM range(100000000) t(i);
-SELECT 'status2=' || rows_inserted || '/' || batches_committed || '/' || last_committed_seq AS ingest_status
-FROM nats_ingest_status(job_name := '${job_a}');
-SELECT 'count=' || COUNT(*) AS inserted_rows FROM ingest_out;
-SELECT 'stop2=' || job_name || '|' || stream_name || '|' || target_table || '|' || durable_name AS stop_result
-FROM nats_stop_ingest(job_name := '${job_a}');
-SQL
-)
-
-  start_ns="$(date +%s%N)"
-  set +e
-  "$DUCKDB_BIN" -unsigned "$db_file" -c "$sql_start_b" >"$log_file" 2>&1
-  duckdb_status=$?
-  set -e
-  if [ "$duckdb_status" -ne 0 ]; then
-    cat "$log_file" >&2
-    exit "$duckdb_status"
-  fi
-  end_ns="$(date +%s%N)"
-  second_ms="$(((end_ns - start_ns) / 1000000))"
-  total_ms="$((first_ms + second_ms))"
-
-  if ! grep -Fq "status1=true/4/4/false/false" "$log_file"; then
-    echo "Missing expected rehydrate status for mode $mode" >&2
-    tail -n 80 "$log_file" >&2
-    exit 1
-  fi
+  total_ms="$(((end_ns - start_ns) / 1000000))"
 
   if ! grep -Fq "status2=8/2/8" "$log_file"; then
-    echo "Missing expected resumed status for mode $mode" >&2
+    echo "Missing expected final status for mode $mode" >&2
     tail -n 80 "$log_file" >&2
     exit 1
   fi
@@ -165,13 +145,13 @@ SQL
 
   result="$(grep -o 'status2=[0-9/]*' "$log_file" | tail -n 1)"
   rows_per_sec="$(awk -v ms="$total_ms" 'BEGIN { if (ms <= 0) { print "inf"; } else { printf "%.2f", 8000 / (ms / 1000.0); } }')"
-  printf '%s,%s,%s,%s,%s,%s,%s\n' "$mode" "$first_ms" "$second_ms" "$total_ms" "8" "$rows_per_sec" "$result"
+  printf '%s,%s,%s,%s,%s,%s\n' "$mode" "$total_ms" "8" "$rows_per_sec" "$result" "single_session"
 
   rm -f "$log_file" "$db_file"
   trap - RETURN
 }
 
-echo "mode,first_ms,second_ms,total_ms,rows_inserted,approx_rows_per_sec,status"
+echo "mode,total_ms,rows_inserted,approx_rows_per_sec,status,driver"
 
 echo "Checking NATS connection at $NATS_URL" >&2
 "$NATS_CLI" server check connection --server "$NATS_URL" >&2

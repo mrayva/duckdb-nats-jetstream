@@ -5,6 +5,8 @@ from __future__ import annotations
 import argparse
 import ctypes
 import os
+import shlex
+import subprocess
 import sys
 import time
 from dataclasses import dataclass
@@ -31,11 +33,15 @@ class PlanAction:
     kind: str
     arg: str = ""
     timeout: float = 30.0
+    pattern: str = ""
 
 
 def parse_plan(stream) -> List[PlanAction]:
     actions: List[PlanAction] = []
     collecting_sql = False
+    collecting_kind = "send"
+    collecting_pattern = ""
+    collecting_timeout = 30.0
     sql_lines: List[str] = []
 
     for raw_line in stream:
@@ -44,9 +50,13 @@ def parse_plan(stream) -> List[PlanAction]:
 
         if collecting_sql:
             if stripped == "END":
-                actions.append(PlanAction("send", "\n".join(sql_lines)))
+                actions.append(PlanAction(collecting_kind, "\n".join(sql_lines), collecting_timeout,
+                                          collecting_pattern))
                 sql_lines = []
                 collecting_sql = False
+                collecting_kind = "send"
+                collecting_pattern = ""
+                collecting_timeout = 30.0
             else:
                 sql_lines.append(line)
             continue
@@ -56,6 +66,17 @@ def parse_plan(stream) -> List[PlanAction]:
 
         if stripped == "SEND":
             collecting_sql = True
+            sql_lines = []
+            continue
+
+        if stripped.startswith("POLL "):
+            parts = stripped.split(None, 2)
+            if len(parts) != 3:
+                raise ValueError(f"Invalid POLL line: {line}")
+            collecting_sql = True
+            collecting_kind = "poll"
+            collecting_pattern = parts[1]
+            collecting_timeout = float(parts[2])
             sql_lines = []
             continue
 
@@ -69,6 +90,13 @@ def parse_plan(stream) -> List[PlanAction]:
 
         if stripped == "QUIT":
             actions.append(PlanAction("quit"))
+            continue
+
+        if stripped.startswith("RUN "):
+            command = stripped[4:].strip()
+            if not command:
+                raise ValueError(f"Invalid RUN line: {line}")
+            actions.append(PlanAction("run", command))
             continue
 
         if stripped.startswith("SLEEP "):
@@ -279,6 +307,18 @@ class DuckDBBridge:
                 )
             time.sleep(0.05)
 
+    def poll(self, sql: str, pattern: str, timeout: float) -> None:
+        deadline = time.monotonic() + timeout
+        while pattern not in self.transcript:
+            self.execute(sql)
+            if pattern in self.transcript:
+                return
+            if time.monotonic() >= deadline:
+                raise DuckDBSessionError(
+                    f"Timed out polling for pattern: {pattern}\n--- Transcript tail ---\n{self.transcript[-4000:]}"
+                )
+            time.sleep(0.05)
+
 
 def find_duckdb_lib(duckdb_bin: str) -> str:
     candidates = []
@@ -318,10 +358,14 @@ def main() -> int:
         for action in actions:
             if action.kind == "send":
                 bridge.execute(action.arg)
+            elif action.kind == "poll":
+                bridge.poll(action.arg, action.pattern, action.timeout)
             elif action.kind == "expect":
                 bridge.expect(action.arg, action.timeout)
             elif action.kind == "sleep":
                 time.sleep(action.timeout)
+            elif action.kind == "run":
+                subprocess.run(shlex.split(action.arg), check=True)
             elif action.kind == "quit":
                 break
             else:
