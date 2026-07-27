@@ -1001,6 +1001,7 @@ static void NatsScanExecute(ClientContext &context, TableFunctionInput &data_p, 
             msg_data = envelope.Data();
             data_len = envelope.DataLength();
         }
+        NatsPayloadView payload {msg_data, static_cast<idx_t>(data_len)};
 
         for (idx_t out_idx = 0; out_idx < column_ids.size(); out_idx++) {
             auto col_id = column_ids[out_idx];
@@ -1074,7 +1075,7 @@ static void NatsScanExecute(ClientContext &context, TableFunctionInput &data_p, 
 
         if (needs_proto && proto_msg) {
             proto_msg->Clear();
-            bool parse_success = proto_msg->ParseFromArray(msg_data, data_len);
+            bool parse_success = DecodeProtobufPayload(*proto_msg, payload);
 
             if (parse_success) {
                 for (const auto &proto_column : proto_columns) {

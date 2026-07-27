@@ -1,6 +1,50 @@
 #include "nats_message_decode.hpp"
 
+#include "yyjson.hpp"
+
+using namespace duckdb_yyjson;
+
 namespace duckdb {
+
+vector<Value> DecodeJsonFields(const NatsPayloadView &payload, const vector<string> &field_names) {
+    vector<Value> values;
+    values.reserve(field_names.size());
+
+    yyjson_doc *doc = yyjson_read(payload.data, payload.size, 0);
+    if (!doc) {
+        values.resize(field_names.size());
+        return values;
+    }
+
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    for (const auto &field_name : field_names) {
+        yyjson_val *field = yyjson_obj_get(root, field_name.c_str());
+        if (!field || yyjson_is_null(field)) {
+            values.emplace_back(Value());
+        } else if (yyjson_is_str(field)) {
+            values.emplace_back(Value(yyjson_get_str(field)));
+        } else if (yyjson_is_num(field)) {
+            values.emplace_back(Value(yyjson_get_num(field)));
+        } else if (yyjson_is_bool(field)) {
+            values.emplace_back(Value::BOOLEAN(yyjson_get_bool(field)));
+        } else {
+            char *json_string = yyjson_val_write(field, 0, nullptr);
+            if (json_string) {
+                values.emplace_back(Value(json_string));
+                free(json_string);
+            } else {
+                values.emplace_back(Value());
+            }
+        }
+    }
+
+    yyjson_doc_free(doc);
+    return values;
+}
+
+bool DecodeProtobufPayload(google::protobuf::Message &message, const NatsPayloadView &payload) {
+    return message.ParseFromArray(payload.data, static_cast<int>(payload.size));
+}
 
 static vector<string> SplitFieldPath(const string &field_path) {
     vector<string> parts;

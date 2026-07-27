@@ -6,6 +6,15 @@
 
 namespace duckdb {
 
+struct NatsPayloadView {
+    const char *data = nullptr;
+    idx_t size = 0;
+};
+
+vector<Value> DecodeJsonFields(const NatsPayloadView &payload, const vector<string> &field_names);
+
+bool DecodeProtobufPayload(google::protobuf::Message &message, const NatsPayloadView &payload);
+
 vector<const google::protobuf::FieldDescriptor *> ResolveProtobufFieldPath(
     const google::protobuf::Descriptor *message_desc, const string &field_path);
 

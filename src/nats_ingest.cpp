@@ -14,7 +14,6 @@
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "duckdb/transaction/transaction.hpp"
 #include "duckdb/common/types/vector.hpp"
-#include "yyjson.hpp"
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
@@ -31,7 +30,6 @@
 #undef GetMessage
 #endif
 
-using namespace duckdb_yyjson;
 using namespace google::protobuf;
 using namespace google::protobuf::compiler;
 
@@ -1313,47 +1311,17 @@ static TableCatalogEntry &ResolveTargetTable(ClientContext &context, const strin
     return entry.Cast<TableCatalogEntry>();
 }
 
-static void AppendJsonFields(DataChunk &chunk, idx_t row_idx, const NatsIngestConfig &config, const char *msg_data,
-                             int data_len) {
-    yyjson_doc *doc = yyjson_read(msg_data, data_len, 0);
-    if (!doc) {
-        for (idx_t i = 0; i < config.json_fields.size(); i++) {
-            chunk.SetValue(5 + i, row_idx, Value());
-        }
-        return;
+static void AppendJsonFields(DataChunk &chunk, idx_t row_idx, const NatsIngestConfig &config,
+                             const NatsPayloadView &payload) {
+    auto values = DecodeJsonFields(payload, config.json_fields);
+    for (idx_t i = 0; i < values.size(); i++) {
+        chunk.SetValue(5 + i, row_idx, values[i]);
     }
-
-    yyjson_val *root = yyjson_doc_get_root(doc);
-    idx_t col_idx = 5;
-    for (const auto &field_name : config.json_fields) {
-        yyjson_val *field_val = yyjson_obj_get(root, field_name.c_str());
-        if (!field_val) {
-            chunk.SetValue(col_idx++, row_idx, Value());
-        } else if (yyjson_is_str(field_val)) {
-            chunk.SetValue(col_idx++, row_idx, Value(yyjson_get_str(field_val)));
-        } else if (yyjson_is_num(field_val)) {
-            chunk.SetValue(col_idx++, row_idx, Value(yyjson_get_num(field_val)));
-        } else if (yyjson_is_bool(field_val)) {
-            chunk.SetValue(col_idx++, row_idx, Value::BOOLEAN(yyjson_get_bool(field_val)));
-        } else if (yyjson_is_null(field_val)) {
-            chunk.SetValue(col_idx++, row_idx, Value());
-        } else {
-            char *json_str = yyjson_val_write(field_val, 0, nullptr);
-            if (json_str) {
-                chunk.SetValue(col_idx++, row_idx, Value(json_str));
-                free(json_str);
-            } else {
-                chunk.SetValue(col_idx++, row_idx, Value());
-            }
-        }
-    }
-
-    yyjson_doc_free(doc);
 }
 
 static void AppendProtoFields(DataChunk &chunk, idx_t row_idx, const NatsIngestConfig &config, Message *proto_msg,
-                              const char *msg_data, int data_len) {
-    if (!proto_msg || !proto_msg->ParseFromArray(msg_data, data_len)) {
+                              const NatsPayloadView &payload) {
+    if (!proto_msg || !DecodeProtobufPayload(*proto_msg, payload)) {
         for (idx_t i = 0; i < config.proto_fields.size(); i++) {
             chunk.SetValue(5 + i, row_idx, Value());
         }
@@ -1374,6 +1342,7 @@ static void AppendMessageRow(DataChunk &chunk, idx_t row_idx, const NatsIngestCo
     int64_t timestamp_ns = envelope.TimestampNs();
     const char *msg_data = envelope.Data();
     int data_len = envelope.DataLength();
+    NatsPayloadView payload {msg_data, static_cast<idx_t>(data_len)};
     bool payload_as_varchar = !config.json_fields.empty();
 
     chunk.SetValue(0, row_idx, Value(config.stream_name));
@@ -1393,9 +1362,9 @@ static void AppendMessageRow(DataChunk &chunk, idx_t row_idx, const NatsIngestCo
     }
 
     if (!config.json_fields.empty()) {
-        AppendJsonFields(chunk, row_idx, config, msg_data, data_len);
+        AppendJsonFields(chunk, row_idx, config, payload);
     } else if (!config.proto_fields.empty()) {
-        AppendProtoFields(chunk, row_idx, config, proto_msg, msg_data, data_len);
+        AppendProtoFields(chunk, row_idx, config, proto_msg, payload);
     }
 }
 
