@@ -5,6 +5,31 @@
 
 namespace duckdb {
 
+// Caches the message metadata and data pointers while the caller retains the
+// underlying natsMsg. It does not own or acknowledge the message.
+class NatsMessageEnvelope {
+public:
+    explicit NatsMessageEnvelope(natsMsg *message);
+
+    natsMsg *Message() const;
+    const char *Subject() const;
+    uint64_t Sequence() const;
+    int64_t TimestampNs() const;
+    const char *Data() const;
+    int DataLength() const;
+
+private:
+    void LoadMetadata() const;
+
+    natsMsg *message_ = nullptr;
+    const char *subject_ = nullptr;
+    const char *data_ = nullptr;
+    int data_length_ = 0;
+    mutable uint64_t sequence_ = 0;
+    mutable int64_t timestamp_ns_ = 0;
+    mutable bool metadata_loaded_ = false;
+};
+
 // Owns one buffered JetStream pull batch and transfers individual messages to
 // the caller. The caller owns a returned message and must destroy it.
 class NatsJetStreamBatchSource {

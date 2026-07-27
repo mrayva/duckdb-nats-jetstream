@@ -1313,20 +1313,6 @@ static TableCatalogEntry &ResolveTargetTable(ClientContext &context, const strin
     return entry.Cast<TableCatalogEntry>();
 }
 
-static uint64_t GetMessageSequence(natsMsg *msg) {
-    uint64_t stream_seq = natsMsg_GetSequence(msg);
-    if (stream_seq != 0) {
-        return stream_seq;
-    }
-
-    jsMsgMetaData *meta = nullptr;
-    if (natsMsg_GetMetaData(&meta, msg) == NATS_OK && meta != nullptr) {
-        stream_seq = meta->Sequence.Stream;
-        jsMsgMetaData_Destroy(meta);
-    }
-    return stream_seq;
-}
-
 static void AppendJsonFields(DataChunk &chunk, idx_t row_idx, const NatsIngestConfig &config, const char *msg_data,
                              int data_len) {
     yyjson_doc *doc = yyjson_read(msg_data, data_len, 0);
@@ -1380,25 +1366,14 @@ static void AppendProtoFields(DataChunk &chunk, idx_t row_idx, const NatsIngestC
     }
 }
 
-static void AppendMessageRow(DataChunk &chunk, idx_t row_idx, const NatsIngestConfig &config, natsMsg *msg,
+static void AppendMessageRow(DataChunk &chunk, idx_t row_idx, const NatsIngestConfig &config,
+                             const NatsMessageEnvelope &envelope,
                              Message *proto_msg) {
-    const char *subject = natsMsg_GetSubject(msg);
-    uint64_t stream_seq = GetMessageSequence(msg);
-    int64_t timestamp_ns = 0;
-
-    if (timestamp_ns == 0) {
-        jsMsgMetaData *meta = nullptr;
-        if (natsMsg_GetMetaData(&meta, msg) == NATS_OK && meta != nullptr) {
-            timestamp_ns = meta->Timestamp;
-            jsMsgMetaData_Destroy(meta);
-        }
-    }
-    if (timestamp_ns == 0) {
-        timestamp_ns = natsMsg_GetTime(msg);
-    }
-
-    const char *msg_data = natsMsg_GetData(msg);
-    int data_len = natsMsg_GetDataLength(msg);
+    const char *subject = envelope.Subject();
+    uint64_t stream_seq = envelope.Sequence();
+    int64_t timestamp_ns = envelope.TimestampNs();
+    const char *msg_data = envelope.Data();
+    int data_len = envelope.DataLength();
     bool payload_as_varchar = !config.json_fields.empty();
 
     chunk.SetValue(0, row_idx, Value(config.stream_name));
@@ -1582,7 +1557,8 @@ static void RunIngestWorker(const shared_ptr<NatsIngestJobState> &job) {
 
                     ack_msgs.push_back(msg);
 
-                    uint64_t msg_seq = GetMessageSequence(msg);
+                    NatsMessageEnvelope envelope(msg);
+                    uint64_t msg_seq = envelope.Sequence();
                     batch_last_delivered_seq = std::max(batch_last_delivered_seq, msg_seq);
                     if (msg_seq != 0) {
                         if (msg_seq <= progress_snapshot.last_committed_seq) {
@@ -1593,7 +1569,7 @@ static void RunIngestWorker(const shared_ptr<NatsIngestJobState> &job) {
                         }
                     }
 
-                    const char *subject = natsMsg_GetSubject(msg);
+                    const char *subject = envelope.Subject();
                     if (!config.subject_contains.empty() &&
                         (subject == nullptr || string(subject).find(config.subject_contains) == string::npos)) {
                         lock_guard<std::mutex> guard(job->job_mutex);
@@ -1603,11 +1579,11 @@ static void RunIngestWorker(const shared_ptr<NatsIngestJobState> &job) {
 
                     if (!proto_template) {
                         batch_stage = "append row";
-                        AppendMessageRow(write_chunk, write_row, config, msg, nullptr);
+                        AppendMessageRow(write_chunk, write_row, config, envelope, nullptr);
                     } else {
                         std::unique_ptr<Message> row_proto(proto_template->New());
                         batch_stage = "append proto row";
-                        AppendMessageRow(write_chunk, write_row, config, msg, row_proto.get());
+                        AppendMessageRow(write_chunk, write_row, config, envelope, row_proto.get());
                     }
                     write_row++;
                     write_chunk.SetCardinality(write_row);

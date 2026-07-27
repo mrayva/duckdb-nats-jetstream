@@ -968,21 +968,9 @@ static void NatsScanExecute(ClientContext &context, TableFunctionInput &data_p, 
             continue;
         }
 
-        uint64_t stream_seq = natsMsg_GetSequence(msg);
-        int64_t timestamp_ns = 0;
-        if (needs_ts || stream_seq == 0) {
-            jsMsgMetaData *meta = nullptr;
-            natsStatus meta_status = natsMsg_GetMetaData(&meta, msg);
-            if (meta_status == NATS_OK) {
-                stream_seq = meta->Sequence.Stream;
-                timestamp_ns = meta->Timestamp;
-            } else if (needs_ts) {
-                timestamp_ns = natsMsg_GetTime(msg);
-            }
-            if (meta != nullptr) {
-                jsMsgMetaData_Destroy(meta);
-            }
-        }
+        NatsMessageEnvelope envelope(msg);
+        uint64_t stream_seq = envelope.Sequence();
+        int64_t timestamp_ns = needs_ts ? envelope.TimestampNs() : 0;
         if (stream_seq == 0) {
             natsMsg_Destroy(msg);
             throw std::runtime_error("Failed to read JetStream metadata for fetched message");
@@ -997,7 +985,7 @@ static void NatsScanExecute(ClientContext &context, TableFunctionInput &data_p, 
 
         const char *subject = nullptr;
         if (needs_message_subject) {
-            subject = natsMsg_GetSubject(msg);
+            subject = envelope.Subject();
         }
 
         if (needs_subject_for_filter &&
@@ -1010,8 +998,8 @@ static void NatsScanExecute(ClientContext &context, TableFunctionInput &data_p, 
         const char *msg_data = nullptr;
         int data_len = 0;
         if (needs_message_payload) {
-            msg_data = natsMsg_GetData(msg);
-            data_len = natsMsg_GetDataLength(msg);
+            msg_data = envelope.Data();
+            data_len = envelope.DataLength();
         }
 
         for (idx_t out_idx = 0; out_idx < column_ids.size(); out_idx++) {
