@@ -185,6 +185,11 @@ Ingest jobs also persist a checkpoint keyed by `stream_name` and `durable_name`,
 so restarting with the same durable resumes from the last committed sequence.
 If you want DuckDB to create the destination table for you, pass
 `create_target_table := true` to `nats_start_ingest(...)`.
+New databases store checkpoints in the append-only
+`duckdb_nats_ingest_checkpoint_log` table, avoiding a keyed SQL upsert on every
+commit batch. The existing `duckdb_nats_ingest_checkpoints` name remains
+available as a latest-row view; databases created with the older table schema
+continue to use that table for backward compatibility.
 
 Core NATS live subscriptions are available through `nats_start_subscribe(...)`,
 `nats_pause_subscribe(...)`, `nats_resume_subscribe(...)`, and

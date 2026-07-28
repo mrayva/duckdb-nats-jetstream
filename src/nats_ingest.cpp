@@ -144,6 +144,7 @@ struct NatsIngestControlGlobalState : public GlobalTableFunctionState {
 };
 
 static constexpr const char *NATS_INGEST_CHECKPOINT_TABLE = "duckdb_nats_ingest_checkpoints";
+static constexpr const char *NATS_INGEST_CHECKPOINT_LOG_TABLE = "duckdb_nats_ingest_checkpoint_log";
 static constexpr const char *NATS_INGEST_REGISTRY_TABLE = "duckdb_nats_ingest_jobs";
 
 static NatsIngestSnapshot SnapshotJob(const shared_ptr<NatsIngestJobState> &job);
@@ -202,8 +203,19 @@ static void MarkTransactionWrite(Connection &conn) {
 }
 
 static void EnsureCheckpointTable(Connection &conn) {
+    auto object_result = conn.Query(
+        "SELECT table_type FROM information_schema.tables WHERE table_schema = current_schema() AND table_name = " +
+        SqlStringLiteral(NATS_INGEST_CHECKPOINT_TABLE));
+    if (object_result->HasError()) {
+        throw std::runtime_error("Failed to inspect ingest checkpoint object: " + object_result->GetError());
+    }
+    auto object_chunk = object_result->Fetch();
+    if (object_chunk && object_chunk->size() > 0) {
+        return;
+    }
+
     std::ostringstream sql;
-    sql << "CREATE TABLE IF NOT EXISTS " << NATS_INGEST_CHECKPOINT_TABLE << " ("
+    sql << "CREATE TABLE IF NOT EXISTS " << NATS_INGEST_CHECKPOINT_LOG_TABLE << " ("
         << "stream_name VARCHAR NOT NULL,"
         << "durable_name VARCHAR NOT NULL,"
         << "job_name VARCHAR NOT NULL,"
@@ -211,10 +223,19 @@ static void EnsureCheckpointTable(Connection &conn) {
         << "last_delivered_seq UBIGINT NOT NULL,"
         << "rows_inserted UBIGINT NOT NULL,"
         << "batches_committed UBIGINT NOT NULL,"
-        << "updated_at TIMESTAMP NOT NULL,"
-        << "PRIMARY KEY(stream_name, durable_name)"
+        << "updated_at TIMESTAMP NOT NULL"
         << ")";
-    ExecuteOrThrow(conn, sql.str(), "Failed to create ingest checkpoint table");
+    ExecuteOrThrow(conn, sql.str(), "Failed to create ingest checkpoint log");
+
+    std::ostringstream view_sql;
+    view_sql << "CREATE VIEW " << NATS_INGEST_CHECKPOINT_TABLE << " AS "
+                "SELECT stream_name, durable_name, job_name, last_committed_seq, last_delivered_seq, rows_inserted, "
+                "batches_committed, updated_at FROM ("
+             << "SELECT *, ROW_NUMBER() OVER (PARTITION BY stream_name, durable_name "
+                "ORDER BY last_committed_seq DESC, batches_committed DESC) AS checkpoint_rank FROM "
+             << NATS_INGEST_CHECKPOINT_LOG_TABLE
+             << ") latest WHERE checkpoint_rank = 1";
+    ExecuteOrThrow(conn, view_sql.str(), "Failed to create ingest checkpoint view");
 }
 
 static void EnsureRegistryTable(Connection &conn) {
@@ -624,16 +645,31 @@ static bool LoadCheckpoint(Connection &conn, const NatsIngestConfig &config, uin
 
 static unique_ptr<PreparedStatement> PrepareCheckpointStatement(Connection &conn) {
     std::ostringstream sql;
-    sql << "INSERT INTO " << NATS_INGEST_CHECKPOINT_TABLE
-        << " (stream_name, durable_name, job_name, last_committed_seq, last_delivered_seq, rows_inserted, "
-           "batches_committed, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP) "
-           "ON CONFLICT(stream_name, durable_name) DO UPDATE SET "
-        << "job_name = excluded.job_name, "
-        << "last_committed_seq = excluded.last_committed_seq, "
-        << "last_delivered_seq = excluded.last_delivered_seq, "
-        << "rows_inserted = excluded.rows_inserted, "
-        << "batches_committed = excluded.batches_committed, "
-        << "updated_at = excluded.updated_at";
+    auto object_result = conn.Query(
+        "SELECT table_type FROM information_schema.tables WHERE table_schema = current_schema() AND table_name = " +
+        SqlStringLiteral(NATS_INGEST_CHECKPOINT_TABLE));
+    if (object_result->HasError()) {
+        throw std::runtime_error("Failed to inspect ingest checkpoint object: " + object_result->GetError());
+    }
+    auto object_chunk = object_result->Fetch();
+    bool append_only = object_chunk && object_chunk->size() > 0 &&
+                       object_chunk->GetValue(0, 0).GetValue<string>() == "VIEW";
+    if (append_only) {
+        sql << "INSERT INTO " << NATS_INGEST_CHECKPOINT_LOG_TABLE
+            << " (stream_name, durable_name, job_name, last_committed_seq, last_delivered_seq, rows_inserted, "
+               "batches_committed, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)";
+    } else {
+        sql << "INSERT INTO " << NATS_INGEST_CHECKPOINT_TABLE
+            << " (stream_name, durable_name, job_name, last_committed_seq, last_delivered_seq, rows_inserted, "
+               "batches_committed, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP) "
+               "ON CONFLICT(stream_name, durable_name) DO UPDATE SET "
+            << "job_name = excluded.job_name, "
+            << "last_committed_seq = excluded.last_committed_seq, "
+            << "last_delivered_seq = excluded.last_delivered_seq, "
+            << "rows_inserted = excluded.rows_inserted, "
+            << "batches_committed = excluded.batches_committed, "
+            << "updated_at = excluded.updated_at";
+    }
     auto statement = conn.Prepare(sql.str());
     if (!statement || statement->HasError()) {
         throw std::runtime_error("Failed to prepare ingest checkpoint: " +
