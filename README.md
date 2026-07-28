@@ -190,6 +190,10 @@ New databases store checkpoints in the append-only
 commit batch. The existing `duckdb_nats_ingest_checkpoints` name remains
 available as a latest-row view; databases created with the older table schema
 continue to use that table for backward compatibility.
+The log is compacted transactionally every 1,000 committed batches by default,
+retaining only the latest row for each stream/durable pair. Set
+`NATS_INGEST_CHECKPOINT_COMPACTION_INTERVAL=0` to disable compaction or use a
+smaller positive value for tighter storage bounds.
 
 Core NATS live subscriptions are available through `nats_start_subscribe(...)`,
 `nats_pause_subscribe(...)`, `nats_resume_subscribe(...)`, and

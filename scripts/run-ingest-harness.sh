@@ -62,7 +62,8 @@ log_file="$(mktemp /tmp/nats_ingest_harness.XXXXXX.log)"
 rm -f "$db_file"
 trap 'rc=$?; rm -f "$log_file" "$db_file"; exit $rc' EXIT
 
-if ! DUCKDB_LIB="$DUCKDB_LIB" NATS_INGEST_DISABLE_REHYDRATE=1 python3 "$ROOT_DIR/scripts/duckdb_session.py" --duckdb-bin "$DUCKDB_BIN" --db-file "$db_file" <<SQL >"$log_file" 2>&1
+if ! DUCKDB_LIB="$DUCKDB_LIB" NATS_INGEST_DISABLE_REHYDRATE=1 NATS_INGEST_CHECKPOINT_COMPACTION_INTERVAL=2 \
+  python3 "$ROOT_DIR/scripts/duckdb_session.py" --duckdb-bin "$DUCKDB_BIN" --db-file "$db_file" <<SQL >"$log_file" 2>&1
 SEND
 LOAD '${EXTENSION_PATH}';
 CREATE TABLE ingest_out(
@@ -79,7 +80,7 @@ FROM nats_start_ingest(
     target_table := 'ingest_out',
     durable_name := '${durable_name}',
     url := '${NATS_URL}',
-    batch_size := 4,
+    batch_size := 2,
     poll_ms := 10000,
     fetch_timeout_ms := 100,
     start_seq := 1
@@ -90,7 +91,13 @@ SEND
 SELECT 'status1=' || rows_inserted || '/' || batches_committed || '/' || last_committed_seq AS ingest_status
 FROM nats_ingest_status(job_name := '${start_job_a}');
 END
-EXPECT status1=4/1/4 30
+EXPECT status1=2/1/2 30
+SLEEP 1
+SEND
+SELECT 'status2=' || rows_inserted || '/' || batches_committed || '/' || last_committed_seq AS ingest_status
+FROM nats_ingest_status(job_name := '${start_job_a}');
+END
+EXPECT status2=4/2/4 30
 SEND
 SELECT 'stop1=' || job_name || '|' || stream_name || '|' || target_table || '|' || durable_name AS stop_result
 FROM nats_stop_ingest(job_name := '${start_job_a}');
@@ -98,10 +105,14 @@ SELECT 'count=' || COUNT(*) AS inserted_rows FROM ingest_out;
 SELECT 'checkpoint=' || last_committed_seq AS checkpoint_seq
 FROM duckdb_nats_ingest_checkpoints
 WHERE stream_name = '${stream_name}' AND durable_name = '${durable_name}';
+SELECT 'checkpoint_log_rows=' || COUNT(*) AS checkpoint_log_rows
+FROM duckdb_nats_ingest_checkpoint_log
+WHERE stream_name = '${stream_name}' AND durable_name = '${durable_name}';
 END
 EXPECT stop1=${start_job_a}|${stream_name}|ingest_out|${durable_name} 10
 EXPECT count=4 10
 EXPECT checkpoint=4 10
+EXPECT checkpoint_log_rows=1 10
 SEND
 CREATE TABLE ingest_bad_target(
     stream_name INTEGER,

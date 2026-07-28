@@ -643,8 +643,7 @@ static bool LoadCheckpoint(Connection &conn, const NatsIngestConfig &config, uin
     return true;
 }
 
-static unique_ptr<PreparedStatement> PrepareCheckpointStatement(Connection &conn) {
-    std::ostringstream sql;
+static bool UsesAppendOnlyCheckpointLog(Connection &conn) {
     auto object_result = conn.Query(
         "SELECT table_type FROM information_schema.tables WHERE table_schema = current_schema() AND table_name = " +
         SqlStringLiteral(NATS_INGEST_CHECKPOINT_TABLE));
@@ -652,8 +651,35 @@ static unique_ptr<PreparedStatement> PrepareCheckpointStatement(Connection &conn
         throw std::runtime_error("Failed to inspect ingest checkpoint object: " + object_result->GetError());
     }
     auto object_chunk = object_result->Fetch();
-    bool append_only = object_chunk && object_chunk->size() > 0 &&
-                       object_chunk->GetValue(0, 0).GetValue<string>() == "VIEW";
+    return object_chunk && object_chunk->size() > 0 && object_chunk->GetValue(0, 0).GetValue<string>() == "VIEW";
+}
+
+static void CompactCheckpointLog(Connection &conn) {
+    EnsureActiveTransaction(conn);
+    MarkTransactionWrite(conn);
+    try {
+        ExecuteOrThrow(
+            conn,
+            "DELETE FROM " + string(NATS_INGEST_CHECKPOINT_LOG_TABLE) + " AS old WHERE EXISTS (SELECT 1 FROM " +
+                string(NATS_INGEST_CHECKPOINT_LOG_TABLE) +
+                " AS newer WHERE newer.stream_name = old.stream_name AND newer.durable_name = old.durable_name AND "
+                "(newer.last_committed_seq > old.last_committed_seq OR "
+                "(newer.last_committed_seq = old.last_committed_seq AND "
+                "newer.batches_committed > old.batches_committed)))",
+            "Failed to compact ingest checkpoint log");
+        conn.Commit();
+    } catch (...) {
+        try {
+            conn.Rollback();
+        } catch (...) {
+        }
+        throw;
+    }
+}
+
+static unique_ptr<PreparedStatement> PrepareCheckpointStatement(Connection &conn) {
+    std::ostringstream sql;
+    bool append_only = UsesAppendOnlyCheckpointLog(conn);
     if (append_only) {
         sql << "INSERT INTO " << NATS_INGEST_CHECKPOINT_LOG_TABLE
             << " (stream_name, durable_name, job_name, last_committed_seq, last_delivered_seq, rows_inserted, "
@@ -1452,6 +1478,7 @@ struct NatsIngestTiming {
     uint64_t checkpoint_ns = 0;
     uint64_t commit_ns = 0;
     uint64_t persist_ns = 0;
+    uint64_t compaction_ns = 0;
     uint64_t ack_ns = 0;
     uint64_t batches = 0;
 
@@ -1464,11 +1491,12 @@ struct NatsIngestTiming {
         };
         std::fprintf(stderr,
                      "NATS_INGEST_PROFILE job=%s rows=%llu batches=%llu fetch_ms=%.3f row_ms=%.3f append_ms=%.3f "
-                     "flush_ms=%.3f checkpoint_ms=%.3f commit_ms=%.3f persist_ms=%.3f ack_ms=%.3f\n",
+                     "flush_ms=%.3f checkpoint_ms=%.3f commit_ms=%.3f persist_ms=%.3f compaction_ms=%.3f ack_ms=%.3f\n",
                      job_name.c_str(), static_cast<unsigned long long>(rows),
                      static_cast<unsigned long long>(batches), milliseconds(fetch_ns), milliseconds(row_ns),
                      milliseconds(append_ns), milliseconds(flush_ns), milliseconds(checkpoint_ns),
-                     milliseconds(commit_ns), milliseconds(persist_ns), milliseconds(ack_ns));
+                     milliseconds(commit_ns), milliseconds(persist_ns), milliseconds(compaction_ns),
+                     milliseconds(ack_ns));
         std::fflush(stderr);
     }
 };
@@ -1486,6 +1514,15 @@ static void RunIngestWorker(const shared_ptr<NatsIngestJobState> &job) {
             auto parsed_interval = std::strtoull(registry_interval_env, &end, 10);
             if (end != registry_interval_env && *end == '\0' && parsed_interval > 0) {
                 registry_persist_interval = parsed_interval;
+            }
+        }
+        uint64_t checkpoint_compaction_interval = 1000;
+        const char *checkpoint_compaction_env = std::getenv("NATS_INGEST_CHECKPOINT_COMPACTION_INTERVAL");
+        if (checkpoint_compaction_env != nullptr) {
+            char *end = nullptr;
+            auto parsed_interval = std::strtoull(checkpoint_compaction_env, &end, 10);
+            if (end != checkpoint_compaction_env && *end == '\0') {
+                checkpoint_compaction_interval = parsed_interval;
             }
         }
         uint64_t transport_batch_multiplier = 4;
@@ -1545,6 +1582,7 @@ static void RunIngestWorker(const shared_ptr<NatsIngestJobState> &job) {
         DataChunk write_chunk;
         write_chunk.Initialize(Allocator::Get(*db_connection.context), appender->GetActiveTypes(), STANDARD_VECTOR_SIZE);
         auto checkpoint_statement = PrepareCheckpointStatement(db_connection);
+        bool append_only_checkpoint = UsesAppendOnlyCheckpointLog(db_connection);
         idx_t write_row = 0;
         vector<Value> json_values;
         json_values.reserve(config.json_fields.size());
@@ -1828,6 +1866,19 @@ static void RunIngestWorker(const shared_ptr<NatsIngestJobState> &job) {
                     job->cv.notify_all();
                 }
                 timing.batches++;
+                if (append_only_checkpoint && checkpoint_compaction_interval > 0 &&
+                    committed_batches % checkpoint_compaction_interval == 0) {
+                    try {
+                        phase_start = std::chrono::steady_clock::now();
+                        CompactCheckpointLog(db_connection);
+                        timing.compaction_ns += static_cast<uint64_t>(
+                            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - phase_start)
+                                .count());
+                    } catch (const std::exception &ex) {
+                        std::fprintf(stderr, "NATS_INGEST checkpoint compaction skipped job=%s error=%s\n",
+                                     config.job_name.c_str(), ex.what());
+                    }
+                }
                 if (committed_batches % registry_persist_interval == 0) {
                     phase_start = std::chrono::steady_clock::now();
                     PersistRegistry(db_connection, job);
