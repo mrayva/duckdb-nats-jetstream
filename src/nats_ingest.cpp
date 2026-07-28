@@ -16,6 +16,7 @@
 #include "duckdb/common/types/vector.hpp"
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <sstream>
@@ -920,13 +921,13 @@ static void RestoreJobProgress(const shared_ptr<NatsIngestJobState> &job, const 
     lock_guard<std::mutex> guard(job->job_mutex);
     job->progress.pause_requested = snapshot.pause_requested;
     job->progress.paused = snapshot.paused;
-    job->progress.last_committed_seq = snapshot.last_committed_seq;
-    job->progress.last_delivered_seq = snapshot.last_delivered_seq;
-    job->progress.rows_inserted = snapshot.rows_inserted;
-    job->progress.batches_committed = snapshot.batches_committed;
-    job->progress.fetches_completed = snapshot.fetches_completed;
+    job->progress.last_committed_seq = std::max(job->progress.last_committed_seq, snapshot.last_committed_seq);
+    job->progress.last_delivered_seq = std::max(job->progress.last_delivered_seq, snapshot.last_delivered_seq);
+    job->progress.rows_inserted = std::max(job->progress.rows_inserted, snapshot.rows_inserted);
+    job->progress.batches_committed = std::max(job->progress.batches_committed, snapshot.batches_committed);
+    job->progress.fetches_completed = std::max(job->progress.fetches_completed, snapshot.fetches_completed);
     job->progress.last_batch_rows = snapshot.last_batch_rows;
-    job->progress.checkpoint_seq = snapshot.last_committed_seq;
+    job->progress.checkpoint_seq = std::max(job->progress.checkpoint_seq, snapshot.last_committed_seq);
     job->progress.last_start_time = snapshot.last_start_time;
     job->progress.last_fetch_time = snapshot.last_fetch_time;
     job->progress.last_ack_time = snapshot.last_ack_time;
@@ -1376,9 +1377,50 @@ static void AppendMessageRow(DataChunk &chunk, idx_t row_idx, const NatsIngestCo
     }
 }
 
+struct NatsIngestTiming {
+    bool enabled = false;
+    uint64_t fetch_ns = 0;
+    uint64_t row_ns = 0;
+    uint64_t append_ns = 0;
+    uint64_t flush_ns = 0;
+    uint64_t checkpoint_ns = 0;
+    uint64_t commit_ns = 0;
+    uint64_t persist_ns = 0;
+    uint64_t batches = 0;
+
+    void Report(const string &job_name, uint64_t rows) const {
+        if (!enabled) {
+            return;
+        }
+        auto milliseconds = [](uint64_t nanoseconds) {
+            return static_cast<double>(nanoseconds) / 1000000.0;
+        };
+        std::fprintf(stderr,
+                     "NATS_INGEST_PROFILE job=%s rows=%llu batches=%llu fetch_ms=%.3f row_ms=%.3f append_ms=%.3f "
+                     "flush_ms=%.3f checkpoint_ms=%.3f commit_ms=%.3f persist_ms=%.3f\n",
+                     job_name.c_str(), static_cast<unsigned long long>(rows),
+                     static_cast<unsigned long long>(batches), milliseconds(fetch_ns), milliseconds(row_ns),
+                     milliseconds(append_ns), milliseconds(flush_ns), milliseconds(checkpoint_ns),
+                     milliseconds(commit_ns), milliseconds(persist_ns));
+        std::fflush(stderr);
+    }
+};
+
 static void RunIngestWorker(const shared_ptr<NatsIngestJobState> &job) {
     try {
         auto &config = job->config;
+        const char *profile_env = std::getenv("NATS_INGEST_PROFILE");
+        NatsIngestTiming timing;
+        timing.enabled = profile_env && string(profile_env) != "0";
+        uint64_t registry_persist_interval = 8;
+        const char *registry_interval_env = std::getenv("NATS_INGEST_REGISTRY_INTERVAL");
+        if (registry_interval_env != nullptr) {
+            char *end = nullptr;
+            auto parsed_interval = std::strtoull(registry_interval_env, &end, 10);
+            if (end != registry_interval_env && *end == '\0' && parsed_interval > 0) {
+                registry_persist_interval = parsed_interval;
+            }
+        }
         Connection db_connection(*job->db);
         const char *fail_after_commit_env = std::getenv("NATS_INGEST_FAIL_AFTER_COMMIT");
         bool inject_fail_after_commit = fail_after_commit_env != nullptr && string(fail_after_commit_env) != "0";
@@ -1495,8 +1537,12 @@ static void RunIngestWorker(const shared_ptr<NatsIngestJobState> &job) {
                 break;
             }
 
+            auto phase_start = std::chrono::steady_clock::now();
             bool fetched = message_source.FetchBatch(config.batch_size, config.fetch_timeout_ms, config.stream_name,
                                                      false);
+            timing.fetch_ns += static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - phase_start)
+                    .count());
             if (!fetched) {
                 if (config.poll_ms > 0) {
                     std::this_thread::sleep_for(std::chrono::milliseconds(config.poll_ms));
@@ -1562,13 +1608,21 @@ static void RunIngestWorker(const shared_ptr<NatsIngestJobState> &job) {
 
                     if (!proto_template) {
                         batch_stage = "append row";
+                        phase_start = std::chrono::steady_clock::now();
                         AppendMessageRow(write_chunk, write_row, config, envelope, nullptr, json_values,
                                          reuse_json_values, direct_json_write);
+                        timing.row_ns += static_cast<uint64_t>(
+                            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - phase_start)
+                                .count());
                     } else {
                         std::unique_ptr<Message> row_proto(proto_template->New());
                         batch_stage = "append proto row";
+                        phase_start = std::chrono::steady_clock::now();
                         AppendMessageRow(write_chunk, write_row, config, envelope, row_proto.get(), json_values,
                                          reuse_json_values, direct_json_write);
+                        timing.row_ns += static_cast<uint64_t>(
+                            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - phase_start)
+                                .count());
                     }
                     write_row++;
                     write_chunk.SetCardinality(write_row);
@@ -1577,7 +1631,11 @@ static void RunIngestWorker(const shared_ptr<NatsIngestJobState> &job) {
                     if (write_row == write_chunk.GetCapacity()) {
                         batch_stage = "append chunk";
                         try {
+                            phase_start = std::chrono::steady_clock::now();
                             appender->AppendDataChunk(write_chunk);
+                            timing.append_ns += static_cast<uint64_t>(
+                                std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - phase_start)
+                                    .count());
                         } catch (const std::exception &ex) {
                             throw std::runtime_error(string("Failed to append ingest chunk: ") + ex.what());
                         }
@@ -1617,7 +1675,11 @@ static void RunIngestWorker(const shared_ptr<NatsIngestJobState> &job) {
                 if (write_row > 0) {
                     batch_stage = "append final chunk";
                     try {
+                        phase_start = std::chrono::steady_clock::now();
                         appender->AppendDataChunk(write_chunk);
+                        timing.append_ns += static_cast<uint64_t>(
+                            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - phase_start)
+                                .count());
                     } catch (const std::exception &ex) {
                         throw std::runtime_error(string("Failed to append final ingest chunk: ") + ex.what());
                     }
@@ -1628,7 +1690,11 @@ static void RunIngestWorker(const shared_ptr<NatsIngestJobState> &job) {
                 if (inserted_rows > 0) {
                     batch_stage = "flush appender";
                     try {
+                        phase_start = std::chrono::steady_clock::now();
                         appender->Flush();
+                        timing.flush_ns += static_cast<uint64_t>(
+                            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - phase_start)
+                                .count());
                     } catch (const std::exception &ex) {
                         throw std::runtime_error(string("Failed to flush ingest appender: ") + ex.what());
                     }
@@ -1647,14 +1713,22 @@ static void RunIngestWorker(const shared_ptr<NatsIngestJobState> &job) {
 
                 try {
                     batch_stage = "write checkpoint";
+                    phase_start = std::chrono::steady_clock::now();
                     UpsertCheckpoint(db_connection, *job, committed_seq, batch_last_delivered_seq, committed_rows,
                                      committed_batches);
+                    timing.checkpoint_ns += static_cast<uint64_t>(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - phase_start)
+                            .count());
                 } catch (const std::exception &ex) {
                     throw std::runtime_error(string("Failed to write ingest checkpoint: ") + ex.what());
                 }
                 try {
                     batch_stage = "commit transaction";
+                    phase_start = std::chrono::steady_clock::now();
                     db_connection.Commit();
+                    timing.commit_ns += static_cast<uint64_t>(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - phase_start)
+                            .count());
                 } catch (const std::exception &ex) {
                     throw std::runtime_error(string("Failed to commit ingest transaction: ") + ex.what());
                 }
@@ -1671,7 +1745,15 @@ static void RunIngestWorker(const shared_ptr<NatsIngestJobState> &job) {
                     job->progress.last_commit_time = Timestamp::GetCurrentTimestamp();
                     job->cv.notify_all();
                 }
-                PersistRegistry(db_connection, job);
+                timing.batches++;
+                if (committed_batches % registry_persist_interval == 0) {
+                    phase_start = std::chrono::steady_clock::now();
+                    PersistRegistry(db_connection, job);
+                    timing.persist_ns += static_cast<uint64_t>(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - phase_start)
+                            .count());
+                }
+                timing.Report(config.job_name, committed_rows);
 
                 if (inject_fail_after_commit && !injected_fail_after_commit) {
                     injected_fail_after_commit = true;

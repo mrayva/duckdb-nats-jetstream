@@ -55,7 +55,8 @@ bench_mode() {
   local stream="json_buffer_${CASE_ID}_${mode}"
   local durable="duckdb_json_buffer_${CASE_ID}_${mode}"
   local job="json_buffer_${CASE_ID}_${mode}"
-  local db_file log_file start_ns end_ns total_ms result rows_per_sec
+  local db_file log_file start_ns end_ns total_ms result rows_per_sec profile_line
+  local fetch_ms row_ms append_ms flush_ms checkpoint_ms commit_ms persist_ms
 
   prepare_stream "$stream"
   db_file="$(mktemp /tmp/nats_json_buffer.XXXXXX.duckdb)"
@@ -111,7 +112,8 @@ SQL
 
   start_ns="$(date +%s%N)"
   set +e
-  NATS_INGEST_DISABLE_REHYDRATE=1 NATS_INGEST_JSON_BUFFER_MODE=reuse NATS_INGEST_JSON_WRITE_MODE="$mode" \
+  NATS_INGEST_DISABLE_REHYDRATE=1 NATS_INGEST_PROFILE=1 NATS_INGEST_JSON_BUFFER_MODE=reuse \
+    NATS_INGEST_JSON_WRITE_MODE="$mode" \
     LD_PRELOAD="${LD_PRELOAD:-$DUCKDB_LIB}" \
     DUCKDB_LIB="$DUCKDB_LIB" \
     python3 "$ROOT_DIR/scripts/duckdb_session.py" --duckdb-bin "$DUCKDB_BIN" --db-file "$db_file" \
@@ -125,8 +127,22 @@ SQL
   end_ns="$(date +%s%N)"
   total_ms="$(((end_ns - start_ns) / 1000000))"
   result="$(grep -o "complete=${MESSAGE_COUNT}/${MESSAGE_COUNT}" "$log_file" | tail -n 1)"
+  profile_line="$(grep 'NATS_INGEST_PROFILE ' "$log_file" | tail -n 1)"
+  if [ -z "$profile_line" ]; then
+    echo "Missing ingest profile for mode $mode" >&2
+    tail -n 80 "$log_file" >&2
+    exit 1
+  fi
+  fetch_ms="$(sed -n 's/.*fetch_ms=\([^ ]*\).*/\1/p' <<<"$profile_line")"
+  row_ms="$(sed -n 's/.*row_ms=\([^ ]*\).*/\1/p' <<<"$profile_line")"
+  append_ms="$(sed -n 's/.*append_ms=\([^ ]*\).*/\1/p' <<<"$profile_line")"
+  flush_ms="$(sed -n 's/.*flush_ms=\([^ ]*\).*/\1/p' <<<"$profile_line")"
+  checkpoint_ms="$(sed -n 's/.*checkpoint_ms=\([^ ]*\).*/\1/p' <<<"$profile_line")"
+  commit_ms="$(sed -n 's/.*commit_ms=\([^ ]*\).*/\1/p' <<<"$profile_line")"
+  persist_ms="$(sed -n 's/.*persist_ms=\([^ ]*\).*/\1/p' <<<"$profile_line")"
   rows_per_sec="$(awk -v ms="$total_ms" -v rows="$MESSAGE_COUNT" 'BEGIN { if (ms <= 0) print "inf"; else printf "%.2f", rows / (ms / 1000.0); }')"
-  printf '%s,%s,%s,%s,%s\n' "$mode" "$total_ms" "$MESSAGE_COUNT" "$rows_per_sec" "$result"
+  printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' "$mode" "$total_ms" "$MESSAGE_COUNT" "$rows_per_sec" "$result" \
+    "$fetch_ms" "$row_ms" "$append_ms" "$flush_ms" "$checkpoint_ms" "$commit_ms" "$persist_ms"
 
   rm -f "$log_file" "$db_file"
   "$NATS_CLI" stream rm "$stream" --force --server="$NATS_URL" >/dev/null 2>&1 || true
@@ -135,7 +151,7 @@ SQL
 
 echo "Checking NATS connection at $NATS_URL" >&2
 "$NATS_CLI" server check connection --server "$NATS_URL" >&2
-echo "write_mode,total_ms,rows_inserted,approx_rows_per_sec,status"
+echo "write_mode,total_ms,rows_inserted,approx_rows_per_sec,status,fetch_ms,row_ms,append_ms,flush_ms,checkpoint_ms,commit_ms,persist_ms"
 current_result="$(bench_mode current)"
 direct_result="$(bench_mode direct)"
 printf '%s\n%s\n' "$current_result" "$direct_result"
