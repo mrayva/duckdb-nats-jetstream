@@ -56,7 +56,7 @@ bench_mode() {
   local durable="duckdb_json_buffer_${CASE_ID}_${mode}"
   local job="json_buffer_${CASE_ID}_${mode}"
   local db_file log_file start_ns end_ns total_ms result rows_per_sec profile_line
-  local fetch_ms row_ms append_ms flush_ms checkpoint_ms commit_ms persist_ms
+  local fetch_ms row_ms append_ms flush_ms checkpoint_ms commit_ms persist_ms ack_ms
 
   prepare_stream "$stream"
   db_file="$(mktemp /tmp/nats_json_buffer.XXXXXX.duckdb)"
@@ -140,9 +140,10 @@ SQL
   checkpoint_ms="$(sed -n 's/.*checkpoint_ms=\([^ ]*\).*/\1/p' <<<"$profile_line")"
   commit_ms="$(sed -n 's/.*commit_ms=\([^ ]*\).*/\1/p' <<<"$profile_line")"
   persist_ms="$(sed -n 's/.*persist_ms=\([^ ]*\).*/\1/p' <<<"$profile_line")"
+  ack_ms="$(sed -n 's/.*ack_ms=\([^ ]*\).*/\1/p' <<<"$profile_line")"
   rows_per_sec="$(awk -v ms="$total_ms" -v rows="$MESSAGE_COUNT" 'BEGIN { if (ms <= 0) print "inf"; else printf "%.2f", rows / (ms / 1000.0); }')"
-  printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' "$mode" "$total_ms" "$MESSAGE_COUNT" "$rows_per_sec" "$result" \
-    "$fetch_ms" "$row_ms" "$append_ms" "$flush_ms" "$checkpoint_ms" "$commit_ms" "$persist_ms"
+  printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' "$mode" "$total_ms" "$MESSAGE_COUNT" "$rows_per_sec" "$result" \
+    "$fetch_ms" "$row_ms" "$append_ms" "$flush_ms" "$checkpoint_ms" "$commit_ms" "$persist_ms" "$ack_ms"
 
   rm -f "$log_file" "$db_file"
   "$NATS_CLI" stream rm "$stream" --force --server="$NATS_URL" >/dev/null 2>&1 || true
@@ -151,7 +152,7 @@ SQL
 
 echo "Checking NATS connection at $NATS_URL" >&2
 "$NATS_CLI" server check connection --server "$NATS_URL" >&2
-echo "write_mode,total_ms,rows_inserted,approx_rows_per_sec,status,fetch_ms,row_ms,append_ms,flush_ms,checkpoint_ms,commit_ms,persist_ms"
+echo "write_mode,total_ms,rows_inserted,approx_rows_per_sec,status,fetch_ms,row_ms,append_ms,flush_ms,checkpoint_ms,commit_ms,persist_ms,ack_ms"
 current_result="$(bench_mode current)"
 direct_result="$(bench_mode direct)"
 printf '%s\n%s\n' "$current_result" "$direct_result"

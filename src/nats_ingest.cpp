@@ -642,6 +642,21 @@ static unique_ptr<PreparedStatement> PrepareCheckpointStatement(Connection &conn
     return statement;
 }
 
+static void AckMessages(const std::vector<natsMsg *> &messages, const string &stream_name) {
+    for (auto *msg : messages) {
+        if (!msg) {
+            continue;
+        }
+        auto status = natsMsg_Ack(msg, nullptr);
+        if (status != NATS_OK) {
+            natsMsg_Destroy(msg);
+            throw std::runtime_error(std::string("Failed to ack JetStream message from '") + stream_name + "': " +
+                                     natsStatus_GetText(status));
+        }
+        natsMsg_Destroy(msg);
+    }
+}
+
 static void UpsertCheckpoint(PreparedStatement &statement, const NatsIngestConfig &config, uint64_t committed_seq,
                              uint64_t delivered_seq, uint64_t rows_inserted, uint64_t batches_committed) {
     vector<Value> values;
@@ -1401,6 +1416,7 @@ struct NatsIngestTiming {
     uint64_t checkpoint_ns = 0;
     uint64_t commit_ns = 0;
     uint64_t persist_ns = 0;
+    uint64_t ack_ns = 0;
     uint64_t batches = 0;
 
     void Report(const string &job_name, uint64_t rows) const {
@@ -1412,11 +1428,11 @@ struct NatsIngestTiming {
         };
         std::fprintf(stderr,
                      "NATS_INGEST_PROFILE job=%s rows=%llu batches=%llu fetch_ms=%.3f row_ms=%.3f append_ms=%.3f "
-                     "flush_ms=%.3f checkpoint_ms=%.3f commit_ms=%.3f persist_ms=%.3f\n",
+                     "flush_ms=%.3f checkpoint_ms=%.3f commit_ms=%.3f persist_ms=%.3f ack_ms=%.3f\n",
                      job_name.c_str(), static_cast<unsigned long long>(rows),
                      static_cast<unsigned long long>(batches), milliseconds(fetch_ns), milliseconds(row_ns),
                      milliseconds(append_ns), milliseconds(flush_ns), milliseconds(checkpoint_ns),
-                     milliseconds(commit_ns), milliseconds(persist_ns));
+                     milliseconds(commit_ns), milliseconds(persist_ns), milliseconds(ack_ns));
         std::fflush(stderr);
     }
 };
@@ -1576,7 +1592,6 @@ static void RunIngestWorker(const shared_ptr<NatsIngestJobState> &job) {
             ack_msgs.reserve(static_cast<size_t>(config.batch_size));
             uint64_t batch_last_delivered_seq = 0;
             string batch_stage = "begin";
-            natsStatus s = NATS_OK;
             std::unordered_set<uint64_t> batch_seen_sequences;
             batch_seen_sequences.reserve(static_cast<size_t>(config.batch_size));
 
@@ -1672,19 +1687,11 @@ static void RunIngestWorker(const shared_ptr<NatsIngestJobState> &job) {
                     } catch (const std::exception &ex) {
                         throw std::runtime_error(string("Failed to rollback empty ingest transaction: ") + ex.what());
                     }
-                    for (auto *msg : ack_msgs) {
-                        if (!msg) {
-                            continue;
-                        }
-                        jsErrCode ack_err = static_cast<jsErrCode>(0);
-                        s = natsMsg_AckSync(msg, nullptr, &ack_err);
-                        if (s != NATS_OK) {
-                            natsMsg_Destroy(msg);
-                            throw std::runtime_error(std::string("Failed to ack JetStream message from '") +
-                                                     config.stream_name + "': " + natsStatus_GetText(s));
-                        }
-                        natsMsg_Destroy(msg);
-                    }
+                    phase_start = std::chrono::steady_clock::now();
+                    AckMessages(ack_msgs, config.stream_name);
+                    timing.ack_ns += static_cast<uint64_t>(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - phase_start)
+                            .count());
                     continue;
                 }
 
@@ -1776,19 +1783,11 @@ static void RunIngestWorker(const shared_ptr<NatsIngestJobState> &job) {
                     std::abort();
                 }
 
-                for (auto *msg : ack_msgs) {
-                    if (!msg) {
-                        continue;
-                    }
-                    jsErrCode ack_err = static_cast<jsErrCode>(0);
-                    s = natsMsg_AckSync(msg, nullptr, &ack_err);
-                    if (s != NATS_OK) {
-                        natsMsg_Destroy(msg);
-                        throw std::runtime_error(std::string("Failed to ack JetStream message from '") +
-                                                 config.stream_name + "': " + natsStatus_GetText(s));
-                    }
-                    natsMsg_Destroy(msg);
-                }
+                phase_start = std::chrono::steady_clock::now();
+                AckMessages(ack_msgs, config.stream_name);
+                timing.ack_ns += static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - phase_start)
+                        .count());
                 {
                     lock_guard<std::mutex> guard(job->job_mutex);
                     job->progress.last_ack_time = Timestamp::GetCurrentTimestamp();
