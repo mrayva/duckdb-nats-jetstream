@@ -1452,6 +1452,20 @@ static void RunIngestWorker(const shared_ptr<NatsIngestJobState> &job) {
                 registry_persist_interval = parsed_interval;
             }
         }
+        uint64_t transport_batch_multiplier = 4;
+        const char *transport_multiplier_env = std::getenv("NATS_INGEST_TRANSPORT_BATCH_MULTIPLIER");
+        if (transport_multiplier_env != nullptr) {
+            char *end = nullptr;
+            auto parsed_multiplier = std::strtoull(transport_multiplier_env, &end, 10);
+            if (end != transport_multiplier_env && *end == '\0' && parsed_multiplier > 0) {
+                transport_batch_multiplier = parsed_multiplier;
+            }
+        }
+        uint64_t transport_batch_size = config.batch_size;
+        if (transport_batch_multiplier > 1 &&
+            config.batch_size <= 65536 / std::min<uint64_t>(transport_batch_multiplier, 65536)) {
+            transport_batch_size = std::min<uint64_t>(65536, config.batch_size * transport_batch_multiplier);
+        }
         Connection db_connection(*job->db);
         const char *fail_after_commit_env = std::getenv("NATS_INGEST_FAIL_AFTER_COMMIT");
         bool inject_fail_after_commit = fail_after_commit_env != nullptr && string(fail_after_commit_env) != "0";
@@ -1512,7 +1526,7 @@ static void RunIngestWorker(const shared_ptr<NatsIngestJobState> &job) {
             throw std::runtime_error("Ingest worker did not initialize a JetStream subscription");
         }
         NatsJetStreamBatchSource message_source(sub);
-        message_source.StartPrefetch(config.batch_size, config.fetch_timeout_ms, config.stream_name);
+        message_source.StartPrefetch(transport_batch_size, config.fetch_timeout_ms, config.stream_name);
 
         while (true) {
             bool pause_requested = false;
@@ -1571,19 +1585,22 @@ static void RunIngestWorker(const shared_ptr<NatsIngestJobState> &job) {
             }
 
             auto phase_start = std::chrono::steady_clock::now();
-            bool fetched = message_source.FetchBatch(config.batch_size, config.fetch_timeout_ms, config.stream_name,
-                                                     false);
-            timing.fetch_ns += static_cast<uint64_t>(
-                std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - phase_start)
-                    .count());
-            if (!fetched) {
-                if (config.poll_ms > 0) {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(config.poll_ms));
+            bool fetched_from_transport = false;
+            if (!message_source.HasBufferedMessages()) {
+                fetched_from_transport = message_source.FetchBatch(transport_batch_size, config.fetch_timeout_ms,
+                                                                    config.stream_name, false);
+                timing.fetch_ns += static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - phase_start)
+                        .count());
+                if (!fetched_from_transport) {
+                    if (config.poll_ms > 0) {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(config.poll_ms));
+                    }
+                    continue;
                 }
-                continue;
             }
 
-            {
+            if (fetched_from_transport) {
                 lock_guard<std::mutex> guard(job->job_mutex);
                 job->progress.fetches_completed++;
                 job->progress.last_fetch_time = Timestamp::GetCurrentTimestamp();
@@ -1607,7 +1624,11 @@ static void RunIngestWorker(const shared_ptr<NatsIngestJobState> &job) {
                     progress_snapshot = job->progress;
                 }
 
+                idx_t transaction_messages = 0;
                 while (message_source.HasBufferedMessages()) {
+                    if (transaction_messages == config.batch_size) {
+                        break;
+                    }
                     natsMsg *msg = nullptr;
                     if (!message_source.Next(&msg, config.batch_size, config.fetch_timeout_ms, config.stream_name)) {
                         break;
@@ -1617,6 +1638,7 @@ static void RunIngestWorker(const shared_ptr<NatsIngestJobState> &job) {
                     }
 
                     ack_msgs.push_back(msg);
+                    transaction_messages++;
 
                     NatsMessageEnvelope envelope(msg);
                     uint64_t msg_seq = envelope.Sequence();
