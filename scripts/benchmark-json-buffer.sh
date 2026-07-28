@@ -97,9 +97,13 @@ FROM nats_ingest_status(job_name := '$(sql_escape "$job")');
 END
 SEND
 SELECT 'count=' || COUNT(*) AS inserted_rows FROM ingest_out;
+SELECT 'json_values=' || COUNT(*) AS valid_json_rows
+FROM ingest_out
+WHERE value LIKE 'json-benchmark-%' AND nested = '{"ok":true}';
 SELECT 'stop=' || job_name AS stop_result FROM nats_stop_ingest(job_name := '$(sql_escape "$job")');
 END
 EXPECT count=${MESSAGE_COUNT} 10
+EXPECT json_values=${MESSAGE_COUNT} 10
 EXPECT stop=${job} 10
 QUIT
 SQL
@@ -107,7 +111,8 @@ SQL
 
   start_ns="$(date +%s%N)"
   set +e
-  NATS_INGEST_DISABLE_REHYDRATE=1 NATS_INGEST_JSON_BUFFER_MODE="$mode" LD_PRELOAD="${LD_PRELOAD:-$DUCKDB_LIB}" \
+  NATS_INGEST_DISABLE_REHYDRATE=1 NATS_INGEST_JSON_BUFFER_MODE=reuse NATS_INGEST_JSON_WRITE_MODE="$mode" \
+    LD_PRELOAD="${LD_PRELOAD:-$DUCKDB_LIB}" \
     DUCKDB_LIB="$DUCKDB_LIB" \
     python3 "$ROOT_DIR/scripts/duckdb_session.py" --duckdb-bin "$DUCKDB_BIN" --db-file "$db_file" \
     <<<"$session_plan" >"$log_file" 2>&1
@@ -130,14 +135,14 @@ SQL
 
 echo "Checking NATS connection at $NATS_URL" >&2
 "$NATS_CLI" server check connection --server "$NATS_URL" >&2
-echo "buffer_mode,total_ms,rows_inserted,approx_rows_per_sec,status"
-reuse_result="$(bench_mode reuse)"
-allocate_result="$(bench_mode allocate)"
-printf '%s\n%s\n' "$reuse_result" "$allocate_result"
+echo "write_mode,total_ms,rows_inserted,approx_rows_per_sec,status"
+current_result="$(bench_mode current)"
+direct_result="$(bench_mode direct)"
+printf '%s\n%s\n' "$current_result" "$direct_result"
 
-reuse_ms="$(printf '%s\n' "$reuse_result" | awk -F, '{print $2}')"
-allocate_ms="$(printf '%s\n' "$allocate_result" | awk -F, '{print $2}')"
-awk -v reuse="$reuse_ms" -v allocate="$allocate_ms" 'BEGIN {
-  if (reuse <= 0 || allocate <= 0) exit 0;
-  printf "reuse_speedup_vs_allocate,%.2fx\n", allocate / reuse;
+current_ms="$(printf '%s\n' "$current_result" | awk -F, '{print $2}')"
+direct_ms="$(printf '%s\n' "$direct_result" | awk -F, '{print $2}')"
+awk -v current="$current_ms" -v direct="$direct_ms" 'BEGIN {
+  if (current <= 0 || direct <= 0) exit 0;
+  printf "direct_speedup_vs_current,%.2fx\n", current / direct;
 }'

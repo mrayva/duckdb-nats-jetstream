@@ -44,6 +44,45 @@ void DecodeJsonFields(const NatsPayloadView &payload, const vector<string> &fiel
     yyjson_doc_free(doc);
 }
 
+void DecodeJsonFieldsToChunk(DataChunk &chunk, idx_t row_idx, idx_t first_column, const NatsPayloadView &payload,
+                             const vector<string> &field_names) {
+    yyjson_doc *doc = yyjson_read(payload.data, payload.size, 0);
+    if (!doc) {
+        for (idx_t i = 0; i < field_names.size(); i++) {
+            FlatVector::SetNull(chunk.data[first_column + i], row_idx, true);
+        }
+        return;
+    }
+
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    for (idx_t i = 0; i < field_names.size(); i++) {
+        auto &vector = chunk.data[first_column + i];
+        auto vector_data = FlatVector::GetData<string_t>(vector);
+        yyjson_val *field = yyjson_obj_get(root, field_names[i].c_str());
+
+        if (!field || yyjson_is_null(field)) {
+            FlatVector::SetNull(vector, row_idx, true);
+        } else if (yyjson_is_str(field)) {
+            vector_data[row_idx] = StringVector::AddString(vector, yyjson_get_str(field));
+        } else if (yyjson_is_num(field)) {
+            auto value = std::to_string(yyjson_get_num(field));
+            vector_data[row_idx] = StringVector::AddString(vector, value);
+        } else if (yyjson_is_bool(field)) {
+            vector_data[row_idx] = StringVector::AddString(vector, yyjson_get_bool(field) ? "true" : "false");
+        } else {
+            char *json_string = yyjson_val_write(field, 0, nullptr);
+            if (json_string) {
+                vector_data[row_idx] = StringVector::AddString(vector, json_string);
+                free(json_string);
+            } else {
+                FlatVector::SetNull(vector, row_idx, true);
+            }
+        }
+    }
+
+    yyjson_doc_free(doc);
+}
+
 bool DecodeProtobufPayload(google::protobuf::Message &message, const NatsPayloadView &payload) {
     return message.ParseFromArray(payload.data, static_cast<int>(payload.size));
 }

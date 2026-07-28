@@ -13,6 +13,9 @@ struct NatsPayloadView {
 
 void DecodeJsonFields(const NatsPayloadView &payload, const vector<string> &field_names, vector<Value> &values);
 
+void DecodeJsonFieldsToChunk(DataChunk &chunk, idx_t row_idx, idx_t first_column, const NatsPayloadView &payload,
+                             const vector<string> &field_names);
+
 bool DecodeProtobufPayload(google::protobuf::Message &message, const NatsPayloadView &payload);
 
 vector<const google::protobuf::FieldDescriptor *> ResolveProtobufFieldPath(

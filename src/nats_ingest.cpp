@@ -1312,7 +1312,12 @@ static TableCatalogEntry &ResolveTargetTable(ClientContext &context, const strin
 }
 
 static void AppendJsonFields(DataChunk &chunk, idx_t row_idx, const NatsIngestConfig &config,
-                             const NatsPayloadView &payload, vector<Value> &values, bool reuse_values) {
+                             const NatsPayloadView &payload, vector<Value> &values, bool reuse_values,
+                             bool direct_write) {
+    if (direct_write) {
+        DecodeJsonFieldsToChunk(chunk, row_idx, 5, payload, config.json_fields);
+        return;
+    }
     vector<Value> allocated_values;
     auto &decode_values = reuse_values ? values : allocated_values;
     DecodeJsonFields(payload, config.json_fields, decode_values);
@@ -1338,7 +1343,8 @@ static void AppendProtoFields(DataChunk &chunk, idx_t row_idx, const NatsIngestC
 
 static void AppendMessageRow(DataChunk &chunk, idx_t row_idx, const NatsIngestConfig &config,
                              const NatsMessageEnvelope &envelope,
-                             Message *proto_msg, vector<Value> &json_values, bool reuse_json_values) {
+                             Message *proto_msg, vector<Value> &json_values, bool reuse_json_values,
+                             bool direct_json_write) {
     const char *subject = envelope.Subject();
     uint64_t stream_seq = envelope.Sequence();
     int64_t timestamp_ns = envelope.TimestampNs();
@@ -1364,7 +1370,7 @@ static void AppendMessageRow(DataChunk &chunk, idx_t row_idx, const NatsIngestCo
     }
 
     if (!config.json_fields.empty()) {
-        AppendJsonFields(chunk, row_idx, config, payload, json_values, reuse_json_values);
+        AppendJsonFields(chunk, row_idx, config, payload, json_values, reuse_json_values, direct_json_write);
     } else if (!config.proto_fields.empty()) {
         AppendProtoFields(chunk, row_idx, config, proto_msg, payload);
     }
@@ -1420,6 +1426,8 @@ static void RunIngestWorker(const shared_ptr<NatsIngestJobState> &job) {
         json_values.reserve(config.json_fields.size());
         const char *json_buffer_mode = std::getenv("NATS_INGEST_JSON_BUFFER_MODE");
         bool reuse_json_values = !json_buffer_mode || string(json_buffer_mode) != "allocate";
+        const char *json_write_mode = std::getenv("NATS_INGEST_JSON_WRITE_MODE");
+        bool direct_json_write = json_write_mode && string(json_write_mode) == "direct";
 
         natsSubscription *sub = nullptr;
         {
@@ -1555,12 +1563,12 @@ static void RunIngestWorker(const shared_ptr<NatsIngestJobState> &job) {
                     if (!proto_template) {
                         batch_stage = "append row";
                         AppendMessageRow(write_chunk, write_row, config, envelope, nullptr, json_values,
-                                         reuse_json_values);
+                                         reuse_json_values, direct_json_write);
                     } else {
                         std::unique_ptr<Message> row_proto(proto_template->New());
                         batch_stage = "append proto row";
                         AppendMessageRow(write_chunk, write_row, config, envelope, row_proto.get(), json_values,
-                                         reuse_json_values);
+                                         reuse_json_values, direct_json_write);
                     }
                     write_row++;
                     write_chunk.SetCardinality(write_row);

@@ -231,7 +231,7 @@ For timing and throughput checks, use:
 ./scripts/benchmark-ingest.sh
 ```
 
-To compare reusable JSON extraction storage against the per-message allocation baseline:
+To compare the current JSON extraction path against direct `DataChunk` vector writes:
 
 ```bash
 ./scripts/benchmark-json-buffer.sh
