@@ -231,6 +231,12 @@ For timing and throughput checks, use:
 ./scripts/benchmark-ingest.sh
 ```
 
+To compare reusable JSON extraction storage against the per-message allocation baseline:
+
+```bash
+./scripts/benchmark-json-buffer.sh
+```
+
 The benchmark prints CSV and runs both ingest modes by default. Use
 `HARNESS_MODE=resume` or `HARNESS_MODE=redelivery` to run one mode at a time.
 
