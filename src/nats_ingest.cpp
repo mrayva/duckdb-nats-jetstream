@@ -622,27 +622,42 @@ static bool LoadCheckpoint(Connection &conn, const NatsIngestConfig &config, uin
     return true;
 }
 
-static void UpsertCheckpoint(Connection &conn, const NatsIngestJobState &job, uint64_t committed_seq,
-                             uint64_t delivered_seq, uint64_t rows_inserted, uint64_t batches_committed) {
+static unique_ptr<PreparedStatement> PrepareCheckpointStatement(Connection &conn) {
     std::ostringstream sql;
     sql << "INSERT INTO " << NATS_INGEST_CHECKPOINT_TABLE
         << " (stream_name, durable_name, job_name, last_committed_seq, last_delivered_seq, rows_inserted, "
-           "batches_committed, updated_at) VALUES ("
-        << SqlStringLiteral(job.config.stream_name) << ", "
-        << SqlStringLiteral(job.config.durable_name) << ", "
-        << SqlStringLiteral(job.config.job_name) << ", "
-        << committed_seq << ", "
-        << delivered_seq << ", "
-        << rows_inserted << ", "
-        << batches_committed << ", CURRENT_TIMESTAMP"
-        << ") ON CONFLICT(stream_name, durable_name) DO UPDATE SET "
+           "batches_committed, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP) "
+           "ON CONFLICT(stream_name, durable_name) DO UPDATE SET "
         << "job_name = excluded.job_name, "
         << "last_committed_seq = excluded.last_committed_seq, "
         << "last_delivered_seq = excluded.last_delivered_seq, "
         << "rows_inserted = excluded.rows_inserted, "
         << "batches_committed = excluded.batches_committed, "
         << "updated_at = excluded.updated_at";
-    ExecuteOrThrow(conn, sql.str(), "Failed to update ingest checkpoint");
+    auto statement = conn.Prepare(sql.str());
+    if (!statement || statement->HasError()) {
+        throw std::runtime_error("Failed to prepare ingest checkpoint: " +
+                                 (statement ? statement->GetError() : string("unknown error")));
+    }
+    return statement;
+}
+
+static void UpsertCheckpoint(PreparedStatement &statement, const NatsIngestConfig &config, uint64_t committed_seq,
+                             uint64_t delivered_seq, uint64_t rows_inserted, uint64_t batches_committed) {
+    vector<Value> values;
+    values.reserve(7);
+    values.emplace_back(config.stream_name);
+    values.emplace_back(config.durable_name);
+    values.emplace_back(config.job_name);
+    values.emplace_back(Value::UBIGINT(committed_seq));
+    values.emplace_back(Value::UBIGINT(delivered_seq));
+    values.emplace_back(Value::UBIGINT(rows_inserted));
+    values.emplace_back(Value::UBIGINT(batches_committed));
+    auto result = statement.Execute(values, false);
+    if (!result || result->HasError()) {
+        throw std::runtime_error("Failed to update ingest checkpoint: " +
+                                 (result ? result->GetError() : string("unknown error")));
+    }
 }
 
 static bool SubjectIsUnderStreamPattern(const string &subject, const char *stream_pattern) {
@@ -1463,6 +1478,7 @@ static void RunIngestWorker(const shared_ptr<NatsIngestJobState> &job) {
 
         DataChunk write_chunk;
         write_chunk.Initialize(Allocator::Get(*db_connection.context), appender->GetActiveTypes(), STANDARD_VECTOR_SIZE);
+        auto checkpoint_statement = PrepareCheckpointStatement(db_connection);
         idx_t write_row = 0;
         vector<Value> json_values;
         json_values.reserve(config.json_fields.size());
@@ -1714,7 +1730,7 @@ static void RunIngestWorker(const shared_ptr<NatsIngestJobState> &job) {
                 try {
                     batch_stage = "write checkpoint";
                     phase_start = std::chrono::steady_clock::now();
-                    UpsertCheckpoint(db_connection, *job, committed_seq, batch_last_delivered_seq, committed_rows,
+                    UpsertCheckpoint(*checkpoint_statement, config, committed_seq, batch_last_delivered_seq, committed_rows,
                                      committed_batches);
                     timing.checkpoint_ns += static_cast<uint64_t>(
                         std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - phase_start)
