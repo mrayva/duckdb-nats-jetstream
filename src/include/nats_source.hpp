@@ -2,6 +2,11 @@
 
 #include "duckdb.hpp"
 #include <nats/nats.h>
+#include <condition_variable>
+#include <deque>
+#include <exception>
+#include <mutex>
+#include <thread>
 
 namespace duckdb {
 
@@ -40,6 +45,8 @@ public:
     NatsJetStreamBatchSource(const NatsJetStreamBatchSource &) = delete;
     NatsJetStreamBatchSource &operator=(const NatsJetStreamBatchSource &) = delete;
 
+    void StartPrefetch(uint64_t batch_size, int64_t fetch_timeout_ms, const string &stream_name);
+
     // Fetches one complete batch. Existing buffered messages are discarded.
     bool FetchBatch(uint64_t batch_size, int64_t fetch_timeout_ms, const string &stream_name, bool no_wait = true);
     bool HasBufferedMessages() const;
@@ -48,12 +55,24 @@ public:
     bool Next(natsMsg **message, uint64_t batch_size, int64_t fetch_timeout_ms, const string &stream_name);
 
 private:
-    bool Fetch(uint64_t batch_size, int64_t fetch_timeout_ms, const string &stream_name, bool no_wait);
+    bool Fetch(natsMsgList &target, uint64_t batch_size, int64_t fetch_timeout_ms, const string &stream_name,
+               bool no_wait);
+    void PrefetchLoop();
     void ClearBatch();
 
     natsSubscription *subscription_ = nullptr;
     natsMsgList messages_ {nullptr, 0};
     int next_index_ = 0;
+    bool prefetch_enabled_ = false;
+    uint64_t prefetch_batch_size_ = 0;
+    int64_t prefetch_timeout_ms_ = 0;
+    string prefetch_stream_name_;
+    std::thread prefetch_thread_;
+    std::mutex prefetch_mutex_;
+    std::condition_variable prefetch_cv_;
+    std::deque<natsMsgList> prefetch_batches_;
+    std::exception_ptr prefetch_error_;
+    bool prefetch_stop_ = false;
 };
 
 } // namespace duckdb

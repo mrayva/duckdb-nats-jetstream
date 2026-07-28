@@ -1512,6 +1512,7 @@ static void RunIngestWorker(const shared_ptr<NatsIngestJobState> &job) {
             throw std::runtime_error("Ingest worker did not initialize a JetStream subscription");
         }
         NatsJetStreamBatchSource message_source(sub);
+        message_source.StartPrefetch(config.batch_size, config.fetch_timeout_ms, config.stream_name);
 
         while (true) {
             bool pause_requested = false;
