@@ -543,19 +543,29 @@ static void FlushSubscribeBatch(Connection &conn, const NatsSubscribeConfig &con
             throw std::runtime_error("JSON and MessagePack extraction columns must be VARCHAR");
         }
     }
-    if (!extracted_fields.empty()) {
-        vector<idx_t> output_columns;
-        output_columns.reserve(extracted_fields.size());
-        for (idx_t i = 0; i < extracted_fields.size(); i++) {
-            output_columns.push_back(3 + i);
+    vector<idx_t> output_columns;
+    output_columns.reserve(extracted_fields.size());
+    for (idx_t i = 0; i < extracted_fields.size(); i++) {
+        output_columns.push_back(3 + i);
+    }
+    DataChunk chunk;
+    chunk.Initialize(Allocator::Get(*conn.context), types, batch.size());
+    auto &subject_vector = chunk.data[0];
+    auto &payload_vector = chunk.data[1];
+    auto &received_at_vector = chunk.data[2];
+    auto subject_data = FlatVector::GetData<string_t>(subject_vector);
+    auto payload_data = FlatVector::GetData<string_t>(payload_vector);
+    auto received_at_data = FlatVector::GetData<timestamp_t>(received_at_vector);
+    for (idx_t row = 0; row < batch.size(); row++) {
+        const auto &entry = batch[row];
+        subject_data[row] = StringVector::AddString(subject_vector, entry.first);
+        if (types[1].id() == LogicalTypeId::BLOB) {
+            payload_data[row] = StringVector::AddStringOrBlob(payload_vector, entry.second.data(), entry.second.size());
+        } else {
+            payload_data[row] = StringVector::AddString(payload_vector, entry.second.data(), entry.second.size());
         }
-        DataChunk chunk;
-        chunk.Initialize(Allocator::Get(*conn.context), types, batch.size());
-        for (idx_t row = 0; row < batch.size(); row++) {
-            const auto &entry = batch[row];
-            chunk.SetValue(0, row, Value(entry.first));
-            chunk.SetValue(1, row, Value::BLOB_RAW(entry.second));
-            chunk.SetValue(2, row, Value::TIMESTAMP(Timestamp::GetCurrentTimestamp()));
+        received_at_data[row] = Timestamp::GetCurrentTimestamp();
+        if (!extracted_fields.empty()) {
             NatsPayloadView payload {entry.second.data(), entry.second.size()};
             if (!config.json_fields.empty()) {
                 DecodeJsonFieldsToChunk(chunk, row, 3, payload, config.json_fields);
@@ -570,15 +580,9 @@ static void FlushSubscribeBatch(Connection &conn, const NatsSubscribeConfig &con
                 }
             }
         }
-        chunk.SetCardinality(batch.size());
-        appender->AppendDataChunk(chunk);
-        appender->Flush();
-        return;
     }
-    for (auto &entry : batch) {
-        auto payload = types[1].id() == LogicalTypeId::BLOB ? Value::BLOB_RAW(entry.second) : Value(entry.second);
-        appender->AppendRow(Value(entry.first), payload, Value::TIMESTAMP(Timestamp::GetCurrentTimestamp()));
-    }
+    chunk.SetCardinality(batch.size());
+    appender->AppendDataChunk(chunk);
     appender->Flush();
 }
 
