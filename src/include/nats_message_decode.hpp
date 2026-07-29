@@ -22,6 +22,10 @@ void DecodeMsgpackFieldPathsToChunk(DataChunk &chunk, idx_t row_idx, const vecto
                                     const NatsPayloadView &payload,
                                     const vector<vector<string>> &field_paths);
 
+void DecodeCborFieldPathsToChunk(DataChunk &chunk, idx_t row_idx, const vector<idx_t> &output_columns,
+                                 const NatsPayloadView &payload,
+                                 const vector<vector<string>> &field_paths);
+
 bool DecodeProtobufPayload(google::protobuf::Message &message, const NatsPayloadView &payload);
 
 vector<const google::protobuf::FieldDescriptor *> ResolveProtobufFieldPath(

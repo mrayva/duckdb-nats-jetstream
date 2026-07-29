@@ -420,6 +420,8 @@ static NatsSubscribeConfig ParseSubscribeConfig(TableFunctionBindInput &input) {
             config.json_fields = GetNamedStringList(input.named_parameters, "json_extract");
         } else if (kv.first == "msgpack_extract") {
             config.msgpack_fields = GetNamedStringList(input.named_parameters, "msgpack_extract");
+        } else if (kv.first == "cbor_extract") {
+            config.cbor_fields = GetNamedStringList(input.named_parameters, "cbor_extract");
         } else if (kv.first == "proto_file") {
             config.proto_file = StringValue::Get(kv.second);
         } else if (kv.first == "proto_message") {
@@ -439,6 +441,7 @@ static NatsSubscribeConfig ParseSubscribeConfig(TableFunctionBindInput &input) {
     }
     auto extraction_modes = static_cast<int>(!config.json_fields.empty()) +
                             static_cast<int>(!config.msgpack_fields.empty()) +
+                            static_cast<int>(!config.cbor_fields.empty()) +
                             static_cast<int>(!config.proto_fields.empty());
     if (extraction_modes > 1) {
         throw std::runtime_error("Cannot combine JSON, MessagePack, and protobuf extraction parameters");
@@ -451,6 +454,9 @@ static NatsSubscribeConfig ParseSubscribeConfig(TableFunctionBindInput &input) {
     }
     if (!config.msgpack_fields.empty()) {
         config.msgpack_field_paths = SplitMsgpackFieldPaths(config.msgpack_fields);
+    }
+    if (!config.cbor_fields.empty()) {
+        config.cbor_field_paths = SplitMsgpackFieldPaths(config.cbor_fields);
     }
     if (config.batch_size == 0 || config.batch_size > 65536) {
         throw std::runtime_error("batch_size must be between 1 and 65536");
@@ -500,7 +506,8 @@ static void EnsureTargetTable(Connection &conn, const NatsSubscribeConfig &confi
         << QuoteIdentifier(config.payload_column) << " BLOB,"
         << "received_at TIMESTAMP";
     const auto &extracted_fields = !config.json_fields.empty() ? config.json_fields :
-                                   (!config.msgpack_fields.empty() ? config.msgpack_fields : config.proto_fields);
+                                   (!config.msgpack_fields.empty() ? config.msgpack_fields :
+                                    (!config.cbor_fields.empty() ? config.cbor_fields : config.proto_fields));
     for (const auto &field : extracted_fields) {
         string sql_type = "VARCHAR";
         if (!config.proto_fields.empty() && !config.proto_field_paths.empty()) {
@@ -542,7 +549,8 @@ static void FlushSubscribeBatch(Connection &conn, const NatsSubscribeConfig &con
     auto appender = CreateSubscribeAppender(conn, config.target_table);
     const auto &types = appender->GetActiveTypes();
     const auto &extracted_fields = !config.json_fields.empty() ? config.json_fields :
-                                   (!config.msgpack_fields.empty() ? config.msgpack_fields : config.proto_fields);
+                                   (!config.msgpack_fields.empty() ? config.msgpack_fields :
+                                    (!config.cbor_fields.empty() ? config.cbor_fields : config.proto_fields));
     if (types.size() != 3 + extracted_fields.size() || types[0].id() != LogicalTypeId::VARCHAR ||
         (types[1].id() != LogicalTypeId::VARCHAR && types[1].id() != LogicalTypeId::BLOB) ||
         types[2].id() != LogicalTypeId::TIMESTAMP) {
@@ -550,7 +558,7 @@ static void FlushSubscribeBatch(Connection &conn, const NatsSubscribeConfig &con
     }
     for (idx_t i = 0; i < extracted_fields.size(); i++) {
         if (config.proto_fields.empty() && types[3 + i].id() != LogicalTypeId::VARCHAR) {
-            throw std::runtime_error("JSON and MessagePack extraction columns must be VARCHAR");
+            throw std::runtime_error("JSON, MessagePack, and CBOR extraction columns must be VARCHAR");
         }
     }
     vector<idx_t> output_columns;
@@ -585,6 +593,8 @@ static void FlushSubscribeBatch(Connection &conn, const NatsSubscribeConfig &con
                 DecodeJsonFieldsToChunk(chunk, row, 3, payload, config.json_fields);
             } else if (!config.msgpack_fields.empty()) {
                 DecodeMsgpackFieldPathsToChunk(chunk, row, output_columns, payload, config.msgpack_field_paths);
+            } else if (!config.cbor_fields.empty()) {
+                DecodeCborFieldPathsToChunk(chunk, row, output_columns, payload, config.cbor_field_paths);
             } else if (proto_message) {
                 proto_message->Clear();
                 if (DecodeProtobufPayload(*proto_message, payload)) {
@@ -1135,6 +1145,7 @@ void NatsSubscribeFunction::Register(ExtensionLoader &loader) {
     start_fn.named_parameters["payload_column"] = LogicalType(LogicalTypeId::VARCHAR);
     start_fn.named_parameters["json_extract"] = LogicalType::LIST(LogicalType(LogicalTypeId::VARCHAR));
     start_fn.named_parameters["msgpack_extract"] = LogicalType::LIST(LogicalType(LogicalTypeId::VARCHAR));
+    start_fn.named_parameters["cbor_extract"] = LogicalType::LIST(LogicalType(LogicalTypeId::VARCHAR));
     start_fn.named_parameters["proto_file"] = LogicalType(LogicalTypeId::VARCHAR);
     start_fn.named_parameters["proto_message"] = LogicalType(LogicalTypeId::VARCHAR);
     start_fn.named_parameters["proto_extract"] = LogicalType::LIST(LogicalType(LogicalTypeId::VARCHAR));

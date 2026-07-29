@@ -266,6 +266,10 @@ DUCKDB_BIN="$DUCKDB_BIN" DUCKDB_LIB="$DUCKDB_LIB" EXTENSION_PATH="$EXTENSION_PAT
   NATS_URL="$NATS_URL" NATS_CLI="$NATS_CLI" "$ROOT_DIR/scripts/run-subscribe-protobuf-harness.sh"
 echo "PASS scripts/run-subscribe-protobuf-harness.sh"
 
+echo "RUN scripts/run-subscribe-cbor-harness.sh"
+  NATS_URL="$NATS_URL" NATS_CLI="$NATS_CLI" "$ROOT_DIR/scripts/run-subscribe-cbor-harness.sh"
+echo "PASS scripts/run-subscribe-cbor-harness.sh"
+
 echo "RUN scripts/run-subscribe-pause-resume-harness.sh"
 NATS_URL="$NATS_URL" \
 NATS_CLI="$NATS_CLI" \

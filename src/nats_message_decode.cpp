@@ -323,6 +323,179 @@ void DecodeMsgpackFieldPathsToChunk(DataChunk &chunk, idx_t row_idx, const vecto
     reader.Decode(chunk, row_idx, output_columns, field_paths);
 }
 
+namespace {
+
+class CborReader {
+public:
+    CborReader(const char *data_p, idx_t size_p)
+        : data(reinterpret_cast<const uint8_t *>(data_p)), remaining(size_p) {
+    }
+
+    bool Decode(DataChunk &chunk, idx_t row_idx, const vector<idx_t> &output_columns,
+                const vector<vector<string>> &field_paths) {
+        uint8_t tag;
+        return ReadByte(tag) && DecodeMap(tag, 0, chunk, row_idx, output_columns, field_paths);
+    }
+
+private:
+    bool ReadByte(uint8_t &value) {
+        if (!remaining) return false;
+        value = *data++;
+        remaining--;
+        return true;
+    }
+
+    bool ReadUnsigned(idx_t width, uint64_t &value) {
+        if (width > remaining || width > sizeof(uint64_t)) return false;
+        value = 0;
+        for (idx_t i = 0; i < width; i++) value = (value << 8) | *data++;
+        remaining -= width;
+        return true;
+    }
+
+    bool ReadArgument(uint8_t additional, uint64_t &value) {
+        if (additional < 24) {
+            value = additional;
+            return true;
+        }
+        if (additional == 24) return ReadUnsigned(1, value);
+        if (additional == 25) return ReadUnsigned(2, value);
+        if (additional == 26) return ReadUnsigned(4, value);
+        if (additional == 27) return ReadUnsigned(8, value);
+        return false;
+    }
+
+    bool ReadText(uint8_t additional, std::string_view &value) {
+        uint64_t length;
+        if (!ReadArgument(additional, length) || length > remaining) return false;
+        value = std::string_view(reinterpret_cast<const char *>(data), static_cast<size_t>(length));
+        data += length;
+        remaining -= length;
+        return true;
+    }
+
+    bool SetScalar(uint8_t major, uint8_t additional, Vector &vector, idx_t row_idx) {
+        auto set_string = [&](const char *value, idx_t length) {
+            FlatVector::SetNull(vector, row_idx, false);
+            FlatVector::GetData<string_t>(vector)[row_idx] = StringVector::AddString(vector, value, length);
+        };
+        if (major == 0 || major == 1) {
+            uint64_t value;
+            if (!ReadArgument(additional, value)) return false;
+            char buffer[64];
+            int length = major == 0 ? snprintf(buffer, sizeof(buffer), "%llu", (unsigned long long)value)
+                                    : snprintf(buffer, sizeof(buffer), "%lld", (long long)(-1 - value));
+            set_string(buffer, static_cast<idx_t>(length));
+            return true;
+        }
+        if (major == 3) {
+            std::string_view value;
+            if (!ReadText(additional, value)) return false;
+            set_string(value.data(), value.size());
+            return true;
+        }
+        if (major == 7 && (additional == 20 || additional == 21)) {
+            set_string(additional == 21 ? "true" : "false", additional == 21 ? 4 : 5);
+            return true;
+        }
+        if (major == 7 && additional == 22) {
+            FlatVector::SetNull(vector, row_idx, true);
+            return true;
+        }
+        if (major == 7 && (additional == 25 || additional == 26 || additional == 27)) {
+            uint64_t bits;
+            idx_t width = additional == 25 ? 2 : (additional == 26 ? 4 : 8);
+            if (!ReadUnsigned(width, bits)) return false;
+            char buffer[64];
+            double value = 0;
+            if (additional == 26) {
+                float f;
+                uint32_t raw = static_cast<uint32_t>(bits);
+                memcpy(&f, &raw, sizeof(f));
+                value = f;
+            } else if (additional == 27) {
+                memcpy(&value, &bits, sizeof(value));
+            }
+            auto length = snprintf(buffer, sizeof(buffer), "%f", value);
+            set_string(buffer, static_cast<idx_t>(length));
+            return true;
+        }
+        return false;
+    }
+
+    bool ReadMapCount(uint8_t additional, uint64_t &count) {
+        return ReadArgument(additional, count);
+    }
+
+    bool DecodeMap(uint8_t tag, idx_t depth, DataChunk &chunk, idx_t row_idx,
+                   const vector<idx_t> &output_columns, const vector<vector<string>> &field_paths) {
+        if ((tag >> 5) != 5) return false;
+        uint64_t count;
+        if (!ReadMapCount(tag & 0x1f, count)) return false;
+        for (uint64_t i = 0; i < count; i++) {
+            uint8_t key_tag, value_tag;
+            std::string_view key;
+            if (!ReadByte(key_tag) || (key_tag >> 5) != 3 || !ReadText(key_tag & 0x1f, key) || !ReadByte(value_tag)) {
+                return false;
+            }
+            idx_t matched = DConstants::INVALID_INDEX;
+            for (idx_t field = 0; field < field_paths.size(); field++) {
+                if (depth < field_paths[field].size() && key == field_paths[field][depth]) {
+                    matched = field;
+                    break;
+                }
+            }
+            uint8_t major = value_tag >> 5;
+            if (matched != DConstants::INVALID_INDEX && depth + 1 == field_paths[matched].size()) {
+                auto &vector = chunk.data[output_columns[matched]];
+                if (!SetScalar(major, value_tag & 0x1f, vector, row_idx) && !Skip(value_tag)) return false;
+            } else if (matched != DConstants::INVALID_INDEX && major == 5) {
+                if (!DecodeMap(value_tag, depth + 1, chunk, row_idx, output_columns, field_paths)) return false;
+            } else if (!Skip(value_tag)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    bool Skip(uint8_t tag) {
+        uint8_t major = tag >> 5;
+        uint8_t additional = tag & 0x1f;
+        uint64_t count;
+        if (major <= 1) return ReadArgument(additional, count);
+        if (major == 2 || major == 3) {
+            return ReadArgument(additional, count) && count <= remaining && (data += count, remaining -= count, true);
+        }
+        if (major == 4 || major == 5) {
+            if (!ReadArgument(additional, count)) return false;
+            uint64_t elements = major == 5 ? count * 2 : count;
+            for (uint64_t i = 0; i < elements; i++) {
+                uint8_t child;
+                if (!ReadByte(child) || !Skip(child)) return false;
+            }
+            return true;
+        }
+        if (major == 6) {
+            return ReadArgument(additional, count) && ReadByte(additional) && Skip(additional);
+        }
+        if (additional < 24) return true;
+        return additional == 24 ? ReadUnsigned(1, count) : additional == 25 ? ReadUnsigned(2, count) :
+               additional == 26 ? ReadUnsigned(4, count) : additional == 27 ? ReadUnsigned(8, count) : false;
+    }
+
+    const uint8_t *data;
+    idx_t remaining;
+};
+
+} // namespace
+
+void DecodeCborFieldPathsToChunk(DataChunk &chunk, idx_t row_idx, const vector<idx_t> &output_columns,
+                                 const NatsPayloadView &payload, const vector<vector<string>> &field_paths) {
+    for (auto output_column : output_columns) FlatVector::SetNull(chunk.data[output_column], row_idx, true);
+    CborReader reader(payload.data, payload.size);
+    reader.Decode(chunk, row_idx, output_columns, field_paths);
+}
+
 bool DecodeProtobufPayload(google::protobuf::Message &message, const NatsPayloadView &payload) {
     return message.ParseFromArray(payload.data, static_cast<int>(payload.size));
 }
