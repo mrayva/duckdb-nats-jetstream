@@ -79,6 +79,9 @@ struct NatsIngestJobState {
     std::mutex job_mutex;
     std::condition_variable cv;
     std::thread worker;
+    string lease_owner_id;
+    uint64_t fencing_token = 0;
+    int lease_fd = -1;
     natsConnection *conn = nullptr;
     jsCtx *js = nullptr;
     natsSubscription *sub = nullptr;

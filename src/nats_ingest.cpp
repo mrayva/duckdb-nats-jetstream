@@ -18,9 +18,16 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <sstream>
 #include <unordered_set>
+#ifndef _WIN32
+#include <cerrno>
+#include <fcntl.h>
+#include <sys/file.h>
+#include <unistd.h>
+#endif
 #include <nats/nats.h>
 #include <google/protobuf/compiler/importer.h>
 #include <google/protobuf/dynamic_message.h>
@@ -151,6 +158,8 @@ struct NatsIngestControlGlobalState : public GlobalTableFunctionState {
 static constexpr const char *NATS_INGEST_CHECKPOINT_TABLE = "duckdb_nats_ingest_checkpoints";
 static constexpr const char *NATS_INGEST_CHECKPOINT_LOG_TABLE = "duckdb_nats_ingest_checkpoint_log";
 static constexpr const char *NATS_INGEST_REGISTRY_TABLE = "duckdb_nats_ingest_jobs";
+static constexpr const char *NATS_INGEST_LEASE_TABLE = "duckdb_nats_ingest_leases";
+static constexpr int64_t NATS_INGEST_LEASE_SECONDS = 30;
 
 static NatsIngestSnapshot SnapshotJob(const shared_ptr<NatsIngestJobState> &job);
 static NatsIngestConfig SnapshotToConfig(const NatsIngestSnapshot &snapshot);
@@ -161,6 +170,10 @@ static void EnsureTargetTable(Connection &conn, NatsIngestConfig &config);
 static void IngestDisconnected(natsConnection *, void *closure);
 static void IngestReconnected(natsConnection *, void *closure);
 static void IngestClosed(natsConnection *, void *closure);
+static void ClaimIngestLease(Connection &conn, const shared_ptr<NatsIngestJobState> &job);
+static void AcquireIngestProcessLock(const shared_ptr<NatsIngestJobState> &job);
+static void FenceIngestCommit(Connection &conn, const shared_ptr<NatsIngestJobState> &job);
+static void ReleaseIngestLease(const shared_ptr<NatsIngestJobState> &job);
 
 static string SqlStringLiteral(const string &value) {
     string result = "'";
@@ -321,6 +334,143 @@ static void EnsureRegistryTable(Connection &conn) {
                    "UPDATE " + string(NATS_INGEST_REGISTRY_TABLE) +
                        " SET duplicates_skipped = COALESCE(duplicates_skipped, 0)",
                    "Failed to backfill ingest duplicate metrics");
+    ExecuteOrThrow(conn,
+                   "CREATE TABLE IF NOT EXISTS " + string(NATS_INGEST_LEASE_TABLE) + " ("
+                   "stream_name VARCHAR NOT NULL,"
+                   "durable_name VARCHAR NOT NULL,"
+                   "owner_id VARCHAR NOT NULL,"
+                   "job_name VARCHAR NOT NULL,"
+                   "fencing_token UBIGINT NOT NULL,"
+                   "lease_until TIMESTAMP NOT NULL,"
+                   "updated_at TIMESTAMP NOT NULL,"
+                   "PRIMARY KEY(stream_name, durable_name))",
+                   "Failed to create ingest lease table");
+}
+
+static string LeaseConflictMessage(const NatsIngestConfig &config) {
+    return "Ingest lease for stream '" + config.stream_name + "' and durable '" + config.durable_name +
+           "' is held by another process";
+}
+
+static string LeaseNowSql() {
+    return "CAST(" + SqlStringLiteral(Timestamp::ToString(Timestamp::GetCurrentTimestamp())) + " AS TIMESTAMP)";
+}
+
+static void AcquireIngestProcessLock(const shared_ptr<NatsIngestJobState> &job) {
+#ifndef _WIN32
+    auto lock_key = job->config.connection.url + "\n" + job->config.stream_name + "\n" + job->config.durable_name;
+    auto lock_name = std::string("/tmp/duckdb_nats_ingest_") + std::to_string(std::hash<string> {}(lock_key)) + ".lock";
+    auto fd = open(lock_name.c_str(), O_CREAT | O_RDWR, 0600);
+    if (fd < 0) {
+        throw std::runtime_error("Failed to open ingest ownership lock: " + string(std::strerror(errno)));
+    }
+    if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
+        auto error = errno;
+        close(fd);
+        if (error == EWOULDBLOCK || error == EAGAIN) {
+            throw std::runtime_error(LeaseConflictMessage(job->config));
+        }
+        throw std::runtime_error("Failed to acquire ingest ownership lock: " + string(std::strerror(error)));
+    }
+    job->lease_fd = fd;
+#else
+    (void)job;
+#endif
+}
+
+static void ClaimIngestLease(Connection &conn, const shared_ptr<NatsIngestJobState> &job) {
+    EnsureActiveTransaction(conn);
+    MarkTransactionWrite(conn);
+    try {
+        auto now_sql = LeaseNowSql();
+        std::ostringstream sql;
+        sql << "INSERT INTO " << NATS_INGEST_LEASE_TABLE
+            << " (stream_name, durable_name, owner_id, job_name, fencing_token, lease_until, updated_at) VALUES ("
+            << SqlStringLiteral(job->config.stream_name) << ", "
+            << SqlStringLiteral(job->config.durable_name) << ", "
+            << SqlStringLiteral(job->lease_owner_id) << ", "
+            << SqlStringLiteral(job->config.job_name) << ", 1, " << now_sql << " + INTERVAL '"
+            << NATS_INGEST_LEASE_SECONDS << " seconds', " << now_sql << ") ON CONFLICT(stream_name, durable_name) DO NOTHING";
+        ExecuteOrThrow(conn, sql.str(), "Failed to claim ingest lease");
+
+        sql.str("");
+        sql.clear();
+        sql << "UPDATE " << NATS_INGEST_LEASE_TABLE << " SET owner_id = " << SqlStringLiteral(job->lease_owner_id)
+            << ", job_name = " << SqlStringLiteral(job->config.job_name) << ", fencing_token = fencing_token + 1, "
+            << "lease_until = " << now_sql << " + INTERVAL '" << NATS_INGEST_LEASE_SECONDS
+            << " seconds', updated_at = " << now_sql << " WHERE stream_name = "
+            << SqlStringLiteral(job->config.stream_name) << " AND durable_name = "
+            << SqlStringLiteral(job->config.durable_name) << " AND (";
+        if (job->lease_fd >= 0) {
+            sql << "TRUE";
+        } else {
+            sql << "lease_until <= " << now_sql << " OR owner_id = " << SqlStringLiteral(job->lease_owner_id);
+        }
+        sql << ")";
+        ExecuteOrThrow(conn, sql.str(), "Failed to update ingest lease claim");
+
+        auto result = conn.Query("SELECT owner_id, fencing_token FROM " + string(NATS_INGEST_LEASE_TABLE) +
+                                " WHERE stream_name = " + SqlStringLiteral(job->config.stream_name) +
+                                " AND durable_name = " + SqlStringLiteral(job->config.durable_name));
+        if (result->HasError()) {
+            throw std::runtime_error("Failed to inspect ingest lease: " + result->GetError());
+        }
+        auto chunk = result->Fetch();
+        if (!chunk || chunk->size() == 0 || chunk->GetValue(0, 0).GetValue<string>() != job->lease_owner_id) {
+            throw std::runtime_error(LeaseConflictMessage(job->config));
+        }
+        job->fencing_token = chunk->GetValue(1, 0).GetValue<uint64_t>();
+        conn.Commit();
+    } catch (...) {
+        try {
+            conn.Rollback();
+        } catch (...) {
+        }
+        throw;
+    }
+}
+
+static void FenceIngestCommit(Connection &conn, const shared_ptr<NatsIngestJobState> &job) {
+    auto now_sql = LeaseNowSql();
+    std::ostringstream sql;
+    sql << "UPDATE " << NATS_INGEST_LEASE_TABLE << " SET lease_until = " << now_sql << " + INTERVAL '"
+        << NATS_INGEST_LEASE_SECONDS << " seconds', updated_at = " << now_sql << " WHERE stream_name = "
+        << SqlStringLiteral(job->config.stream_name) << " AND durable_name = "
+        << SqlStringLiteral(job->config.durable_name) << " AND owner_id = " << SqlStringLiteral(job->lease_owner_id)
+        << " AND fencing_token = " << job->fencing_token << " AND lease_until > " << now_sql << " RETURNING fencing_token";
+    auto result = conn.Query(sql.str());
+    if (result->HasError()) {
+        throw std::runtime_error("Failed to fence ingest commit: " + result->GetError());
+    }
+    auto chunk = result->Fetch();
+    if (!chunk || chunk->size() == 0) {
+        throw std::runtime_error(LeaseConflictMessage(job->config));
+    }
+}
+
+static void ReleaseIngestLease(const shared_ptr<NatsIngestJobState> &job) {
+    if (!job->db || job->lease_owner_id.empty() || job->fencing_token == 0) {
+        return;
+    }
+    try {
+        Connection conn(*job->db);
+        EnsureActiveTransaction(conn);
+        MarkTransactionWrite(conn);
+        ExecuteOrThrow(conn, "DELETE FROM " + string(NATS_INGEST_LEASE_TABLE) + " WHERE stream_name = " +
+                                 SqlStringLiteral(job->config.stream_name) + " AND durable_name = " +
+                                 SqlStringLiteral(job->config.durable_name) + " AND owner_id = " +
+                                 SqlStringLiteral(job->lease_owner_id) + " AND fencing_token = " +
+                                 std::to_string(job->fencing_token),
+                       "Failed to release ingest lease");
+        conn.Commit();
+    } catch (...) {
+    }
+#ifndef _WIN32
+    if (job->lease_fd >= 0) {
+        close(job->lease_fd);
+        job->lease_fd = -1;
+    }
+#endif
 }
 
 static void UpsertRegistry(Connection &conn, const NatsIngestSnapshot &snapshot) {
@@ -1358,6 +1508,12 @@ static shared_ptr<NatsIngestJobState> LaunchIngestJob(const NatsIngestConfig &co
         } else {
             throw std::runtime_error("Missing database context for ingest job launch");
         }
+        {
+            Connection db_connection(*job->db);
+            EnsureRegistryTable(db_connection);
+            AcquireIngestProcessLock(job);
+            ClaimIngestLease(db_connection, job);
+        }
         InitializeIngestResources(job);
         if (restore_snapshot != nullptr) {
             RestoreJobProgress(job, *restore_snapshot);
@@ -1370,6 +1526,7 @@ static shared_ptr<NatsIngestJobState> LaunchIngestJob(const NatsIngestConfig &co
         job->worker = std::thread([job]() { RunIngestWorker(job); });
         return job;
     } catch (...) {
+        ReleaseIngestLease(job);
         NatsIngestManager::Get().RemoveJob(job->config.job_name);
         throw;
     }
@@ -1994,6 +2151,7 @@ static void RunIngestWorker(const shared_ptr<NatsIngestJobState> &job) {
                 try {
                     batch_stage = "commit transaction";
                     phase_start = std::chrono::steady_clock::now();
+                    FenceIngestCommit(db_connection, job);
                     db_connection.Commit();
                     timing.commit_ns += static_cast<uint64_t>(
                         std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - phase_start)
@@ -2091,6 +2249,7 @@ static void RunIngestWorker(const shared_ptr<NatsIngestJobState> &job) {
         }
         job->cv.notify_all();
         PersistRegistry(db_connection, job);
+        ReleaseIngestLease(job);
     } catch (const std::exception &ex) {
         {
             lock_guard<std::mutex> guard(job->job_mutex);
@@ -2111,6 +2270,7 @@ static void RunIngestWorker(const shared_ptr<NatsIngestJobState> &job) {
             } catch (...) {
             }
         }
+        ReleaseIngestLease(job);
     } catch (...) {
         {
             lock_guard<std::mutex> guard(job->job_mutex);
@@ -2131,10 +2291,14 @@ static void RunIngestWorker(const shared_ptr<NatsIngestJobState> &job) {
             } catch (...) {
             }
         }
+        ReleaseIngestLease(job);
     }
 }
 
 NatsIngestJobState::NatsIngestJobState(NatsIngestConfig config_p) : config(std::move(config_p)) {
+    auto now = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+    auto thread_id = std::hash<std::thread::id> {}(std::this_thread::get_id());
+    lease_owner_id = config.job_name + ":" + std::to_string(now) + ":" + std::to_string(thread_id);
 }
 
 NatsIngestJobState::~NatsIngestJobState() {

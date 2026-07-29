@@ -219,6 +219,10 @@ Use `scripts/run-ingest-exactly-once-harness.sh` to force a post-commit
 redelivery across a server restart and verify that the target row count stays
 exactly once; `duplicates_skipped` reports messages discarded by checkpoint or
 same-batch sequence deduplication.
+Ingest jobs also claim a lease keyed by stream and durable name. A fencing token
+is refreshed and checked in the same transaction as each target commit, so a
+second DuckDB process cannot write concurrently with an active owner. Run
+`scripts/run-ingest-ownership-harness.sh` to exercise cross-process contention.
 
 ## Authentication And TLS
 
