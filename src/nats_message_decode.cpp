@@ -5,6 +5,7 @@
 #include <cstring>
 #include <iomanip>
 #include <sstream>
+#include <unordered_map>
 
 using namespace duckdb_yyjson;
 
@@ -17,35 +18,9 @@ public:
     MsgpackReader(const char *data, idx_t size) : data(reinterpret_cast<const uint8_t *>(data)), remaining(size) {
     }
 
-    bool FindField(const vector<string> &path, idx_t path_idx, string &value) {
+    bool Collect(unordered_map<string, string> &values) {
         uint8_t tag;
-        if (!ReadByte(tag)) {
-            return false;
-        }
-        if ((tag & 0xf0) == 0x80 || tag == 0xde || tag == 0xdf) {
-            uint32_t count;
-            if (!ReadMapCount(tag, count)) {
-                return false;
-            }
-            for (uint32_t i = 0; i < count; i++) {
-                string key;
-                uint8_t key_tag;
-                if (!ReadByte(key_tag) || !ReadString(key_tag, key) || !SkipValueStart()) {
-                    return false;
-                }
-                if (key == path[path_idx]) {
-                    if (path_idx + 1 == path.size()) {
-                        return ReadScalarValue(value);
-                    }
-                    return FindField(path, path_idx + 1, value);
-                }
-                if (!SkipValue()) {
-                    return false;
-                }
-            }
-            return false;
-        }
-        return false;
+        return ReadByte(tag) && CollectMap(tag, "", values);
     }
 
 private:
@@ -110,13 +85,11 @@ private:
         return ReadBytes(value.data(), length);
     }
 
-    bool SkipValueStart() {
-        return true;
-    }
-
-    bool ReadScalarValue(string &value) {
+    bool ReadScalarValue(string &value, bool tag_already_read = false, uint8_t supplied_tag = 0) {
         uint8_t tag;
-        if (!ReadByte(tag)) {
+        if (tag_already_read) {
+            tag = supplied_tag;
+        } else if (!ReadByte(tag)) {
             return false;
         }
         if ((tag & 0xe0) == 0xa0 || tag == 0xd9 || tag == 0xda || tag == 0xdb) {
@@ -180,9 +153,38 @@ private:
         }
     }
 
+    bool CollectMap(uint8_t tag, const string &prefix, unordered_map<string, string> &values) {
+        uint32_t count;
+        if (!((tag & 0xf0) == 0x80 || tag == 0xde || tag == 0xdf) || !ReadMapCount(tag, count)) {
+            return false;
+        }
+        for (uint32_t i = 0; i < count; i++) {
+            uint8_t key_tag;
+            string key;
+            if (!ReadByte(key_tag) || !ReadString(key_tag, key)) {
+                return false;
+            }
+            string path = prefix.empty() ? key : prefix + "." + key;
+            uint8_t value_tag;
+            if (!ReadByte(value_tag)) {
+                return false;
+            }
+            if ((value_tag & 0xf0) == 0x80 || value_tag == 0xde || value_tag == 0xdf) {
+                if (!CollectMap(value_tag, path, values)) return false;
+            } else if (!ReadScalarValue(values[path], true, value_tag)) {
+                if (!SkipValueAfterTag(value_tag)) return false;
+            }
+        }
+        return true;
+    }
+
     bool SkipValue() {
         uint8_t tag;
         if (!ReadByte(tag)) return false;
+        return SkipValueAfterTag(tag);
+    }
+
+    bool SkipValueAfterTag(uint8_t tag) {
         if (tag <= 0x7f || tag >= 0xe0) return true;
         if ((tag & 0xe0) == 0xa0) {
             return remaining >= (tag & 0x1f) ? (data += (tag & 0x1f), remaining -= (tag & 0x1f), true) : false;
@@ -218,17 +220,6 @@ private:
     const uint8_t *data;
     idx_t remaining;
 };
-
-static vector<string> SplitMsgpackPath(const string &path) {
-    vector<string> result;
-    size_t start = 0;
-    while (true) {
-        auto end = path.find('.', start);
-        result.push_back(path.substr(start, end == string::npos ? string::npos : end - start));
-        if (end == string::npos) return result;
-        start = end + 1;
-    }
-}
 
 } // namespace
 
@@ -311,14 +302,25 @@ void DecodeJsonFieldsToChunk(DataChunk &chunk, idx_t row_idx, idx_t first_column
 
 void DecodeMsgpackFieldsToChunk(DataChunk &chunk, idx_t row_idx, idx_t first_column,
                                 const NatsPayloadView &payload, const vector<string> &field_names) {
+    vector<idx_t> output_columns;
+    output_columns.reserve(field_names.size());
     for (idx_t i = 0; i < field_names.size(); i++) {
-        auto &vector = chunk.data[first_column + i];
-        string value;
-        MsgpackReader reader(payload.data, payload.size);
-        auto path = SplitMsgpackPath(field_names[i]);
-        if (reader.FindField(path, 0, value)) {
+        output_columns.push_back(first_column + i);
+    }
+    DecodeMsgpackProjectedFieldsToChunk(chunk, row_idx, output_columns, payload, field_names);
+}
+
+void DecodeMsgpackProjectedFieldsToChunk(DataChunk &chunk, idx_t row_idx, const vector<idx_t> &output_columns,
+                                         const NatsPayloadView &payload, const vector<string> &field_names) {
+    unordered_map<string, string> values;
+    MsgpackReader reader(payload.data, payload.size);
+    bool valid = reader.Collect(values);
+    for (idx_t i = 0; i < field_names.size(); i++) {
+        auto &vector = chunk.data[output_columns[i]];
+        auto value = values.find(field_names[i]);
+        if (valid && value != values.end()) {
             auto vector_data = FlatVector::GetData<string_t>(vector);
-            vector_data[row_idx] = StringVector::AddString(vector, value);
+            vector_data[row_idx] = StringVector::AddString(vector, value->second);
         } else {
             FlatVector::SetNull(vector, row_idx, true);
         }

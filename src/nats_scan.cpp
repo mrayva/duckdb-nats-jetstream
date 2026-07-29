@@ -1100,10 +1100,15 @@ static void NatsScanExecute(ClientContext &context, TableFunctionInput &data_p, 
         }
 
         if (needs_msgpack && !bind_data.msgpack_fields.empty()) {
+            vector<idx_t> output_columns;
+            vector<string> field_names;
+            output_columns.reserve(msgpack_columns.size());
+            field_names.reserve(msgpack_columns.size());
             for (const auto &msgpack_column : msgpack_columns) {
-                vector<string> field_name {bind_data.msgpack_fields[msgpack_column.field_idx]};
-                DecodeMsgpackFieldsToChunk(output, count, msgpack_column.output_idx, payload, field_name);
+                output_columns.push_back(msgpack_column.output_idx);
+                field_names.push_back(bind_data.msgpack_fields[msgpack_column.field_idx]);
             }
+            DecodeMsgpackProjectedFieldsToChunk(output, count, output_columns, payload, field_names);
         }
 
         if (needs_proto && proto_msg) {
