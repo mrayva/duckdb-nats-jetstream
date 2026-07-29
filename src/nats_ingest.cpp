@@ -1252,6 +1252,7 @@ static void InitializeIngestResources(const shared_ptr<NatsIngestJobState> &job)
     sub_opts.Config.Durable = nullptr;
     sub_opts.Config.DeliverPolicy = js_DeliverByStartSequence;
     sub_opts.Config.AckPolicy = js_AckExplicit;
+    sub_opts.Config.AckWait = 5LL * 1000LL * 1000LL * 1000LL;
     sub_opts.Config.ReplayPolicy = js_ReplayInstant;
     sub_opts.Config.InactiveThreshold = 60LL * 1000LL * 1000LL * 1000LL;
 
@@ -1274,10 +1275,20 @@ static void InitializeIngestResources(const shared_ptr<NatsIngestJobState> &job)
     jsConsumerInfo *consumer_info = nullptr;
     auto consumer_status = js_GetConsumerInfo(&consumer_info, js, config.stream_name.c_str(),
                                                config.durable_name.c_str(), nullptr, nullptr);
+    bool recreate_existing_consumer = consumer_info != nullptr && consumer_info->NumAckPending > 0;
     if (consumer_info != nullptr) {
         jsConsumerInfo_Destroy(consumer_info);
     }
-    bool bind_existing_consumer = consumer_status == NATS_OK;
+    bool bind_existing_consumer = consumer_status == NATS_OK && !recreate_existing_consumer;
+    if (recreate_existing_consumer) {
+        auto delete_status = js_DeleteConsumer(js, config.stream_name.c_str(), config.durable_name.c_str(), nullptr, &js_err);
+        if (delete_status != NATS_OK) {
+            jsStreamInfo_Destroy(stream_info);
+            DisconnectJetStream(&conn, &js);
+            throw std::runtime_error(std::string("Failed to reset pending JetStream consumer for '") +
+                                     config.stream_name + "': " + natsStatus_GetText(delete_status));
+        }
+    }
     sub_opts.Consumer = bind_existing_consumer ? config.durable_name.c_str() : nullptr;
     const char *durable = bind_existing_consumer ? nullptr : config.durable_name.c_str();
     s = js_PullSubscribe(&sub, js, subscription_subject.c_str(), durable, nullptr, &sub_opts, &js_err);
@@ -1628,6 +1639,15 @@ static void RunIngestWorker(const shared_ptr<NatsIngestJobState> &job) {
         const char *fail_after_commit_env = std::getenv("NATS_INGEST_FAIL_AFTER_COMMIT");
         bool inject_fail_after_commit = fail_after_commit_env != nullptr && string(fail_after_commit_env) != "0";
         bool injected_fail_after_commit = false;
+        uint64_t fail_after_append_rows = 0;
+        const char *fail_after_append_env = std::getenv("NATS_INGEST_FAIL_AFTER_APPEND");
+        if (fail_after_append_env != nullptr) {
+            char *end = nullptr;
+            auto parsed_rows = std::strtoull(fail_after_append_env, &end, 10);
+            if (end != fail_after_append_env && *end == '\0' && parsed_rows > 0) {
+                fail_after_append_rows = parsed_rows;
+            }
+        }
 
         shared_ptr<DiskSourceTree> source_tree;
         shared_ptr<ProtobufErrorCollector> error_collector;
@@ -1840,6 +1860,9 @@ static void RunIngestWorker(const shared_ptr<NatsIngestJobState> &job) {
                     write_row++;
                     write_chunk.SetCardinality(write_row);
                     inserted_rows++;
+                    if (fail_after_append_rows > 0 && inserted_rows >= fail_after_append_rows) {
+                        std::abort();
+                    }
 
                     if (write_row == write_chunk.GetCapacity()) {
                         batch_stage = "append chunk";

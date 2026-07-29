@@ -254,6 +254,8 @@ To compare the current JSON extraction path against direct `DataChunk` vector wr
 
 Set `NATS_INGEST_PROFILE=1` to emit cumulative worker phase timings. Registry progress is persisted every eight
 committed batches by default; set `NATS_INGEST_REGISTRY_INTERVAL=1` when per-batch registry durability is required.
+For transactional recovery testing, use `scripts/run-ingest-inflight-recovery-harness.sh`; it crashes after
+two rows are appended but before commit, then verifies replay and exactly-once final insertion.
 Ingest uses a bounded one-batch JetStream prefetch queue to overlap transport fetches with DuckDB processing.
 The transport window defaults to `4 * batch_size`; set `NATS_INGEST_TRANSPORT_BATCH_MULTIPLIER=1` for the
 one-batch baseline.
