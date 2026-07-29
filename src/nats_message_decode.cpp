@@ -2,9 +2,235 @@
 
 #include "yyjson.hpp"
 
+#include <cstring>
+#include <iomanip>
+#include <sstream>
+
 using namespace duckdb_yyjson;
 
 namespace duckdb {
+
+namespace {
+
+class MsgpackReader {
+public:
+    MsgpackReader(const char *data, idx_t size) : data(reinterpret_cast<const uint8_t *>(data)), remaining(size) {
+    }
+
+    bool FindField(const vector<string> &path, idx_t path_idx, string &value) {
+        uint8_t tag;
+        if (!ReadByte(tag)) {
+            return false;
+        }
+        if ((tag & 0xf0) == 0x80 || tag == 0xde || tag == 0xdf) {
+            uint32_t count;
+            if (!ReadMapCount(tag, count)) {
+                return false;
+            }
+            for (uint32_t i = 0; i < count; i++) {
+                string key;
+                uint8_t key_tag;
+                if (!ReadByte(key_tag) || !ReadString(key_tag, key) || !SkipValueStart()) {
+                    return false;
+                }
+                if (key == path[path_idx]) {
+                    if (path_idx + 1 == path.size()) {
+                        return ReadScalarValue(value);
+                    }
+                    return FindField(path, path_idx + 1, value);
+                }
+                if (!SkipValue()) {
+                    return false;
+                }
+            }
+            return false;
+        }
+        return false;
+    }
+
+private:
+    bool ReadByte(uint8_t &value) {
+        if (remaining == 0) {
+            return false;
+        }
+        value = *data++;
+        remaining--;
+        return true;
+    }
+
+    bool ReadBytes(void *out, idx_t count) {
+        if (count > remaining) {
+            return false;
+        }
+        memcpy(out, data, count);
+        data += count;
+        remaining -= count;
+        return true;
+    }
+
+    bool ReadUnsigned(idx_t width, uint64_t &value) {
+        if (width > remaining || width > sizeof(uint64_t)) {
+            return false;
+        }
+        value = 0;
+        for (idx_t i = 0; i < width; i++) {
+            value = (value << 8) | *data++;
+        }
+        remaining -= width;
+        return true;
+    }
+
+    bool ReadMapCount(uint8_t tag, uint32_t &count) {
+        if ((tag & 0xf0) == 0x80) {
+            count = tag & 0x0f;
+            return true;
+        }
+        uint64_t value;
+        if (!ReadUnsigned(tag == 0xde ? 2 : 4, value)) {
+            return false;
+        }
+        count = static_cast<uint32_t>(value);
+        return true;
+    }
+
+    bool ReadString(uint8_t tag, string &value) {
+        idx_t length;
+        if ((tag & 0xe0) == 0xa0) {
+            length = tag & 0x1f;
+        } else if (tag == 0xd9 || tag == 0xda || tag == 0xdb) {
+            uint64_t size;
+            if (!ReadUnsigned(tag == 0xd9 ? 1 : (tag == 0xda ? 2 : 4), size)) {
+                return false;
+            }
+            length = static_cast<idx_t>(size);
+        } else {
+            return false;
+        }
+        value.resize(length);
+        return ReadBytes(value.data(), length);
+    }
+
+    bool SkipValueStart() {
+        return true;
+    }
+
+    bool ReadScalarValue(string &value) {
+        uint8_t tag;
+        if (!ReadByte(tag)) {
+            return false;
+        }
+        if ((tag & 0xe0) == 0xa0 || tag == 0xd9 || tag == 0xda || tag == 0xdb) {
+            return ReadString(tag, value);
+        }
+        if (tag <= 0x7f) {
+            value = std::to_string(tag);
+            return true;
+        }
+        if (tag >= 0xe0) {
+            value = std::to_string(static_cast<int8_t>(tag));
+            return true;
+        }
+        uint64_t number;
+        switch (tag) {
+        case 0xc0:
+            return false;
+        case 0xc2:
+            value = "false";
+            return true;
+        case 0xc3:
+            value = "true";
+            return true;
+        case 0xcc:
+        case 0xcd:
+        case 0xce:
+        case 0xcf:
+            if (!ReadUnsigned(tag == 0xcc ? 1 : (tag == 0xcd ? 2 : (tag == 0xce ? 4 : 8)), number)) return false;
+            value = std::to_string(number);
+            return true;
+        case 0xd0:
+        case 0xd1:
+        case 0xd2:
+        case 0xd3: {
+            if (!ReadUnsigned(tag == 0xd0 ? 1 : (tag == 0xd1 ? 2 : (tag == 0xd2 ? 4 : 8)), number)) return false;
+            int64_t signed_value;
+            if (tag == 0xd0) signed_value = static_cast<int8_t>(number);
+            else if (tag == 0xd1) signed_value = static_cast<int16_t>(number);
+            else if (tag == 0xd2) signed_value = static_cast<int32_t>(number);
+            else signed_value = static_cast<int64_t>(number);
+            value = std::to_string(signed_value);
+            return true;
+        }
+        case 0xca: {
+            if (!ReadUnsigned(4, number)) return false;
+            uint32_t bits = static_cast<uint32_t>(number);
+            float number_value;
+            memcpy(&number_value, &bits, sizeof(number_value));
+            value = std::to_string(number_value);
+            return true;
+        }
+        case 0xcb: {
+            if (!ReadUnsigned(8, number)) return false;
+            double number_value;
+            memcpy(&number_value, &number, sizeof(number_value));
+            value = std::to_string(number_value);
+            return true;
+        }
+        default:
+            return false;
+        }
+    }
+
+    bool SkipValue() {
+        uint8_t tag;
+        if (!ReadByte(tag)) return false;
+        if (tag <= 0x7f || tag >= 0xe0) return true;
+        if ((tag & 0xe0) == 0xa0) {
+            return remaining >= (tag & 0x1f) ? (data += (tag & 0x1f), remaining -= (tag & 0x1f), true) : false;
+        }
+        if ((tag & 0xf0) == 0x90) {
+            for (uint32_t i = 0; i < (tag & 0x0f); i++) if (!SkipValue()) return false;
+            return true;
+        }
+        uint32_t count;
+        uint64_t number;
+        if ((tag & 0xf0) == 0x80 || tag == 0xde || tag == 0xdf) {
+            if (!ReadMapCount(tag, count)) return false;
+            for (uint32_t i = 0; i < count; i++) if (!SkipValue() || !SkipValue()) return false;
+            return true;
+        }
+        idx_t bytes = 0;
+        switch (tag) {
+        case 0xc0: case 0xc2: case 0xc3: return true;
+        case 0xcc: case 0xd0: bytes = 1; break;
+        case 0xcd: case 0xd1: bytes = 2; break;
+        case 0xce: case 0xd2: case 0xca: bytes = 4; break;
+        case 0xcf: case 0xd3: case 0xcb: bytes = 8; break;
+        case 0xd9: case 0xc4: if (!ReadUnsigned(1, number)) return false; bytes = number; break;
+        case 0xda: case 0xc5: if (!ReadUnsigned(2, number)) return false; bytes = number; break;
+        case 0xdb: case 0xc6: if (!ReadUnsigned(4, number)) return false; bytes = number; break;
+        case 0xdc: if (!ReadUnsigned(2, number)) return false; for (uint32_t i = 0; i < number; i++) if (!SkipValue()) return false; return true;
+        case 0xdd: if (!ReadUnsigned(4, number)) return false; for (uint32_t i = 0; i < number; i++) if (!SkipValue()) return false; return true;
+        default: return false;
+        }
+        return bytes <= remaining ? (data += bytes, remaining -= bytes, true) : false;
+    }
+
+    const uint8_t *data;
+    idx_t remaining;
+};
+
+static vector<string> SplitMsgpackPath(const string &path) {
+    vector<string> result;
+    size_t start = 0;
+    while (true) {
+        auto end = path.find('.', start);
+        result.push_back(path.substr(start, end == string::npos ? string::npos : end - start));
+        if (end == string::npos) return result;
+        start = end + 1;
+    }
+}
+
+} // namespace
 
 void DecodeJsonFields(const NatsPayloadView &payload, const vector<string> &field_names, vector<Value> &values) {
     // Reuse the caller-owned buffer across messages; JSON strings and nested values still allocate as needed.
@@ -81,6 +307,22 @@ void DecodeJsonFieldsToChunk(DataChunk &chunk, idx_t row_idx, idx_t first_column
     }
 
     yyjson_doc_free(doc);
+}
+
+void DecodeMsgpackFieldsToChunk(DataChunk &chunk, idx_t row_idx, idx_t first_column,
+                                const NatsPayloadView &payload, const vector<string> &field_names) {
+    for (idx_t i = 0; i < field_names.size(); i++) {
+        auto &vector = chunk.data[first_column + i];
+        string value;
+        MsgpackReader reader(payload.data, payload.size);
+        auto path = SplitMsgpackPath(field_names[i]);
+        if (reader.FindField(path, 0, value)) {
+            auto vector_data = FlatVector::GetData<string_t>(vector);
+            vector_data[row_idx] = StringVector::AddString(vector, value);
+        } else {
+            FlatVector::SetNull(vector, row_idx, true);
+        }
+    }
 }
 
 bool DecodeProtobufPayload(google::protobuf::Message &message, const NatsPayloadView &payload) {

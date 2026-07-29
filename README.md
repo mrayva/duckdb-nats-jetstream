@@ -6,7 +6,7 @@
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/Platform-Linux%20%7C%20macOS%20%7C%20Windows%20%7C%20WebAssembly-lightgrey)](https://github.com/brannn/duckdb-nats-jetstream/actions)
 
-Query NATS JetStream message streams directly with SQL. Timestamp-based range queries, subject filtering, and native type support for JSON and Protocol Buffers payloads.
+Query NATS JetStream message streams directly with SQL. Timestamp-based range queries, subject filtering, and extraction support for JSON, MessagePack, and Protocol Buffers payloads.
 
 ---
 
@@ -17,6 +17,20 @@ Query NATS JetStream message streams directly with SQL. Timestamp-based range qu
 ## Protocol Buffers with Native Types
 
 <img src="images/demo-protobuf.png" alt="Protobuf Demo" width="800"/>
+
+## MessagePack Payload Extraction
+
+MessagePack object fields can be projected directly without converting the payload
+through JSON. Use dot notation for nested map fields:
+
+```sql
+SELECT device_id, "metrics.kw"
+FROM nats_scan(
+    'telemetry',
+    nats_subject := 'telemetry.msgpack',
+    msgpack_extract := ['device_id', 'metrics.kw']
+);
+```
 
 ---
 
@@ -48,6 +62,7 @@ ORDER BY seq;
 - **Subject filtering** - Filter messages by NATS subject patterns
 - **Batched JetStream pulls** - Fetch messages in batches for large scans instead of one request per row
 - **JSON extraction** - Extract JSON fields as columns
+- **MessagePack extraction** - Extract MessagePack map fields as VARCHAR columns
 - **Protocol Buffers** - Native type support (VARCHAR, DOUBLE, BOOLEAN, INTEGER, etc.)
 - **Nested fields** - Access nested protobuf fields with dot notation
 - **Sequence ranges** - Query by message sequence numbers

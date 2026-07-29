@@ -74,6 +74,7 @@ struct NatsScanBindData : public TableFunctionData {
     int64_t start_time;  // nanoseconds since epoch, 0 = not set
     int64_t end_time;    // nanoseconds since epoch, 0 = not set
     vector<string> json_fields;
+    vector<string> msgpack_fields;
     string proto_file;
     string proto_message;
     vector<string> proto_fields;
@@ -90,6 +91,7 @@ struct NatsScanBindData : public TableFunctionData {
     NatsScanBindData(string stream, string subject_substr, string nats_subj, NatsConnectionConfig connection_p,
                      uint64_t start, uint64_t end,
                      int64_t start_ts, int64_t end_ts, vector<string> json_flds,
+                     vector<string> msgpack_flds,
                      string proto_f, string proto_msg, vector<string> proto_flds,
                      vector<vector<const FieldDescriptor*>> proto_paths, uint64_t batch_sz, int64_t fetch_timeout)
         : stream_name(std::move(stream))
@@ -101,6 +103,7 @@ struct NatsScanBindData : public TableFunctionData {
         , start_time(start_ts)
         , end_time(end_ts)
         , json_fields(std::move(json_flds))
+        , msgpack_fields(std::move(msgpack_flds))
         , proto_file(std::move(proto_f))
         , proto_message(std::move(proto_msg))
         , proto_fields(std::move(proto_flds))
@@ -180,7 +183,8 @@ static vector<string> GetCopyOptionStringList(const case_insensitive_map_t<vecto
     return result;
 }
 
-static NatsSourceSchema BuildNatsSourceSchema(const vector<string> &json_fields, const string &proto_file,
+static NatsSourceSchema BuildNatsSourceSchema(const vector<string> &json_fields, const vector<string> &msgpack_fields,
+                                              const string &proto_file,
                                               const string &proto_message, const vector<string> &proto_fields,
                                               const Descriptor *descriptor) {
     NatsSourceSchema schema;
@@ -194,13 +198,18 @@ static NatsSourceSchema BuildNatsSourceSchema(const vector<string> &json_fields,
     schema.return_types.emplace_back(LogicalType(LogicalTypeId::TIMESTAMP));
 
     schema.names.emplace_back("payload");
-    if (!proto_fields.empty() || json_fields.empty()) {
+    if (!proto_fields.empty() || (json_fields.empty() && msgpack_fields.empty())) {
         schema.return_types.emplace_back(LogicalType(LogicalTypeId::BLOB));
     } else {
         schema.return_types.emplace_back(LogicalType(LogicalTypeId::VARCHAR));
     }
 
     for (const auto &field : json_fields) {
+        schema.names.emplace_back(field);
+        schema.return_types.emplace_back(LogicalType(LogicalTypeId::VARCHAR));
+    }
+
+    for (const auto &field : msgpack_fields) {
         schema.names.emplace_back(field);
         schema.return_types.emplace_back(LogicalType(LogicalTypeId::VARCHAR));
     }
@@ -278,6 +287,7 @@ static void NatsCopyListOptions(ClientContext &, CopyOptionsInput &input) {
     copy_options["start_time"] = CopyOption(LogicalType::TIMESTAMP, CopyOptionMode::READ_WRITE);
     copy_options["end_time"] = CopyOption(LogicalType::TIMESTAMP, CopyOptionMode::READ_WRITE);
     copy_options["json_extract"] = CopyOption(LogicalType::ANY, CopyOptionMode::READ_WRITE);
+    copy_options["msgpack_extract"] = CopyOption(LogicalType::ANY, CopyOptionMode::READ_WRITE);
     copy_options["proto_file"] = CopyOption(LogicalType::VARCHAR, CopyOptionMode::READ_WRITE);
     copy_options["proto_message"] = CopyOption(LogicalType::VARCHAR, CopyOptionMode::READ_WRITE);
     copy_options["proto_extract"] = CopyOption(LogicalType::ANY, CopyOptionMode::READ_WRITE);
@@ -524,6 +534,7 @@ static unique_ptr<FunctionData> NatsScanBind(ClientContext &context, TableFuncti
     int64_t start_time = 0;
     int64_t end_time = 0;
     vector<string> json_fields;
+    vector<string> msgpack_fields;
     string proto_file = "";
     string proto_message = "";
     vector<string> proto_fields;
@@ -552,6 +563,11 @@ static unique_ptr<FunctionData> NatsScanBind(ClientContext &context, TableFuncti
             auto list_children = ListValue::GetChildren(kv.second);
             for (auto &child : list_children) {
                 json_fields.push_back(StringValue::Get(child));
+            }
+        } else if (kv.first == "msgpack_extract") {
+            auto list_children = ListValue::GetChildren(kv.second);
+            for (auto &child : list_children) {
+                msgpack_fields.push_back(StringValue::Get(child));
             }
         } else if (kv.first == "proto_file") {
             proto_file = StringValue::Get(kv.second);
@@ -589,6 +605,9 @@ static unique_ptr<FunctionData> NatsScanBind(ClientContext &context, TableFuncti
 
     if (!json_fields.empty() && !proto_fields.empty()) {
         throw std::runtime_error("Cannot use both json_extract and proto_extract parameters");
+    }
+    if ((!json_fields.empty() && !msgpack_fields.empty()) || (!msgpack_fields.empty() && !proto_fields.empty())) {
+        throw std::runtime_error("Cannot combine msgpack_extract with another extraction parameter");
     }
 
     if (!proto_fields.empty()) {
@@ -644,12 +663,12 @@ static unique_ptr<FunctionData> NatsScanBind(ClientContext &context, TableFuncti
         }
     }
 
-    auto schema = BuildNatsSourceSchema(json_fields, proto_file, proto_message, proto_fields, descriptor);
+    auto schema = BuildNatsSourceSchema(json_fields, msgpack_fields, proto_file, proto_message, proto_fields, descriptor);
     names = schema.names;
     return_types = schema.return_types;
 
     auto bind_data = make_uniq<NatsScanBindData>(stream_name, subject_contains, nats_subject, std::move(connection), start_seq, end_seq,
-                                                  start_time, end_time, json_fields, proto_file, proto_message, proto_fields,
+                                                  start_time, end_time, json_fields, msgpack_fields, proto_file, proto_message, proto_fields,
                                                   std::move(proto_field_paths), batch_size, fetch_timeout_ms);
 
     if (!proto_fields.empty()) {
@@ -910,7 +929,8 @@ static void NatsScanExecute(ClientContext &context, TableFunctionInput &data_p, 
     idx_t count = 0;
     const idx_t max_rows = STANDARD_VECTOR_SIZE;
 
-    bool payload_is_blob = !bind_data.proto_fields.empty() || bind_data.json_fields.empty();
+    bool payload_is_blob = !bind_data.proto_fields.empty() ||
+                           (bind_data.json_fields.empty() && bind_data.msgpack_fields.empty());
     auto &column_ids = global_state.column_ids;
     bool needs_stream = false;
     bool needs_subject = false;
@@ -918,8 +938,10 @@ static void NatsScanExecute(ClientContext &context, TableFunctionInput &data_p, 
     bool needs_ts = false;
     bool needs_payload = false;
     bool needs_json = false;
+    bool needs_msgpack = false;
     bool needs_proto = false;
     vector<ProjectedFieldColumn> json_columns;
+    vector<ProjectedFieldColumn> msgpack_columns;
     vector<ProjectedFieldColumn> proto_columns;
     for (idx_t out_idx = 0; out_idx < column_ids.size(); out_idx++) {
         auto col_id = column_ids[out_idx];
@@ -936,14 +958,18 @@ static void NatsScanExecute(ClientContext &context, TableFunctionInput &data_p, 
         } else if (col_id >= 5 && col_id < 5 + bind_data.json_fields.size()) {
             needs_json = true;
             json_columns.push_back({out_idx, static_cast<idx_t>(col_id - 5)});
-        } else if (col_id >= 5 + bind_data.json_fields.size()) {
+        } else if (col_id >= 5 + bind_data.json_fields.size() &&
+                   col_id < 5 + bind_data.json_fields.size() + bind_data.msgpack_fields.size()) {
+            needs_msgpack = true;
+            msgpack_columns.push_back({out_idx, static_cast<idx_t>(col_id - 5 - bind_data.json_fields.size())});
+        } else if (col_id >= 5 + bind_data.json_fields.size() + bind_data.msgpack_fields.size()) {
             needs_proto = true;
-            proto_columns.push_back({out_idx, static_cast<idx_t>(col_id - 5)});
+            proto_columns.push_back({out_idx, static_cast<idx_t>(col_id - 5 - bind_data.json_fields.size() - bind_data.msgpack_fields.size())});
         }
     }
     bool needs_subject_for_filter = !bind_data.subject_contains.empty();
     bool needs_message_subject = needs_subject || needs_subject_for_filter;
-    bool needs_message_payload = needs_payload || needs_json || needs_proto;
+    bool needs_message_payload = needs_payload || needs_json || needs_msgpack || needs_proto;
 
     unique_ptr<Message> proto_msg;
     if (needs_proto && !bind_data.proto_fields.empty() && global_state.proto_prototype != nullptr) {
@@ -1070,6 +1096,13 @@ static void NatsScanExecute(ClientContext &context, TableFunctionInput &data_p, 
                 for (const auto &json_column : json_columns) {
                     FlatVector::SetNull(output.data[json_column.output_idx], count, true);
                 }
+            }
+        }
+
+        if (needs_msgpack && !bind_data.msgpack_fields.empty()) {
+            for (const auto &msgpack_column : msgpack_columns) {
+                vector<string> field_name {bind_data.msgpack_fields[msgpack_column.field_idx]};
+                DecodeMsgpackFieldsToChunk(output, count, msgpack_column.output_idx, payload, field_name);
             }
         }
 
@@ -1420,6 +1453,7 @@ static TableFunction CreateNatsScanTableFunction() {
     nats_scan.named_parameters["start_time"] = LogicalType(LogicalTypeId::TIMESTAMP);
     nats_scan.named_parameters["end_time"] = LogicalType(LogicalTypeId::TIMESTAMP);
     nats_scan.named_parameters["json_extract"] = LogicalType::LIST(LogicalType(LogicalTypeId::VARCHAR));
+    nats_scan.named_parameters["msgpack_extract"] = LogicalType::LIST(LogicalType(LogicalTypeId::VARCHAR));
     nats_scan.named_parameters["proto_file"] = LogicalType(LogicalTypeId::VARCHAR);
     nats_scan.named_parameters["proto_message"] = LogicalType(LogicalTypeId::VARCHAR);
     nats_scan.named_parameters["proto_extract"] = LogicalType::LIST(LogicalType(LogicalTypeId::VARCHAR));
@@ -1449,6 +1483,7 @@ static unique_ptr<FunctionData> NatsCopyFromBind(ClientContext &context, CopyFro
     int64_t start_time = 0;
     int64_t end_time = 0;
     vector<string> json_fields = GetCopyOptionStringList(input.info.options, "json_extract");
+    vector<string> msgpack_fields = GetCopyOptionStringList(input.info.options, "msgpack_extract");
     string proto_file = GetCopyOptionString(input.info.options, "proto_file").value_or("");
     string proto_message = GetCopyOptionString(input.info.options, "proto_message").value_or("");
     vector<string> proto_fields = GetCopyOptionStringList(input.info.options, "proto_extract");
@@ -1483,6 +1518,9 @@ static unique_ptr<FunctionData> NatsCopyFromBind(ClientContext &context, CopyFro
     }
     if (!json_fields.empty() && !proto_fields.empty()) {
         throw std::runtime_error("Cannot use both json_extract and proto_extract parameters");
+    }
+    if ((!json_fields.empty() && !msgpack_fields.empty()) || (!msgpack_fields.empty() && !proto_fields.empty())) {
+        throw std::runtime_error("Cannot combine msgpack_extract with another extraction parameter");
     }
     if (!proto_fields.empty()) {
         if (proto_file.empty()) {
@@ -1534,11 +1572,11 @@ static unique_ptr<FunctionData> NatsCopyFromBind(ClientContext &context, CopyFro
         }
     }
 
-    auto schema = BuildNatsSourceSchema(json_fields, proto_file, proto_message, proto_fields, descriptor);
+    auto schema = BuildNatsSourceSchema(json_fields, msgpack_fields, proto_file, proto_message, proto_fields, descriptor);
     ValidateNatsCopyFromSchema(expected_names, expected_types, schema);
 
     auto bind_data = make_uniq<NatsScanBindData>(stream_name, subject_contains, nats_subject, std::move(connection), start_seq, end_seq,
-                                                 start_time, end_time, json_fields, proto_file, proto_message,
+        start_time, end_time, json_fields, msgpack_fields, proto_file, proto_message,
                                                  proto_fields, std::move(proto_field_paths), batch_size, fetch_timeout_ms);
 
     if (!proto_fields.empty()) {

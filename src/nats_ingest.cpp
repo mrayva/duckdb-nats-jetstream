@@ -115,6 +115,7 @@ struct NatsIngestSnapshot {
     string subject_contains;
     string nats_subject;
     vector<string> json_fields;
+    vector<string> msgpack_fields;
     string proto_file;
     string proto_message;
     vector<string> proto_fields;
@@ -335,6 +336,10 @@ static void EnsureRegistryTable(Connection &conn) {
                        " SET duplicates_skipped = COALESCE(duplicates_skipped, 0)",
                    "Failed to backfill ingest duplicate metrics");
     ExecuteOrThrow(conn,
+                   "ALTER TABLE " + string(NATS_INGEST_REGISTRY_TABLE) +
+                       " ADD COLUMN IF NOT EXISTS msgpack_fields VARCHAR[]",
+                   "Failed to migrate ingest MessagePack settings");
+    ExecuteOrThrow(conn,
                    "CREATE TABLE IF NOT EXISTS " + string(NATS_INGEST_LEASE_TABLE) + " ("
                    "stream_name VARCHAR NOT NULL,"
                    "durable_name VARCHAR NOT NULL,"
@@ -482,7 +487,7 @@ static void UpsertRegistry(Connection &conn, const NatsIngestSnapshot &snapshot)
            "last_committed_seq, last_delivered_seq, rows_inserted, batches_committed, fetches_completed, last_batch_rows, "
            "sequence_lag, last_start_time, last_fetch_time, last_ack_time, last_commit_time, last_error_time, last_error, "
            "credentials_file, tls_ca_file, tls_cert_file, tls_key_file, tls_server_name, tls_skip_verify, "
-           "duplicates_skipped, updated_at) VALUES ("
+           "duplicates_skipped, updated_at, msgpack_fields) VALUES ("
         << SqlStringLiteral(snapshot.job_name) << ", "
         << SqlStringLiteral(snapshot.stream_name) << ", "
         << SqlStringLiteral(snapshot.target_table) << ", "
@@ -526,7 +531,8 @@ static void UpsertRegistry(Connection &conn, const NatsIngestSnapshot &snapshot)
         << (snapshot.tls_server_name.empty() ? "NULL" : SqlStringLiteral(snapshot.tls_server_name)) << ", "
         << (snapshot.tls_skip_verify ? "TRUE" : "FALSE") << ", "
         << snapshot.duplicates_skipped << ", "
-        << "CURRENT_TIMESTAMP"
+        << "CURRENT_TIMESTAMP, "
+        << SqlListLiteral(snapshot.msgpack_fields)
         << ") ON CONFLICT(job_name) DO UPDATE SET "
         << "stream_name = excluded.stream_name, "
         << "target_table = excluded.target_table, "
@@ -570,6 +576,7 @@ static void UpsertRegistry(Connection &conn, const NatsIngestSnapshot &snapshot)
         << "tls_server_name = excluded.tls_server_name, "
         << "tls_skip_verify = excluded.tls_skip_verify, "
         << "duplicates_skipped = excluded.duplicates_skipped, "
+        << "msgpack_fields = excluded.msgpack_fields, "
         << "updated_at = excluded.updated_at";
     ExecuteOrThrow(conn, sql.str(), "Failed to update ingest registry");
 }
@@ -585,7 +592,7 @@ static bool LoadRegistrySnapshot(Connection &conn, const string &job_name, NatsI
            "proto_message, proto_fields, running, stop_requested, stopped, failed, paused, pause_requested, last_committed_seq, "
            "last_delivered_seq, rows_inserted, batches_committed, fetches_completed, last_batch_rows, sequence_lag, last_start_time, "
            "last_fetch_time, last_ack_time, last_commit_time, last_error_time, last_error, credentials_file, tls_ca_file, "
-           "tls_cert_file, tls_key_file, tls_server_name, tls_skip_verify, duplicates_skipped "
+           "tls_cert_file, tls_key_file, tls_server_name, tls_skip_verify, duplicates_skipped, msgpack_fields "
         << "FROM " << NATS_INGEST_REGISTRY_TABLE << " WHERE job_name = " << SqlStringLiteral(job_name);
 
     auto result = conn.Query(sql.str());
@@ -679,6 +686,11 @@ static bool LoadRegistrySnapshot(Connection &conn, const string &job_name, NatsI
     }
     snapshot.tls_skip_verify = chunk->GetValue(41, 0).GetValue<bool>();
     snapshot.duplicates_skipped = chunk->GetValue(42, 0).GetValue<uint64_t>();
+    if (!chunk->GetValue(43, 0).IsNull()) {
+        for (auto &entry : ListValue::GetChildren(chunk->GetValue(43, 0))) {
+            snapshot.msgpack_fields.push_back(entry.GetValue<string>());
+        }
+    }
     return true;
 }
 
@@ -689,7 +701,7 @@ static vector<NatsIngestSnapshot> LoadRegistrySnapshots(Connection &conn) {
            "proto_message, proto_fields, running, stop_requested, stopped, failed, paused, pause_requested, last_committed_seq, "
            "last_delivered_seq, rows_inserted, batches_committed, fetches_completed, last_batch_rows, sequence_lag, last_start_time, "
            "last_fetch_time, last_ack_time, last_commit_time, last_error_time, last_error, credentials_file, tls_ca_file, "
-           "tls_cert_file, tls_key_file, tls_server_name, tls_skip_verify, duplicates_skipped "
+           "tls_cert_file, tls_key_file, tls_server_name, tls_skip_verify, duplicates_skipped, msgpack_fields "
         << "FROM " << NATS_INGEST_REGISTRY_TABLE << " ORDER BY job_name";
 
     auto result = conn.Query(sql.str());
@@ -782,6 +794,11 @@ static vector<NatsIngestSnapshot> LoadRegistrySnapshots(Connection &conn) {
             }
             snapshot.tls_skip_verify = chunk->GetValue(41, row).GetValue<bool>();
             snapshot.duplicates_skipped = chunk->GetValue(42, row).GetValue<uint64_t>();
+            if (!chunk->GetValue(43, row).IsNull()) {
+                for (auto &entry : ListValue::GetChildren(chunk->GetValue(43, row))) {
+                    snapshot.msgpack_fields.push_back(entry.GetValue<string>());
+                }
+            }
             snapshots.push_back(std::move(snapshot));
         }
     }
@@ -1041,6 +1058,11 @@ static NatsIngestConfig ParseStartConfig(TableFunctionBindInput &input) {
             for (auto &child : list_children) {
                 config.json_fields.push_back(StringValue::Get(child));
             }
+        } else if (kv.first == "msgpack_extract") {
+            auto list_children = ListValue::GetChildren(kv.second);
+            for (auto &child : list_children) {
+                config.msgpack_fields.push_back(StringValue::Get(child));
+            }
         } else if (kv.first == "proto_file") {
             config.proto_file = StringValue::Get(kv.second);
         } else if (kv.first == "proto_message") {
@@ -1087,6 +1109,10 @@ static NatsIngestConfig ParseStartConfig(TableFunctionBindInput &input) {
     if (!config.json_fields.empty() && !config.proto_fields.empty()) {
         throw std::runtime_error("Cannot use both json_extract and proto_extract parameters");
     }
+    if ((!config.json_fields.empty() && !config.msgpack_fields.empty()) ||
+        (!config.msgpack_fields.empty() && !config.proto_fields.empty())) {
+        throw std::runtime_error("Cannot combine msgpack_extract with another extraction parameter");
+    }
 
     if (!config.proto_fields.empty()) {
         if (config.proto_file.empty()) {
@@ -1126,6 +1152,7 @@ static NatsIngestSnapshot SnapshotJob(const shared_ptr<NatsIngestJobState> &job)
     snapshot.subject_contains = job->config.subject_contains;
     snapshot.nats_subject = job->config.nats_subject;
     snapshot.json_fields = job->config.json_fields;
+    snapshot.msgpack_fields = job->config.msgpack_fields;
     snapshot.proto_file = job->config.proto_file;
     snapshot.proto_message = job->config.proto_message;
     snapshot.proto_fields = job->config.proto_fields;
@@ -1180,6 +1207,7 @@ static NatsIngestConfig SnapshotToConfig(const NatsIngestSnapshot &snapshot) {
     config.subject_contains = snapshot.subject_contains;
     config.nats_subject = snapshot.nats_subject;
     config.json_fields = snapshot.json_fields;
+    config.msgpack_fields = snapshot.msgpack_fields;
     config.proto_file = snapshot.proto_file;
     config.proto_message = snapshot.proto_message;
     config.proto_fields = snapshot.proto_fields;
@@ -1621,9 +1649,13 @@ static vector<NatsIngestColumnDef> BuildTargetTableColumns(const NatsIngestConfi
     columns.push_back({"subject", "VARCHAR"});
     columns.push_back({"sequence", "UBIGINT"});
     columns.push_back({"ts", "TIMESTAMP"});
-    columns.push_back({"payload", config.json_fields.empty() ? "BLOB" : "VARCHAR"});
+    columns.push_back({"payload", (config.json_fields.empty() && config.msgpack_fields.empty()) ? "BLOB" : "VARCHAR"});
 
     for (const auto &field_name : config.json_fields) {
+        columns.push_back({field_name, "VARCHAR"});
+    }
+
+    for (const auto &field_name : config.msgpack_fields) {
         columns.push_back({field_name, "VARCHAR"});
     }
 
@@ -1745,6 +1777,8 @@ static void AppendMessageRow(DataChunk &chunk, idx_t row_idx, const NatsIngestCo
 
     if (!config.json_fields.empty()) {
         AppendJsonFields(chunk, row_idx, config, payload, json_values, reuse_json_values, direct_json_write);
+    } else if (!config.msgpack_fields.empty()) {
+        DecodeMsgpackFieldsToChunk(chunk, row_idx, 5, payload, config.msgpack_fields);
     } else if (!config.proto_fields.empty()) {
         AppendProtoFields(chunk, row_idx, config, proto_msg, payload);
     }
@@ -2732,6 +2766,7 @@ void NatsIngestFunction::Register(ExtensionLoader &loader) {
     start_fn.named_parameters["subject_contains"] = LogicalType(LogicalTypeId::VARCHAR);
     start_fn.named_parameters["nats_subject"] = LogicalType(LogicalTypeId::VARCHAR);
     start_fn.named_parameters["json_extract"] = LogicalType::LIST(LogicalType(LogicalTypeId::VARCHAR));
+    start_fn.named_parameters["msgpack_extract"] = LogicalType::LIST(LogicalType(LogicalTypeId::VARCHAR));
     start_fn.named_parameters["proto_file"] = LogicalType(LogicalTypeId::VARCHAR);
     start_fn.named_parameters["proto_message"] = LogicalType(LogicalTypeId::VARCHAR);
     start_fn.named_parameters["proto_extract"] = LogicalType::LIST(LogicalType(LogicalTypeId::VARCHAR));

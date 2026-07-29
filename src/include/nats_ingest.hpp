@@ -36,6 +36,7 @@ struct NatsIngestConfig {
     bool resume_from_checkpoint = true;
     bool create_target_table = false;
     vector<string> json_fields;
+    vector<string> msgpack_fields;
     string proto_file;
     string proto_message;
     vector<string> proto_fields;

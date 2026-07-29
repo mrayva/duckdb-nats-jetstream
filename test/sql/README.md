@@ -34,6 +34,9 @@ Payload BLOB type test suite covering:
 - Payload is BLOB with protobuf extraction
 - Manual casting of BLOB payload to VARCHAR when needed
 
+### `test_msgpack_extraction.sql`
+MessagePack extraction coverage for string, numeric, boolean, and nested map fields.
+
 ## Prerequisites
 
 1. **NATS server running:**
@@ -122,4 +125,3 @@ The extension hasn't been built. Build it with:
 ```bash
 make build
 ```
-

@@ -74,10 +74,17 @@ success_tests=(
   test/sql/test_stream_stats.sql
   test/sql/test_connection_errors.sql
   test/sql/test_repeated_fields.sql
+  test/sql/test_msgpack_extraction.sql
 )
 
 for test_file in "${success_tests[@]}"; do
   echo "RUN $test_file"
+  if [ "$test_file" = "test/sql/test_msgpack_extraction.sql" ]; then
+    MSGPACK_FIXTURE=/tmp/duckdb-nats-msgpack.bin
+    "$PYTHON_BIN" "$ROOT_DIR/test/msgpack/generate_msgpack_data.py" "$MSGPACK_FIXTURE"
+    "$NATS_CLI" pub --server "$NATS_URL" --jetstream --force-stdin telemetry.msgpack <"$MSGPACK_FIXTURE" \
+      >/tmp/test_msgpack_publish.log
+  fi
   log_file="/tmp/$(basename "$test_file")".log
   run_sql_test "$test_file" "$log_file"
   echo "PASS $test_file"
