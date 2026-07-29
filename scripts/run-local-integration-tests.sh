@@ -256,6 +256,11 @@ DUCKDB_BIN="$DUCKDB_BIN" DUCKDB_LIB="$DUCKDB_LIB" EXTENSION_PATH="$EXTENSION_PAT
   NATS_URL="$NATS_URL" NATS_CLI="$NATS_CLI" "$ROOT_DIR/scripts/run-subscribe-msgpack-harness.sh"
 echo "PASS scripts/run-subscribe-msgpack-harness.sh"
 
+echo "RUN scripts/run-subscribe-json-harness.sh"
+DUCKDB_BIN="$DUCKDB_BIN" DUCKDB_LIB="$DUCKDB_LIB" EXTENSION_PATH="$EXTENSION_PATH" \
+  NATS_URL="$NATS_URL" NATS_CLI="$NATS_CLI" "$ROOT_DIR/scripts/run-subscribe-json-harness.sh"
+echo "PASS scripts/run-subscribe-json-harness.sh"
+
 echo "RUN scripts/run-subscribe-pause-resume-harness.sh"
 NATS_URL="$NATS_URL" \
 NATS_CLI="$NATS_CLI" \
