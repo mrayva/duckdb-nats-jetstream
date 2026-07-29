@@ -3,9 +3,9 @@
 #include "yyjson.hpp"
 
 #include <cstring>
+#include <cstdio>
 #include <iomanip>
 #include <sstream>
-#include <unordered_map>
 
 using namespace duckdb_yyjson;
 
@@ -18,28 +18,135 @@ public:
     MsgpackReader(const char *data, idx_t size) : data(reinterpret_cast<const uint8_t *>(data)), remaining(size) {
     }
 
-    bool Collect(unordered_map<string, string> &values) {
+    bool Decode(DataChunk &chunk, idx_t row_idx, const vector<idx_t> &output_columns,
+                const vector<vector<string>> &field_paths) {
         uint8_t tag;
-        return ReadByte(tag) && CollectMap(tag, "", values);
+        return ReadByte(tag) && DecodeMap(tag, 0, chunk, row_idx, output_columns, field_paths);
     }
 
 private:
+    bool ReadStringView(uint8_t tag, std::string_view &value) {
+        idx_t length;
+        if ((tag & 0xe0) == 0xa0) {
+            length = tag & 0x1f;
+        } else if (tag == 0xd9 || tag == 0xda || tag == 0xdb) {
+            uint64_t size;
+            if (!ReadUnsigned(tag == 0xd9 ? 1 : (tag == 0xda ? 2 : 4), size)) return false;
+            length = static_cast<idx_t>(size);
+        } else {
+            return false;
+        }
+        if (length > remaining) return false;
+        value = std::string_view(reinterpret_cast<const char *>(data), length);
+        data += length;
+        remaining -= length;
+        return true;
+    }
+
+    bool ReadScalarToVector(uint8_t tag, Vector &vector, idx_t row_idx) {
+        auto set_string = [&](const char *data_ptr, idx_t length) {
+            FlatVector::SetNull(vector, row_idx, false);
+            auto vector_data = FlatVector::GetData<string_t>(vector);
+            vector_data[row_idx] = StringVector::AddString(vector, data_ptr, length);
+        };
+        if ((tag & 0xe0) == 0xa0 || tag == 0xd9 || tag == 0xda || tag == 0xdb) {
+            std::string_view value;
+            if (!ReadStringView(tag, value)) return false;
+            set_string(value.data(), value.size());
+            return true;
+        }
+        char buffer[64];
+        int length = 0;
+        uint64_t number;
+        if (tag <= 0x7f) {
+            length = snprintf(buffer, sizeof(buffer), "%u", tag);
+        } else if (tag >= 0xe0) {
+            length = snprintf(buffer, sizeof(buffer), "%d", static_cast<int8_t>(tag));
+        } else {
+            switch (tag) {
+            case 0xc0:
+                FlatVector::SetNull(vector, row_idx, true);
+                return true;
+            case 0xc2:
+                set_string("false", 5);
+                return true;
+            case 0xc3:
+                set_string("true", 4);
+                return true;
+            case 0xcc: case 0xcd: case 0xce: case 0xcf:
+                if (!ReadUnsigned(tag == 0xcc ? 1 : (tag == 0xcd ? 2 : (tag == 0xce ? 4 : 8)), number)) return false;
+                length = snprintf(buffer, sizeof(buffer), "%llu", static_cast<unsigned long long>(number));
+                break;
+            case 0xd0: case 0xd1: case 0xd2: case 0xd3: {
+                if (!ReadUnsigned(tag == 0xd0 ? 1 : (tag == 0xd1 ? 2 : (tag == 0xd2 ? 4 : 8)), number)) return false;
+                int64_t signed_value = tag == 0xd0 ? static_cast<int8_t>(number) :
+                                       tag == 0xd1 ? static_cast<int16_t>(number) :
+                                       tag == 0xd2 ? static_cast<int32_t>(number) : static_cast<int64_t>(number);
+                length = snprintf(buffer, sizeof(buffer), "%lld", static_cast<long long>(signed_value));
+                break;
+            }
+            case 0xca: {
+                if (!ReadUnsigned(4, number)) return false;
+                uint32_t bits = static_cast<uint32_t>(number);
+                float value;
+                memcpy(&value, &bits, sizeof(value));
+                length = snprintf(buffer, sizeof(buffer), "%f", static_cast<double>(value));
+                break;
+            }
+            case 0xcb: {
+                if (!ReadUnsigned(8, number)) return false;
+                double value;
+                memcpy(&value, &number, sizeof(value));
+                length = snprintf(buffer, sizeof(buffer), "%f", value);
+                break;
+            }
+            default:
+                return false;
+            }
+        }
+        if (length < 0 || static_cast<size_t>(length) >= sizeof(buffer)) return false;
+        set_string(buffer, static_cast<idx_t>(length));
+        return true;
+    }
+
+    bool DecodeMap(uint8_t tag, idx_t depth, DataChunk &chunk, idx_t row_idx,
+                   const vector<idx_t> &output_columns, const vector<vector<string>> &field_paths) {
+        uint32_t count;
+        if (!((tag & 0xf0) == 0x80 || tag == 0xde || tag == 0xdf) || !ReadMapCount(tag, count)) return false;
+        for (uint32_t i = 0; i < count; i++) {
+            uint8_t key_tag;
+            std::string_view key;
+            if (!ReadByte(key_tag) || !ReadStringView(key_tag, key)) return false;
+            idx_t matched = DConstants::INVALID_INDEX;
+            for (idx_t field_idx = 0; field_idx < field_paths.size(); field_idx++) {
+                if (depth < field_paths[field_idx].size() &&
+                    key == std::string_view(field_paths[field_idx][depth])) {
+                    matched = field_idx;
+                    break;
+                }
+            }
+            uint8_t value_tag;
+            if (!ReadByte(value_tag)) return false;
+            if (matched == DConstants::INVALID_INDEX) {
+                if (!SkipValueAfterTag(value_tag)) return false;
+            } else if (depth + 1 == field_paths[matched].size()) {
+                auto &vector = chunk.data[output_columns[matched]];
+                if (!ReadScalarToVector(value_tag, vector, row_idx) && !SkipValueAfterTag(value_tag)) return false;
+            } else if ((value_tag & 0xf0) == 0x80 || value_tag == 0xde || value_tag == 0xdf) {
+                if (!DecodeMap(value_tag, depth + 1, chunk, row_idx, output_columns, field_paths)) return false;
+            } else if (!SkipValueAfterTag(value_tag)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     bool ReadByte(uint8_t &value) {
         if (remaining == 0) {
             return false;
         }
         value = *data++;
         remaining--;
-        return true;
-    }
-
-    bool ReadBytes(void *out, idx_t count) {
-        if (count > remaining) {
-            return false;
-        }
-        memcpy(out, data, count);
-        data += count;
-        remaining -= count;
         return true;
     }
 
@@ -65,116 +172,6 @@ private:
             return false;
         }
         count = static_cast<uint32_t>(value);
-        return true;
-    }
-
-    bool ReadString(uint8_t tag, string &value) {
-        idx_t length;
-        if ((tag & 0xe0) == 0xa0) {
-            length = tag & 0x1f;
-        } else if (tag == 0xd9 || tag == 0xda || tag == 0xdb) {
-            uint64_t size;
-            if (!ReadUnsigned(tag == 0xd9 ? 1 : (tag == 0xda ? 2 : 4), size)) {
-                return false;
-            }
-            length = static_cast<idx_t>(size);
-        } else {
-            return false;
-        }
-        value.resize(length);
-        return ReadBytes(value.data(), length);
-    }
-
-    bool ReadScalarValue(string &value, bool tag_already_read = false, uint8_t supplied_tag = 0) {
-        uint8_t tag;
-        if (tag_already_read) {
-            tag = supplied_tag;
-        } else if (!ReadByte(tag)) {
-            return false;
-        }
-        if ((tag & 0xe0) == 0xa0 || tag == 0xd9 || tag == 0xda || tag == 0xdb) {
-            return ReadString(tag, value);
-        }
-        if (tag <= 0x7f) {
-            value = std::to_string(tag);
-            return true;
-        }
-        if (tag >= 0xe0) {
-            value = std::to_string(static_cast<int8_t>(tag));
-            return true;
-        }
-        uint64_t number;
-        switch (tag) {
-        case 0xc0:
-            return false;
-        case 0xc2:
-            value = "false";
-            return true;
-        case 0xc3:
-            value = "true";
-            return true;
-        case 0xcc:
-        case 0xcd:
-        case 0xce:
-        case 0xcf:
-            if (!ReadUnsigned(tag == 0xcc ? 1 : (tag == 0xcd ? 2 : (tag == 0xce ? 4 : 8)), number)) return false;
-            value = std::to_string(number);
-            return true;
-        case 0xd0:
-        case 0xd1:
-        case 0xd2:
-        case 0xd3: {
-            if (!ReadUnsigned(tag == 0xd0 ? 1 : (tag == 0xd1 ? 2 : (tag == 0xd2 ? 4 : 8)), number)) return false;
-            int64_t signed_value;
-            if (tag == 0xd0) signed_value = static_cast<int8_t>(number);
-            else if (tag == 0xd1) signed_value = static_cast<int16_t>(number);
-            else if (tag == 0xd2) signed_value = static_cast<int32_t>(number);
-            else signed_value = static_cast<int64_t>(number);
-            value = std::to_string(signed_value);
-            return true;
-        }
-        case 0xca: {
-            if (!ReadUnsigned(4, number)) return false;
-            uint32_t bits = static_cast<uint32_t>(number);
-            float number_value;
-            memcpy(&number_value, &bits, sizeof(number_value));
-            value = std::to_string(number_value);
-            return true;
-        }
-        case 0xcb: {
-            if (!ReadUnsigned(8, number)) return false;
-            double number_value;
-            memcpy(&number_value, &number, sizeof(number_value));
-            value = std::to_string(number_value);
-            return true;
-        }
-        default:
-            return false;
-        }
-    }
-
-    bool CollectMap(uint8_t tag, const string &prefix, unordered_map<string, string> &values) {
-        uint32_t count;
-        if (!((tag & 0xf0) == 0x80 || tag == 0xde || tag == 0xdf) || !ReadMapCount(tag, count)) {
-            return false;
-        }
-        for (uint32_t i = 0; i < count; i++) {
-            uint8_t key_tag;
-            string key;
-            if (!ReadByte(key_tag) || !ReadString(key_tag, key)) {
-                return false;
-            }
-            string path = prefix.empty() ? key : prefix + "." + key;
-            uint8_t value_tag;
-            if (!ReadByte(value_tag)) {
-                return false;
-            }
-            if ((value_tag & 0xf0) == 0x80 || value_tag == 0xde || value_tag == 0xdf) {
-                if (!CollectMap(value_tag, path, values)) return false;
-            } else if (!ReadScalarValue(values[path], true, value_tag)) {
-                if (!SkipValueAfterTag(value_tag)) return false;
-            }
-        }
         return true;
     }
 
@@ -300,31 +297,30 @@ void DecodeJsonFieldsToChunk(DataChunk &chunk, idx_t row_idx, idx_t first_column
     yyjson_doc_free(doc);
 }
 
-void DecodeMsgpackFieldsToChunk(DataChunk &chunk, idx_t row_idx, idx_t first_column,
-                                const NatsPayloadView &payload, const vector<string> &field_names) {
-    vector<idx_t> output_columns;
-    output_columns.reserve(field_names.size());
-    for (idx_t i = 0; i < field_names.size(); i++) {
-        output_columns.push_back(first_column + i);
+vector<vector<string>> SplitMsgpackFieldPaths(const vector<string> &field_names) {
+    vector<vector<string>> result;
+    result.reserve(field_names.size());
+    for (const auto &field_name : field_names) {
+        vector<string> path;
+        size_t start = 0;
+        while (true) {
+            auto end = field_name.find('.', start);
+            path.push_back(field_name.substr(start, end == string::npos ? string::npos : end - start));
+            if (end == string::npos) break;
+            start = end + 1;
+        }
+        result.push_back(std::move(path));
     }
-    DecodeMsgpackProjectedFieldsToChunk(chunk, row_idx, output_columns, payload, field_names);
+    return result;
 }
 
-void DecodeMsgpackProjectedFieldsToChunk(DataChunk &chunk, idx_t row_idx, const vector<idx_t> &output_columns,
-                                         const NatsPayloadView &payload, const vector<string> &field_names) {
-    unordered_map<string, string> values;
-    MsgpackReader reader(payload.data, payload.size);
-    bool valid = reader.Collect(values);
-    for (idx_t i = 0; i < field_names.size(); i++) {
-        auto &vector = chunk.data[output_columns[i]];
-        auto value = values.find(field_names[i]);
-        if (valid && value != values.end()) {
-            auto vector_data = FlatVector::GetData<string_t>(vector);
-            vector_data[row_idx] = StringVector::AddString(vector, value->second);
-        } else {
-            FlatVector::SetNull(vector, row_idx, true);
-        }
+void DecodeMsgpackFieldPathsToChunk(DataChunk &chunk, idx_t row_idx, const vector<idx_t> &output_columns,
+                                    const NatsPayloadView &payload, const vector<vector<string>> &field_paths) {
+    for (auto output_column : output_columns) {
+        FlatVector::SetNull(chunk.data[output_column], row_idx, true);
     }
+    MsgpackReader reader(payload.data, payload.size);
+    reader.Decode(chunk, row_idx, output_columns, field_paths);
 }
 
 bool DecodeProtobufPayload(google::protobuf::Message &message, const NatsPayloadView &payload) {

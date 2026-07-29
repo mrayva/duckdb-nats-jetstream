@@ -75,6 +75,7 @@ struct NatsScanBindData : public TableFunctionData {
     int64_t end_time;    // nanoseconds since epoch, 0 = not set
     vector<string> json_fields;
     vector<string> msgpack_fields;
+    vector<vector<string>> msgpack_field_paths;
     string proto_file;
     string proto_message;
     vector<string> proto_fields;
@@ -678,6 +679,8 @@ static unique_ptr<FunctionData> NatsScanBind(ClientContext &context, TableFuncti
         bind_data->proto_descriptor = descriptor;
     }
 
+    bind_data->msgpack_field_paths = SplitMsgpackFieldPaths(bind_data->msgpack_fields);
+
     return bind_data;
 }
 
@@ -967,6 +970,12 @@ static void NatsScanExecute(ClientContext &context, TableFunctionInput &data_p, 
             proto_columns.push_back({out_idx, static_cast<idx_t>(col_id - 5 - bind_data.json_fields.size() - bind_data.msgpack_fields.size())});
         }
     }
+    vector<idx_t> msgpack_output_columns;
+    vector<vector<string>> msgpack_field_paths;
+    for (const auto &msgpack_column : msgpack_columns) {
+        msgpack_output_columns.push_back(msgpack_column.output_idx);
+        msgpack_field_paths.push_back(bind_data.msgpack_field_paths[msgpack_column.field_idx]);
+    }
     bool needs_subject_for_filter = !bind_data.subject_contains.empty();
     bool needs_message_subject = needs_subject || needs_subject_for_filter;
     bool needs_message_payload = needs_payload || needs_json || needs_msgpack || needs_proto;
@@ -1100,15 +1109,7 @@ static void NatsScanExecute(ClientContext &context, TableFunctionInput &data_p, 
         }
 
         if (needs_msgpack && !bind_data.msgpack_fields.empty()) {
-            vector<idx_t> output_columns;
-            vector<string> field_names;
-            output_columns.reserve(msgpack_columns.size());
-            field_names.reserve(msgpack_columns.size());
-            for (const auto &msgpack_column : msgpack_columns) {
-                output_columns.push_back(msgpack_column.output_idx);
-                field_names.push_back(bind_data.msgpack_fields[msgpack_column.field_idx]);
-            }
-            DecodeMsgpackProjectedFieldsToChunk(output, count, output_columns, payload, field_names);
+            DecodeMsgpackFieldPathsToChunk(output, count, msgpack_output_columns, payload, msgpack_field_paths);
         }
 
         if (needs_proto && proto_msg) {

@@ -16,11 +16,11 @@ void DecodeJsonFields(const NatsPayloadView &payload, const vector<string> &fiel
 void DecodeJsonFieldsToChunk(DataChunk &chunk, idx_t row_idx, idx_t first_column, const NatsPayloadView &payload,
                              const vector<string> &field_names);
 
-void DecodeMsgpackFieldsToChunk(DataChunk &chunk, idx_t row_idx, idx_t first_column, const NatsPayloadView &payload,
-                                const vector<string> &field_names);
+vector<vector<string>> SplitMsgpackFieldPaths(const vector<string> &field_names);
 
-void DecodeMsgpackProjectedFieldsToChunk(DataChunk &chunk, idx_t row_idx, const vector<idx_t> &output_columns,
-                                         const NatsPayloadView &payload, const vector<string> &field_names);
+void DecodeMsgpackFieldPathsToChunk(DataChunk &chunk, idx_t row_idx, const vector<idx_t> &output_columns,
+                                    const NatsPayloadView &payload,
+                                    const vector<vector<string>> &field_paths);
 
 bool DecodeProtobufPayload(google::protobuf::Message &message, const NatsPayloadView &payload);
 

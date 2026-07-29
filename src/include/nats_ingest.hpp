@@ -37,6 +37,7 @@ struct NatsIngestConfig {
     bool create_target_table = false;
     vector<string> json_fields;
     vector<string> msgpack_fields;
+    vector<vector<string>> msgpack_field_paths;
     string proto_file;
     string proto_message;
     vector<string> proto_fields;
