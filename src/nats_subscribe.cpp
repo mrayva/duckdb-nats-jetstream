@@ -9,13 +9,70 @@
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/parser/qualified_name.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
+#include <google/protobuf/compiler/importer.h>
+#include <google/protobuf/dynamic_message.h>
+#include <filesystem>
 
 #include <algorithm>
 #include <chrono>
 #include <limits>
 #include <sstream>
 
+#ifdef GetMessage
+#undef GetMessage
+#endif
+
+using namespace google::protobuf;
+using namespace google::protobuf::compiler;
+
 namespace duckdb {
+
+class SubscribeProtobufErrorCollector : public MultiFileErrorCollector {
+public:
+#if GOOGLE_PROTOBUF_VERSION >= 3022000
+    void RecordError(absl::string_view filename, int line, int column, absl::string_view message) override {
+        errors.push_back(string(filename) + ":" + std::to_string(line) + ":" + std::to_string(column) + ": " + string(message));
+    }
+#else
+    void AddError(const std::string &filename, int line, int column, const std::string &message) override {
+        errors.push_back(filename + ":" + std::to_string(line) + ":" + std::to_string(column) + ": " + message);
+    }
+#endif
+    string GetErrors() const {
+        string result;
+        for (const auto &error : errors) result += error + "\n";
+        return result;
+    }
+
+private:
+    vector<string> errors;
+};
+
+static void ImportSubscribeProtoSchema(const string &proto_file, const string &proto_message,
+                                       shared_ptr<DiskSourceTree> &source_tree,
+                                       shared_ptr<SubscribeProtobufErrorCollector> &error_collector,
+                                       shared_ptr<Importer> &importer, const Descriptor *&descriptor) {
+    source_tree = make_shared_ptr<DiskSourceTree>();
+    std::filesystem::path proto_path(proto_file);
+    source_tree->MapPath("", proto_path.parent_path().empty() ? "." : proto_path.parent_path().string());
+    error_collector = make_shared_ptr<SubscribeProtobufErrorCollector>();
+    importer = make_shared_ptr<Importer>(source_tree.get(), error_collector.get());
+    auto *file_desc = importer->Import(proto_path.filename().string());
+    if (!file_desc) {
+        string error = "Failed to import protobuf schema file: " + proto_file;
+        auto details = error_collector->GetErrors();
+        if (!details.empty()) error += "\n" + details;
+        throw std::runtime_error(error);
+    }
+    descriptor = file_desc->FindMessageTypeByName(proto_message);
+    if (!descriptor) {
+        throw std::runtime_error("Message type '" + proto_message + "' not found in " + proto_file);
+    }
+}
+
+static string SubscribeProtoSqlType(const FieldDescriptor *field) {
+    return ProtobufFieldDescriptorToDuckDBType(field).ToString();
+}
 
 NatsSubscribeJobState::NatsSubscribeJobState(NatsSubscribeConfig config_p) : config(std::move(config_p)) {
 }
@@ -370,11 +427,17 @@ static NatsSubscribeConfig ParseSubscribeConfig(TableFunctionBindInput &input) {
     if (!has_subject) {
         throw std::runtime_error("subject parameter is required");
     }
-    if (!config.proto_fields.empty()) {
-        throw std::runtime_error("core NATS live subscriptions currently support JSON and MessagePack extraction only");
+    auto extraction_modes = static_cast<int>(!config.json_fields.empty()) +
+                            static_cast<int>(!config.msgpack_fields.empty()) +
+                            static_cast<int>(!config.proto_fields.empty());
+    if (extraction_modes > 1) {
+        throw std::runtime_error("Cannot combine JSON, MessagePack, and protobuf extraction parameters");
     }
-    if (!config.json_fields.empty() && !config.msgpack_fields.empty()) {
-        throw std::runtime_error("Cannot combine json_extract with msgpack_extract");
+    if (!config.proto_fields.empty() && config.proto_file.empty()) {
+        throw std::runtime_error("proto_file parameter is required with proto_extract");
+    }
+    if (!config.proto_fields.empty() && config.proto_message.empty()) {
+        throw std::runtime_error("proto_message parameter is required with proto_extract");
     }
     if (!config.msgpack_fields.empty()) {
         config.msgpack_field_paths = SplitMsgpackFieldPaths(config.msgpack_fields);
@@ -426,9 +489,15 @@ static void EnsureTargetTable(Connection &conn, const NatsSubscribeConfig &confi
         << QuoteIdentifier(config.subject_column) << " VARCHAR,"
         << QuoteIdentifier(config.payload_column) << " BLOB,"
         << "received_at TIMESTAMP";
-    const auto &extracted_fields = config.json_fields.empty() ? config.msgpack_fields : config.json_fields;
+    const auto &extracted_fields = !config.json_fields.empty() ? config.json_fields :
+                                   (!config.msgpack_fields.empty() ? config.msgpack_fields : config.proto_fields);
     for (const auto &field : extracted_fields) {
-        sql << "," << QuoteIdentifier(field) << " VARCHAR";
+        string sql_type = "VARCHAR";
+        if (!config.proto_fields.empty() && !config.proto_field_paths.empty()) {
+            auto index = &field - config.proto_fields.data();
+            sql_type = SubscribeProtoSqlType(config.proto_field_paths[index].back());
+        }
+        sql << "," << QuoteIdentifier(field) << " " << sql_type;
     }
     sql << ")";
     auto result = conn.Query(sql.str());
@@ -456,22 +525,22 @@ static unique_ptr<Appender> CreateSubscribeAppender(Connection &conn, const stri
 }
 
 static void FlushSubscribeBatch(Connection &conn, const NatsSubscribeConfig &config,
-                                const vector<pair<string, string>> &batch) {
+                                const vector<pair<string, string>> &batch, Message *proto_message) {
     if (batch.empty()) {
         return;
     }
     auto appender = CreateSubscribeAppender(conn, config.target_table);
     const auto &types = appender->GetActiveTypes();
-    const auto &extracted_fields = config.json_fields.empty() ? config.msgpack_fields : config.json_fields;
+    const auto &extracted_fields = !config.json_fields.empty() ? config.json_fields :
+                                   (!config.msgpack_fields.empty() ? config.msgpack_fields : config.proto_fields);
     if (types.size() != 3 + extracted_fields.size() || types[0].id() != LogicalTypeId::VARCHAR ||
         (types[1].id() != LogicalTypeId::VARCHAR && types[1].id() != LogicalTypeId::BLOB) ||
         types[2].id() != LogicalTypeId::TIMESTAMP) {
-        throw std::runtime_error("Subscription target table must have subject, payload, received_at, and the "
-                                 "configured extraction columns");
+        throw std::runtime_error("Subscription target table metadata does not match the configured extraction columns");
     }
     for (idx_t i = 0; i < extracted_fields.size(); i++) {
-        if (types[3 + i].id() != LogicalTypeId::VARCHAR) {
-            throw std::runtime_error("MessagePack extraction columns must be VARCHAR");
+        if (config.proto_fields.empty() && types[3 + i].id() != LogicalTypeId::VARCHAR) {
+            throw std::runtime_error("JSON and MessagePack extraction columns must be VARCHAR");
         }
     }
     if (!extracted_fields.empty()) {
@@ -490,8 +559,15 @@ static void FlushSubscribeBatch(Connection &conn, const NatsSubscribeConfig &con
             NatsPayloadView payload {entry.second.data(), entry.second.size()};
             if (!config.json_fields.empty()) {
                 DecodeJsonFieldsToChunk(chunk, row, 3, payload, config.json_fields);
-            } else {
+            } else if (!config.msgpack_fields.empty()) {
                 DecodeMsgpackFieldPathsToChunk(chunk, row, output_columns, payload, config.msgpack_field_paths);
+            } else if (proto_message) {
+                proto_message->Clear();
+                if (DecodeProtobufPayload(*proto_message, payload)) {
+                    DecodeProtobufFieldsToChunk(chunk, row, output_columns, proto_message, config.proto_field_paths);
+                } else {
+                    for (auto output_column : output_columns) FlatVector::SetNull(chunk.data[output_column], row, true);
+                }
             }
         }
         chunk.SetCardinality(batch.size());
@@ -551,7 +627,7 @@ static void SubscribeClosed(natsConnection *, void *closure) {
     lock_guard<std::mutex> guard(job->mutex);
     job->progress.connected = false;
     job->progress.reconnecting = false;
-    if (!job->progress.stop_requested) {
+    if (!job->progress.stop_requested && !job->progress.failed) {
         job->progress.last_error = "NATS connection closed after reconnect attempts";
         job->progress.last_error_time = Timestamp::GetCurrentTimestamp();
     }
@@ -606,6 +682,22 @@ static void CreateSubscribeSubscription(const shared_ptr<NatsSubscribeJobState> 
 static void RunSubscribeWorker(const shared_ptr<NatsSubscribeJobState> &job) {
     try {
         Connection conn(*job->db);
+        shared_ptr<DiskSourceTree> proto_source_tree;
+        shared_ptr<SubscribeProtobufErrorCollector> proto_error_collector;
+        shared_ptr<Importer> proto_importer;
+        unique_ptr<DynamicMessageFactory> proto_factory;
+        unique_ptr<Message> proto_message;
+        if (!job->config.proto_fields.empty()) {
+            const Descriptor *descriptor = nullptr;
+            ImportSubscribeProtoSchema(job->config.proto_file, job->config.proto_message, proto_source_tree,
+                                       proto_error_collector, proto_importer, descriptor);
+            job->config.proto_field_paths.clear();
+            for (const auto &field : job->config.proto_fields) {
+                job->config.proto_field_paths.push_back(ResolveProtobufFieldPath(descriptor, field));
+            }
+            proto_factory = make_uniq<DynamicMessageFactory>();
+            proto_message.reset(proto_factory->GetPrototype(descriptor)->New());
+        }
         EnsureTargetTable(conn, job->config);
         NatsConnectionCallbacks callbacks;
         callbacks.disconnected = SubscribeDisconnected;
@@ -672,7 +764,7 @@ static void RunSubscribeWorker(const shared_ptr<NatsSubscribeJobState> &job) {
             RefreshSubscribeMetrics(job);
             if (s == NATS_TIMEOUT) {
                 if (!batch.empty()) {
-                    FlushSubscribeBatch(conn, job->config, batch);
+                    FlushSubscribeBatch(conn, job->config, batch, proto_message.get());
                     {
                         lock_guard<std::mutex> guard(job->mutex);
                         job->progress.batches_committed++;
@@ -711,7 +803,7 @@ static void RunSubscribeWorker(const shared_ptr<NatsSubscribeJobState> &job) {
 
             batch.emplace_back(std::move(subject), std::move(payload));
             if (batch.size() >= job->config.batch_size) {
-                FlushSubscribeBatch(conn, job->config, batch);
+                FlushSubscribeBatch(conn, job->config, batch, proto_message.get());
                 {
                     lock_guard<std::mutex> guard(job->mutex);
                     job->progress.batches_committed++;
@@ -724,7 +816,7 @@ static void RunSubscribeWorker(const shared_ptr<NatsSubscribeJobState> &job) {
         }
 
         if (!batch.empty()) {
-            FlushSubscribeBatch(conn, job->config, batch);
+            FlushSubscribeBatch(conn, job->config, batch, proto_message.get());
             lock_guard<std::mutex> guard(job->mutex);
             job->progress.batches_committed++;
             job->progress.rows_inserted += batch.size();
