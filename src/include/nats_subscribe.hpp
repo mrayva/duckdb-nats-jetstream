@@ -47,6 +47,7 @@ struct NatsSubscribeProgress {
     bool pause_requested = false;
     bool stop_requested = false;
     bool failed = false;
+    bool resubscribe_requested = false;
     uint64_t rows_inserted = 0;
     uint64_t batches_committed = 0;
     uint64_t pending_messages = 0;
@@ -55,11 +56,15 @@ struct NatsSubscribeProgress {
     uint64_t max_pending_bytes = 0;
     uint64_t messages_delivered = 0;
     uint64_t messages_dropped = 0;
+    bool connected = false;
+    bool reconnecting = false;
+    uint64_t reconnect_count = 0;
     string last_error;
     timestamp_t last_start_time;
     timestamp_t last_commit_time;
     timestamp_t last_error_time;
     timestamp_t last_message_time;
+    timestamp_t last_reconnect_time {0};
 };
 
 struct NatsSubscribeJobState {

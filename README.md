@@ -209,6 +209,12 @@ Use `scripts/run-subscribe-pause-resume-harness.sh` to exercise the control
 path deterministically against local NATS.
 Use `scripts/run-subscribe-backpressure-harness.sh` to verify bounded pending
 queues and dropped-message reporting under overload.
+NATS connections use automatic reconnect with a bounded retry window. JetStream
+ingest retries transient pull failures and resumes from its durable consumer and
+DuckDB checkpoint; core subscriptions explicitly reattach after reconnect.
+Status functions expose `connected`, `reconnecting`, `reconnect_count`, and
+`last_reconnect_time`. Run `scripts/run-reconnect-harness.sh` for an isolated
+server restart regression test.
 
 ## Authentication And TLS
 

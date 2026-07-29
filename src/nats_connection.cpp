@@ -59,10 +59,23 @@ void RegisterNatsConnectionParameters(TableFunction &function) {
     function.named_parameters["tls_skip_verify"] = LogicalType(LogicalTypeId::BOOLEAN);
 }
 
-void ConfigureNatsOptions(natsOptions *options, const NatsConnectionConfig &config) {
+void ConfigureNatsOptions(natsOptions *options, const NatsConnectionConfig &config,
+                          const NatsConnectionCallbacks *callbacks) {
     ValidateNatsConnectionConfig(config);
     CheckNatsStatus(natsOptions_SetTimeout(options, 5000), "Failed to set NATS timeout");
     CheckNatsStatus(natsOptions_SetURL(options, config.url.c_str()), "Failed to set NATS URL");
+    CheckNatsStatus(natsOptions_SetAllowReconnect(options, true), "Failed to enable NATS reconnect");
+    CheckNatsStatus(natsOptions_SetMaxReconnect(options, 600), "Failed to set NATS reconnect limit");
+    CheckNatsStatus(natsOptions_SetReconnectWait(options, 1000), "Failed to set NATS reconnect wait");
+
+    if (callbacks != nullptr) {
+        CheckNatsStatus(natsOptions_SetDisconnectedCB(options, callbacks->disconnected, callbacks->closure),
+                       "Failed to set NATS disconnected callback");
+        CheckNatsStatus(natsOptions_SetReconnectedCB(options, callbacks->reconnected, callbacks->closure),
+                       "Failed to set NATS reconnected callback");
+        CheckNatsStatus(natsOptions_SetClosedCB(options, callbacks->closed, callbacks->closure),
+                       "Failed to set NATS closed callback");
+    }
 
     if (!config.credentials_file.empty()) {
         CheckNatsStatus(natsOptions_SetUserCredentialsFromFiles(options, config.credentials_file.c_str(), nullptr),
@@ -94,13 +107,14 @@ void ConfigureNatsOptions(natsOptions *options, const NatsConnectionConfig &conf
     }
 }
 
-void ConnectNats(const NatsConnectionConfig &config, natsConnection **connection, idx_t max_attempts) {
+void ConnectNats(const NatsConnectionConfig &config, natsConnection **connection, idx_t max_attempts,
+                 const NatsConnectionCallbacks *callbacks) {
     natsStatus last_status = NATS_OK;
     for (idx_t attempt = 0; attempt < max_attempts; attempt++) {
         natsOptions *options = nullptr;
         CheckNatsStatus(natsOptions_Create(&options), "Failed to create NATS options");
         try {
-            ConfigureNatsOptions(options, config);
+            ConfigureNatsOptions(options, config, callbacks);
             last_status = natsConnection_Connect(connection, options);
             natsOptions_Destroy(options);
         } catch (...) {

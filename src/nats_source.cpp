@@ -62,7 +62,8 @@ int NatsMessageEnvelope::DataLength() const {
     return data_length_;
 }
 
-NatsJetStreamBatchSource::NatsJetStreamBatchSource(natsSubscription *subscription) : subscription_(subscription) {
+NatsJetStreamBatchSource::NatsJetStreamBatchSource(natsSubscription *subscription, natsConnection *connection)
+    : subscription_(subscription), connection_(connection) {
     if (subscription_ == nullptr) {
         throw std::runtime_error("JetStream batch source requires a subscription");
     }
@@ -118,33 +119,44 @@ bool NatsJetStreamBatchSource::Fetch(natsMsgList &target, uint64_t batch_size, i
         throw std::runtime_error("JetStream batch source requires a positive fetch timeout");
     }
 
-    jsFetchRequest request;
-    natsStatus status = jsFetchRequest_Init(&request);
-    if (status != NATS_OK) {
-        throw std::runtime_error(std::string("Failed to initialize JetStream fetch request: ") +
-                                 natsStatus_GetText(status));
-    }
+    while (true) {
+        jsFetchRequest request;
+        natsStatus status = jsFetchRequest_Init(&request);
+        if (status != NATS_OK) {
+            throw std::runtime_error(std::string("Failed to initialize JetStream fetch request: ") +
+                                     natsStatus_GetText(status));
+        }
 
-    request.Batch = static_cast<int>(std::min<uint64_t>(batch_size, 65536));
-    request.Expires = fetch_timeout_ms * 1000LL * 1000LL;
-    request.NoWait = no_wait;
+        request.Batch = static_cast<int>(std::min<uint64_t>(batch_size, 65536));
+        request.Expires = fetch_timeout_ms * 1000LL * 1000LL;
+        request.NoWait = no_wait;
 
-    status = natsSubscription_FetchRequest(&target, subscription_, &request);
-    if (status == NATS_TIMEOUT || status == NATS_NOT_FOUND) {
-        natsMsgList_Destroy(&target);
-        target = {nullptr, 0};
-        return false;
+        status = natsSubscription_FetchRequest(&target, subscription_, &request);
+        if (status == NATS_TIMEOUT || status == NATS_NOT_FOUND) {
+            natsMsgList_Destroy(&target);
+            target = {nullptr, 0};
+            return false;
+        }
+        if (status == NATS_CONNECTION_DISCONNECTED || status == NATS_IO_ERROR || status == NATS_STALE_CONNECTION ||
+            status == NATS_NOT_YET_CONNECTED || status == NATS_LIMIT_REACHED) {
+            if (connection_ != nullptr && !natsConnection_IsClosed(connection_)) {
+                natsMsgList_Destroy(&target);
+                target = {nullptr, 0};
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                continue;
+            }
+        }
+        if (status != NATS_OK) {
+            throw std::runtime_error(std::string("Failed to fetch JetStream message batch from '") +
+                                     stream_name + "': " + natsStatus_GetText(status));
+        }
+        if (target.Count == 0) {
+            natsMsgList_Destroy(&target);
+            target = {nullptr, 0};
+            return false;
+        }
+        return true;
     }
-    if (status != NATS_OK) {
-        throw std::runtime_error(std::string("Failed to fetch JetStream message batch from '") +
-                                 stream_name + "': " + natsStatus_GetText(status));
-    }
-    if (target.Count == 0) {
-        natsMsgList_Destroy(&target);
-        target = {nullptr, 0};
-        return false;
-    }
-    return true;
 }
 
 bool NatsJetStreamBatchSource::FetchBatch(uint64_t batch_size, int64_t fetch_timeout_ms, const string &stream_name,

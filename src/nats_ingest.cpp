@@ -124,6 +124,10 @@ struct NatsIngestSnapshot {
     uint64_t fetches_completed = 0;
     uint64_t last_batch_rows = 0;
     uint64_t sequence_lag = 0;
+    bool connected = false;
+    bool reconnecting = false;
+    uint64_t reconnect_count = 0;
+    timestamp_t last_reconnect_time {0};
     timestamp_t last_start_time;
     timestamp_t last_fetch_time;
     timestamp_t last_ack_time;
@@ -153,6 +157,9 @@ static void RestoreJobProgress(const shared_ptr<NatsIngestJobState> &job, const 
 static void RunIngestWorker(const shared_ptr<NatsIngestJobState> &job);
 static TableCatalogEntry &ResolveTargetTable(ClientContext &context, const string &target_table);
 static void EnsureTargetTable(Connection &conn, NatsIngestConfig &config);
+static void IngestDisconnected(natsConnection *, void *closure);
+static void IngestReconnected(natsConnection *, void *closure);
+static void IngestClosed(natsConnection *, void *closure);
 
 static string SqlStringLiteral(const string &value) {
     string result = "'";
@@ -972,6 +979,10 @@ static NatsIngestSnapshot SnapshotJob(const shared_ptr<NatsIngestJobState> &job)
     snapshot.sequence_lag = snapshot.last_delivered_seq > snapshot.last_committed_seq
                                 ? snapshot.last_delivered_seq - snapshot.last_committed_seq
                                 : 0;
+    snapshot.connected = job->progress.connected;
+    snapshot.reconnecting = job->progress.reconnecting;
+    snapshot.reconnect_count = job->progress.reconnect_count;
+    snapshot.last_reconnect_time = job->progress.last_reconnect_time;
     snapshot.last_start_time = job->progress.last_start_time;
     snapshot.last_fetch_time = job->progress.last_fetch_time;
     snapshot.last_ack_time = job->progress.last_ack_time;
@@ -1076,6 +1087,14 @@ static void FillSnapshotColumns(DataChunk &output, idx_t row, const NatsIngestSn
     } else {
         output.SetValue(22, row, Value(snapshot.last_error));
     }
+    output.SetValue(23, row, Value(snapshot.connected));
+    output.SetValue(24, row, Value(snapshot.reconnecting));
+    output.SetValue(25, row, Value::UBIGINT(snapshot.reconnect_count));
+    if (snapshot.last_reconnect_time.value == 0) {
+        FlatVector::SetNull(output.data[26], row, true);
+    } else {
+        output.SetValue(26, row, Value::TIMESTAMP(snapshot.last_reconnect_time));
+    }
 }
 
 static void AddSnapshotColumns(vector<LogicalType> &return_types, vector<string> &names) {
@@ -1125,6 +1144,14 @@ static void AddSnapshotColumns(vector<LogicalType> &return_types, vector<string>
     return_types.emplace_back(LogicalType(LogicalTypeId::TIMESTAMP));
     names.emplace_back("last_error");
     return_types.emplace_back(LogicalType(LogicalTypeId::VARCHAR));
+    names.emplace_back("connected");
+    return_types.emplace_back(LogicalType(LogicalTypeId::BOOLEAN));
+    names.emplace_back("reconnecting");
+    return_types.emplace_back(LogicalType(LogicalTypeId::BOOLEAN));
+    names.emplace_back("reconnect_count");
+    return_types.emplace_back(LogicalType(LogicalTypeId::UBIGINT));
+    names.emplace_back("last_reconnect_time");
+    return_types.emplace_back(LogicalType(LogicalTypeId::TIMESTAMP));
 }
 
 static void InitializeJobStateFromConfig(const shared_ptr<NatsIngestJobState> &job, ClientContext &context) {
@@ -1134,6 +1161,36 @@ static void InitializeJobStateFromConfig(const shared_ptr<NatsIngestJobState> &j
 static void InitializeJobStateFromDatabase(const shared_ptr<NatsIngestJobState> &job, DatabaseInstance &db) {
     Connection db_connection(db);
     job->db = db_connection.context->db;
+}
+
+static void IngestDisconnected(natsConnection *, void *closure) {
+    auto *job = static_cast<NatsIngestJobState *>(closure);
+    lock_guard<std::mutex> guard(job->job_mutex);
+    job->progress.connected = false;
+    job->progress.reconnecting = true;
+    job->cv.notify_all();
+}
+
+static void IngestReconnected(natsConnection *, void *closure) {
+    auto *job = static_cast<NatsIngestJobState *>(closure);
+    lock_guard<std::mutex> guard(job->job_mutex);
+    job->progress.connected = true;
+    job->progress.reconnecting = false;
+    job->progress.reconnect_count++;
+    job->progress.last_reconnect_time = Timestamp::GetCurrentTimestamp();
+    job->cv.notify_all();
+}
+
+static void IngestClosed(natsConnection *, void *closure) {
+    auto *job = static_cast<NatsIngestJobState *>(closure);
+    lock_guard<std::mutex> guard(job->job_mutex);
+    job->progress.connected = false;
+    job->progress.reconnecting = false;
+    if (!job->progress.stop_requested) {
+        job->progress.last_error = "NATS connection closed after reconnect attempts";
+        job->progress.last_error_time = Timestamp::GetCurrentTimestamp();
+    }
+    job->cv.notify_all();
 }
 
 static void InitializeIngestResources(const shared_ptr<NatsIngestJobState> &job) {
@@ -1152,7 +1209,12 @@ static void InitializeIngestResources(const shared_ptr<NatsIngestJobState> &job)
 
     natsConnection *conn = nullptr;
     jsCtx *js = nullptr;
-    ConnectNats(config.connection, &conn, 20);
+    NatsConnectionCallbacks callbacks;
+    callbacks.disconnected = IngestDisconnected;
+    callbacks.reconnected = IngestReconnected;
+    callbacks.closed = IngestClosed;
+    callbacks.closure = job.get();
+    ConnectNats(config.connection, &conn, 20, &callbacks);
     auto jetstream_status = natsConnection_JetStream(&js, conn, nullptr);
     if (jetstream_status != NATS_OK) {
         natsConnection_Destroy(conn);
@@ -1187,6 +1249,7 @@ static void InitializeIngestResources(const shared_ptr<NatsIngestJobState> &job)
     jsSubOptions sub_opts;
     jsSubOptions_Init(&sub_opts);
     sub_opts.Stream = config.stream_name.c_str();
+    sub_opts.Config.Durable = nullptr;
     sub_opts.Config.DeliverPolicy = js_DeliverByStartSequence;
     sub_opts.Config.AckPolicy = js_AckExplicit;
     sub_opts.Config.ReplayPolicy = js_ReplayInstant;
@@ -1208,7 +1271,27 @@ static void InitializeIngestResources(const shared_ptr<NatsIngestJobState> &job)
 
     jsErrCode js_err = static_cast<jsErrCode>(0);
     natsSubscription *sub = nullptr;
-    s = js_PullSubscribe(&sub, js, subscription_subject.c_str(), nullptr, nullptr, &sub_opts, &js_err);
+    jsConsumerInfo *consumer_info = nullptr;
+    auto consumer_status = js_GetConsumerInfo(&consumer_info, js, config.stream_name.c_str(),
+                                               config.durable_name.c_str(), nullptr, nullptr);
+    if (consumer_info != nullptr) {
+        jsConsumerInfo_Destroy(consumer_info);
+    }
+    bool bind_existing_consumer = consumer_status == NATS_OK;
+    sub_opts.Consumer = bind_existing_consumer ? config.durable_name.c_str() : nullptr;
+    const char *durable = bind_existing_consumer ? nullptr : config.durable_name.c_str();
+    s = js_PullSubscribe(&sub, js, subscription_subject.c_str(), durable, nullptr, &sub_opts, &js_err);
+    if (s != NATS_OK && bind_existing_consumer) {
+        // A previous process may have left an unusable pull binding behind.
+        // The DuckDB checkpoint is authoritative, so recreating the durable
+        // consumer is safe and allows unacknowledged messages to be replayed.
+        auto delete_status = js_DeleteConsumer(js, config.stream_name.c_str(), config.durable_name.c_str(), nullptr, &js_err);
+        if (delete_status == NATS_OK) {
+            sub_opts.Consumer = nullptr;
+            durable = config.durable_name.c_str();
+            s = js_PullSubscribe(&sub, js, subscription_subject.c_str(), durable, nullptr, &sub_opts, &js_err);
+        }
+    }
     if (s != NATS_OK) {
         jsStreamInfo_Destroy(stream_info);
         DisconnectJetStream(&conn, &js);
@@ -1221,6 +1304,8 @@ static void InitializeIngestResources(const shared_ptr<NatsIngestJobState> &job)
     job->conn = conn;
     job->js = js;
     job->sub = sub;
+    job->progress.connected = true;
+    job->progress.reconnecting = false;
 }
 
 static shared_ptr<NatsIngestJobState> LaunchIngestJob(const NatsIngestConfig &config, ClientContext *context,
@@ -1599,7 +1684,7 @@ static void RunIngestWorker(const shared_ptr<NatsIngestJobState> &job) {
         if (!sub) {
             throw std::runtime_error("Ingest worker did not initialize a JetStream subscription");
         }
-        NatsJetStreamBatchSource message_source(sub);
+        NatsJetStreamBatchSource message_source(sub, job->conn);
         message_source.StartPrefetch(transport_batch_size, config.fetch_timeout_ms, config.stream_name);
 
         while (true) {
@@ -1933,6 +2018,8 @@ static void RunIngestWorker(const shared_ptr<NatsIngestJobState> &job) {
             lock_guard<std::mutex> guard(job->job_mutex);
             job->progress.running = false;
             job->progress.stopped = true;
+            job->progress.connected = false;
+            job->progress.reconnecting = false;
         }
         job->cv.notify_all();
         PersistRegistry(db_connection, job);
@@ -1942,6 +2029,8 @@ static void RunIngestWorker(const shared_ptr<NatsIngestJobState> &job) {
             job->progress.running = false;
             job->progress.stopped = true;
             job->progress.failed = true;
+            job->progress.connected = false;
+            job->progress.reconnecting = false;
             job->progress.last_error_time = Timestamp::GetCurrentTimestamp();
             job->progress.last_error = ex.what();
         }
@@ -1960,6 +2049,8 @@ static void RunIngestWorker(const shared_ptr<NatsIngestJobState> &job) {
             job->progress.running = false;
             job->progress.stopped = true;
             job->progress.failed = true;
+            job->progress.connected = false;
+            job->progress.reconnecting = false;
             job->progress.last_error_time = Timestamp::GetCurrentTimestamp();
             job->progress.last_error = "Unknown ingest worker failure";
         }

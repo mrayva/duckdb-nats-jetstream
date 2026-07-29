@@ -133,11 +133,15 @@ struct NatsSubscribeSnapshot {
     uint64_t max_pending_bytes = 0;
     uint64_t messages_delivered = 0;
     uint64_t messages_dropped = 0;
+    bool connected = false;
+    bool reconnecting = false;
+    uint64_t reconnect_count = 0;
     string last_error;
     timestamp_t last_start_time;
     timestamp_t last_commit_time;
     timestamp_t last_error_time;
     timestamp_t last_message_time;
+    timestamp_t last_reconnect_time {0};
 };
 
 struct NatsSubscribeBindData : public TableFunctionData {
@@ -177,12 +181,15 @@ static void AddSubscribeSnapshotColumns(vector<LogicalType> &return_types, vecto
                     LogicalType(LogicalTypeId::UBIGINT),    LogicalType(LogicalTypeId::UBIGINT),
                     LogicalType(LogicalTypeId::TIMESTAMP),  LogicalType(LogicalTypeId::TIMESTAMP),
                     LogicalType(LogicalTypeId::TIMESTAMP),  LogicalType(LogicalTypeId::TIMESTAMP),
-                    LogicalType(LogicalTypeId::VARCHAR)};
+                    LogicalType(LogicalTypeId::VARCHAR),    LogicalType(LogicalTypeId::BOOLEAN),
+                    LogicalType(LogicalTypeId::BOOLEAN),     LogicalType(LogicalTypeId::UBIGINT),
+                    LogicalType(LogicalTypeId::TIMESTAMP)};
     names = {"job_name",         "target_table",     "nats_url",        "subject",       "queue_group",
              "running",          "paused",           "pause_requested", "stop_requested", "failed",
              "rows_inserted",    "batches_committed", "pending_messages", "pending_bytes",
              "max_pending_messages", "max_pending_bytes", "messages_delivered", "messages_dropped",
-             "last_start_time", "last_commit_time", "last_error_time", "last_message_time", "last_error"};
+             "last_start_time", "last_commit_time", "last_error_time", "last_message_time", "last_error",
+             "connected", "reconnecting", "reconnect_count", "last_reconnect_time"};
 }
 
 static void FillSubscribeSnapshotColumns(DataChunk &output, idx_t row, const NatsSubscribeSnapshot &snapshot) {
@@ -209,6 +216,14 @@ static void FillSubscribeSnapshotColumns(DataChunk &output, idx_t row, const Nat
     output.SetValue(20, row, Value::TIMESTAMP(snapshot.last_error_time));
     output.SetValue(21, row, Value::TIMESTAMP(snapshot.last_message_time));
     output.SetValue(22, row, Value(snapshot.last_error));
+    output.SetValue(23, row, Value(snapshot.connected));
+    output.SetValue(24, row, Value(snapshot.reconnecting));
+    output.SetValue(25, row, Value::UBIGINT(snapshot.reconnect_count));
+    if (snapshot.last_reconnect_time.value == 0) {
+        FlatVector::SetNull(output.data[26], row, true);
+    } else {
+        output.SetValue(26, row, Value::TIMESTAMP(snapshot.last_reconnect_time));
+    }
 }
 
 static NatsSubscribeSnapshot SnapshotJob(const shared_ptr<NatsSubscribeJobState> &job) {
@@ -233,11 +248,15 @@ static NatsSubscribeSnapshot SnapshotJob(const shared_ptr<NatsSubscribeJobState>
     snapshot.max_pending_bytes = job->progress.max_pending_bytes;
     snapshot.messages_delivered = job->progress.messages_delivered;
     snapshot.messages_dropped = job->progress.messages_dropped;
+    snapshot.connected = job->progress.connected;
+    snapshot.reconnecting = job->progress.reconnecting;
+    snapshot.reconnect_count = job->progress.reconnect_count;
     snapshot.last_error = job->progress.last_error;
     snapshot.last_start_time = job->progress.last_start_time;
     snapshot.last_commit_time = job->progress.last_commit_time;
     snapshot.last_error_time = job->progress.last_error_time;
     snapshot.last_message_time = job->progress.last_message_time;
+    snapshot.last_reconnect_time = job->progress.last_reconnect_time;
     return snapshot;
 }
 
@@ -465,49 +484,116 @@ static void RefreshSubscribeMetrics(const shared_ptr<NatsSubscribeJobState> &job
     job->progress.messages_dropped = static_cast<uint64_t>(std::max<int64_t>(messages_dropped, 0));
 }
 
+static void SubscribeDisconnected(natsConnection *, void *closure) {
+    auto *job = static_cast<NatsSubscribeJobState *>(closure);
+    lock_guard<std::mutex> guard(job->mutex);
+    job->progress.connected = false;
+    job->progress.reconnecting = true;
+    job->progress.resubscribe_requested = true;
+    job->cv.notify_all();
+}
+
+static void SubscribeReconnected(natsConnection *, void *closure) {
+    auto *job = static_cast<NatsSubscribeJobState *>(closure);
+    lock_guard<std::mutex> guard(job->mutex);
+    job->progress.connected = true;
+    job->progress.reconnecting = false;
+    job->progress.reconnect_count++;
+    job->progress.last_reconnect_time = Timestamp::GetCurrentTimestamp();
+    job->cv.notify_all();
+}
+
+static void SubscribeClosed(natsConnection *, void *closure) {
+    auto *job = static_cast<NatsSubscribeJobState *>(closure);
+    lock_guard<std::mutex> guard(job->mutex);
+    job->progress.connected = false;
+    job->progress.reconnecting = false;
+    if (!job->progress.stop_requested) {
+        job->progress.last_error = "NATS connection closed after reconnect attempts";
+        job->progress.last_error_time = Timestamp::GetCurrentTimestamp();
+    }
+    job->cv.notify_all();
+}
+
+static bool IsTransientNatsStatus(natsStatus status) {
+    return status == NATS_CONNECTION_DISCONNECTED || status == NATS_IO_ERROR ||
+           status == NATS_STALE_CONNECTION || status == NATS_NOT_YET_CONNECTED;
+}
+
+static void CreateSubscribeSubscription(const shared_ptr<NatsSubscribeJobState> &job) {
+    natsConnection *conn = nullptr;
+    {
+        lock_guard<std::mutex> guard(job->mutex);
+        conn = job->conn;
+    }
+    if (conn == nullptr || natsConnection_IsClosed(conn)) {
+        throw std::runtime_error("Cannot create NATS subscription while connection is closed");
+    }
+
+    natsSubscription *sub = nullptr;
+    natsStatus status = NATS_OK;
+    if (!job->config.queue_group.empty()) {
+        status = natsConnection_QueueSubscribeSync(&sub, conn, job->config.subject.c_str(),
+                                                   job->config.queue_group.c_str());
+    } else {
+        status = natsConnection_SubscribeSync(&sub, conn, job->config.subject.c_str());
+    }
+    if (status != NATS_OK) {
+        throw std::runtime_error(std::string("Failed to create NATS subscription: ") + natsStatus_GetText(status));
+    }
+    status = natsSubscription_SetPendingLimits(sub, job->config.pending_message_limit,
+                                                job->config.pending_bytes_limit);
+    if (status != NATS_OK) {
+        natsSubscription_Destroy(sub);
+        throw std::runtime_error(std::string("Failed to set NATS subscription pending limits: ") +
+                                 natsStatus_GetText(status));
+    }
+    status = natsConnection_FlushTimeout(conn, 5000);
+    if (status != NATS_OK) {
+        natsSubscription_Destroy(sub);
+        throw std::runtime_error(std::string("Failed to flush NATS subscription: ") + natsStatus_GetText(status));
+    }
+    {
+        lock_guard<std::mutex> guard(job->mutex);
+        job->sub = sub;
+        job->progress.resubscribe_requested = false;
+    }
+}
+
 static void RunSubscribeWorker(const shared_ptr<NatsSubscribeJobState> &job) {
     try {
         Connection conn(*job->db);
         EnsureTargetTable(conn, job->config);
-        ConnectNats(job->config.connection, &job->conn);
+        NatsConnectionCallbacks callbacks;
+        callbacks.disconnected = SubscribeDisconnected;
+        callbacks.reconnected = SubscribeReconnected;
+        callbacks.closed = SubscribeClosed;
+        callbacks.closure = job.get();
+        ConnectNats(job->config.connection, &job->conn, 20, &callbacks);
 
-        natsStatus s = NATS_OK;
-        if (!job->config.queue_group.empty()) {
-            s = natsConnection_QueueSubscribeSync(&job->sub, job->conn, job->config.subject.c_str(),
-                                                  job->config.queue_group.c_str());
-        } else {
-            s = natsConnection_SubscribeSync(&job->sub, job->conn, job->config.subject.c_str());
-        }
-        if (s != NATS_OK) {
-            throw std::runtime_error(std::string("Failed to create NATS subscription: ") + natsStatus_GetText(s));
-        }
-        s = natsSubscription_SetPendingLimits(job->sub, job->config.pending_message_limit,
-                                              job->config.pending_bytes_limit);
-        if (s != NATS_OK) {
-            throw std::runtime_error(std::string("Failed to set NATS subscription pending limits: ") +
-                                     natsStatus_GetText(s));
-        }
-        s = natsConnection_FlushTimeout(job->conn, 5000);
-        if (s != NATS_OK) {
-            throw std::runtime_error(std::string("Failed to flush NATS subscription: ") + natsStatus_GetText(s));
-        }
+        CreateSubscribeSubscription(job);
 
         {
             lock_guard<std::mutex> guard(job->mutex);
             job->progress.running = true;
+            job->progress.connected = true;
+            job->progress.reconnecting = false;
             job->progress.last_start_time = Timestamp::GetCurrentTimestamp();
         }
         job->cv.notify_all();
 
         vector<pair<string, string>> batch;
         batch.reserve(job->config.batch_size);
+        natsStatus s = NATS_OK;
 
         while (true) {
+            bool resubscribe_requested = false;
             {
                 unique_lock<std::mutex> lock(job->mutex);
                 if (job->progress.stop_requested) {
                     break;
                 }
+                resubscribe_requested = job->progress.resubscribe_requested;
                 if (job->progress.paused) {
                     lock.unlock();
                     RefreshSubscribeMetrics(job);
@@ -522,6 +608,20 @@ static void RunSubscribeWorker(const shared_ptr<NatsSubscribeJobState> &job) {
                         continue;
                     }
                 }
+            }
+
+            if (resubscribe_requested) {
+                natsSubscription *old_sub = nullptr;
+                {
+                    lock_guard<std::mutex> guard(job->mutex);
+                    old_sub = job->sub;
+                    job->sub = nullptr;
+                }
+                if (old_sub != nullptr) {
+                    natsSubscription_Destroy(old_sub);
+                }
+                CreateSubscribeSubscription(job);
+                continue;
             }
 
             natsMsg *msg = nullptr;
@@ -542,6 +642,10 @@ static void RunSubscribeWorker(const shared_ptr<NatsSubscribeJobState> &job) {
                 continue;
             }
             if (s == NATS_SLOW_CONSUMER) {
+                continue;
+            }
+            if (IsTransientNatsStatus(s) && job->conn != nullptr && !natsConnection_IsClosed(job->conn)) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
                 continue;
             }
             if (s != NATS_OK) {
@@ -588,6 +692,8 @@ static void RunSubscribeWorker(const shared_ptr<NatsSubscribeJobState> &job) {
         {
             lock_guard<std::mutex> guard(job->mutex);
             job->progress.running = false;
+            job->progress.connected = false;
+            job->progress.reconnecting = false;
         }
     } catch (std::exception &ex) {
         lock_guard<std::mutex> guard(job->mutex);

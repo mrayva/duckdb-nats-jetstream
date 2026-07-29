@@ -56,6 +56,10 @@ struct NatsIngestProgress {
     uint64_t fetches_completed = 0;
     uint64_t last_batch_rows = 0;
     uint64_t checkpoint_seq = 0;
+    bool connected = false;
+    bool reconnecting = false;
+    uint64_t reconnect_count = 0;
+    timestamp_t last_reconnect_time {0};
     timestamp_t last_start_time;
     timestamp_t last_fetch_time;
     timestamp_t last_ack_time;

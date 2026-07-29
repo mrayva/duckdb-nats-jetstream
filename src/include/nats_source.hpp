@@ -39,7 +39,7 @@ private:
 // the caller. The caller owns a returned message and must destroy it.
 class NatsJetStreamBatchSource {
 public:
-    explicit NatsJetStreamBatchSource(natsSubscription *subscription);
+    explicit NatsJetStreamBatchSource(natsSubscription *subscription, natsConnection *connection = nullptr);
     ~NatsJetStreamBatchSource();
 
     NatsJetStreamBatchSource(const NatsJetStreamBatchSource &) = delete;
@@ -61,6 +61,7 @@ private:
     void ClearBatch();
 
     natsSubscription *subscription_ = nullptr;
+    natsConnection *connection_ = nullptr;
     natsMsgList messages_ {nullptr, 0};
     int next_index_ = 0;
     bool prefetch_enabled_ = false;
