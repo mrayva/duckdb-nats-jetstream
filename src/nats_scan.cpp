@@ -976,6 +976,12 @@ static void NatsScanExecute(ClientContext &context, TableFunctionInput &data_p, 
         msgpack_output_columns.push_back(msgpack_column.output_idx);
         msgpack_field_paths.push_back(bind_data.msgpack_field_paths[msgpack_column.field_idx]);
     }
+    vector<idx_t> proto_output_columns;
+    vector<vector<const FieldDescriptor *>> proto_field_paths;
+    for (const auto &proto_column : proto_columns) {
+        proto_output_columns.push_back(proto_column.output_idx);
+        proto_field_paths.push_back(bind_data.proto_field_paths[proto_column.field_idx]);
+    }
     bool needs_subject_for_filter = !bind_data.subject_contains.empty();
     bool needs_message_subject = needs_subject || needs_subject_for_filter;
     bool needs_message_payload = needs_payload || needs_json || needs_msgpack || needs_proto;
@@ -1117,10 +1123,7 @@ static void NatsScanExecute(ClientContext &context, TableFunctionInput &data_p, 
             bool parse_success = DecodeProtobufPayload(*proto_msg, payload);
 
             if (parse_success) {
-                for (const auto &proto_column : proto_columns) {
-                    Value field_value = ExtractProtobufValue(proto_msg.get(), bind_data.proto_field_paths[proto_column.field_idx]);
-                    output.SetValue(proto_column.output_idx, count, field_value);
-                }
+                DecodeProtobufFieldsToChunk(output, count, proto_output_columns, proto_msg.get(), proto_field_paths);
             } else {
                 for (const auto &proto_column : proto_columns) {
                     FlatVector::SetNull(output.data[proto_column.output_idx], count, true);

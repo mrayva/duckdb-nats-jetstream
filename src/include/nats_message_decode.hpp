@@ -32,4 +32,8 @@ LogicalType ProtobufFieldDescriptorToDuckDBType(const google::protobuf::FieldDes
 Value ExtractProtobufValue(const google::protobuf::Message *message,
                            const vector<const google::protobuf::FieldDescriptor *> &field_path);
 
+void DecodeProtobufFieldsToChunk(DataChunk &chunk, idx_t row_idx, const vector<idx_t> &output_columns,
+                                 const google::protobuf::Message *message,
+                                 const vector<vector<const google::protobuf::FieldDescriptor *>> &field_paths);
+
 } // namespace duckdb

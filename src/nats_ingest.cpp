@@ -1735,7 +1735,7 @@ static void AppendJsonFields(DataChunk &chunk, idx_t row_idx, const NatsIngestCo
 }
 
 static void AppendProtoFields(DataChunk &chunk, idx_t row_idx, const NatsIngestConfig &config, Message *proto_msg,
-                              const NatsPayloadView &payload) {
+                              const NatsPayloadView &payload, const vector<idx_t> &output_columns) {
     if (!proto_msg || !DecodeProtobufPayload(*proto_msg, payload)) {
         for (idx_t i = 0; i < config.proto_fields.size(); i++) {
             chunk.SetValue(5 + i, row_idx, Value());
@@ -1743,16 +1743,14 @@ static void AppendProtoFields(DataChunk &chunk, idx_t row_idx, const NatsIngestC
         return;
     }
 
-    idx_t col_idx = 5;
-    for (const auto &field_path : config.proto_field_paths) {
-        chunk.SetValue(col_idx++, row_idx, ExtractProtobufValue(proto_msg, field_path));
-    }
+    DecodeProtobufFieldsToChunk(chunk, row_idx, output_columns, proto_msg, config.proto_field_paths);
 }
 
 static void AppendMessageRow(DataChunk &chunk, idx_t row_idx, const NatsIngestConfig &config,
                              const NatsMessageEnvelope &envelope,
                              Message *proto_msg, vector<Value> &json_values, bool reuse_json_values,
-                             bool direct_json_write, const vector<idx_t> &msgpack_output_columns) {
+                             bool direct_json_write, const vector<idx_t> &msgpack_output_columns,
+                             const vector<idx_t> &proto_output_columns) {
     const char *subject = envelope.Subject();
     uint64_t stream_seq = envelope.Sequence();
     int64_t timestamp_ns = envelope.TimestampNs();
@@ -1782,7 +1780,7 @@ static void AppendMessageRow(DataChunk &chunk, idx_t row_idx, const NatsIngestCo
     } else if (!config.msgpack_fields.empty()) {
         DecodeMsgpackFieldPathsToChunk(chunk, row_idx, msgpack_output_columns, payload, config.msgpack_field_paths);
     } else if (!config.proto_fields.empty()) {
-        AppendProtoFields(chunk, row_idx, config, proto_msg, payload);
+        AppendProtoFields(chunk, row_idx, config, proto_msg, payload, proto_output_columns);
     }
 }
 
@@ -1925,6 +1923,11 @@ static void RunIngestWorker(const shared_ptr<NatsIngestJobState> &job) {
         msgpack_output_columns.reserve(config.msgpack_fields.size());
         for (idx_t i = 0; i < config.msgpack_fields.size(); i++) {
             msgpack_output_columns.push_back(5 + i);
+        }
+        vector<idx_t> proto_output_columns;
+        proto_output_columns.reserve(config.proto_fields.size());
+        for (idx_t i = 0; i < config.proto_fields.size(); i++) {
+            proto_output_columns.push_back(5 + i);
         }
         const char *json_buffer_mode = std::getenv("NATS_INGEST_JSON_BUFFER_MODE");
         bool reuse_json_values = !json_buffer_mode || string(json_buffer_mode) != "allocate";
@@ -2082,7 +2085,7 @@ static void RunIngestWorker(const shared_ptr<NatsIngestJobState> &job) {
                         batch_stage = "append row";
                         phase_start = std::chrono::steady_clock::now();
                         AppendMessageRow(write_chunk, write_row, config, envelope, nullptr, json_values,
-                                         reuse_json_values, direct_json_write, msgpack_output_columns);
+                                         reuse_json_values, direct_json_write, msgpack_output_columns, proto_output_columns);
                         timing.row_ns += static_cast<uint64_t>(
                             std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - phase_start)
                                 .count());
@@ -2091,7 +2094,7 @@ static void RunIngestWorker(const shared_ptr<NatsIngestJobState> &job) {
                         batch_stage = "append proto row";
                         phase_start = std::chrono::steady_clock::now();
                         AppendMessageRow(write_chunk, write_row, config, envelope, row_proto.get(), json_values,
-                                         reuse_json_values, direct_json_write, msgpack_output_columns);
+                                         reuse_json_values, direct_json_write, msgpack_output_columns, proto_output_columns);
                         timing.row_ns += static_cast<uint64_t>(
                             std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - phase_start)
                                 .count());

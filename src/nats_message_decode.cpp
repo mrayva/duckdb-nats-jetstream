@@ -517,4 +517,106 @@ Value ExtractProtobufValue(const google::protobuf::Message *message,
     return Value();
 }
 
+static void SetProtobufNull(Vector &vector, idx_t row_idx) {
+    FlatVector::SetNull(vector, row_idx, true);
+}
+
+static bool WriteProtobufScalar(Vector &vector, idx_t row_idx,
+                                const google::protobuf::Message &message,
+                                const google::protobuf::Reflection &reflection,
+                                const google::protobuf::FieldDescriptor &field) {
+    using Field = google::protobuf::FieldDescriptor;
+    if (field.is_repeated() || field.type() == Field::TYPE_MESSAGE) {
+        return false;
+    }
+
+    FlatVector::SetNull(vector, row_idx, false);
+    switch (field.type()) {
+    case Field::TYPE_STRING: {
+        const auto &value = reflection.GetString(message, &field);
+        FlatVector::GetData<string_t>(vector)[row_idx] = StringVector::AddString(vector, value.data(), value.size());
+        return true;
+    }
+    case Field::TYPE_BYTES: {
+        const auto &value = reflection.GetString(message, &field);
+        FlatVector::GetData<string_t>(vector)[row_idx] = StringVector::AddStringOrBlob(vector, value.data(), value.size());
+        return true;
+    }
+    case Field::TYPE_INT32:
+    case Field::TYPE_SINT32:
+    case Field::TYPE_SFIXED32:
+        FlatVector::GetData<int32_t>(vector)[row_idx] = reflection.GetInt32(message, &field);
+        return true;
+    case Field::TYPE_INT64:
+    case Field::TYPE_SINT64:
+    case Field::TYPE_SFIXED64:
+        FlatVector::GetData<int64_t>(vector)[row_idx] = reflection.GetInt64(message, &field);
+        return true;
+    case Field::TYPE_UINT32:
+    case Field::TYPE_FIXED32:
+        FlatVector::GetData<uint32_t>(vector)[row_idx] = reflection.GetUInt32(message, &field);
+        return true;
+    case Field::TYPE_UINT64:
+    case Field::TYPE_FIXED64:
+        FlatVector::GetData<uint64_t>(vector)[row_idx] = reflection.GetUInt64(message, &field);
+        return true;
+    case Field::TYPE_FLOAT:
+        FlatVector::GetData<float>(vector)[row_idx] = reflection.GetFloat(message, &field);
+        return true;
+    case Field::TYPE_DOUBLE:
+        FlatVector::GetData<double>(vector)[row_idx] = reflection.GetDouble(message, &field);
+        return true;
+    case Field::TYPE_BOOL:
+        FlatVector::GetData<bool>(vector)[row_idx] = reflection.GetBool(message, &field);
+        return true;
+    case Field::TYPE_ENUM: {
+        const auto *value = reflection.GetEnum(message, &field);
+        if (!value) {
+            SetProtobufNull(vector, row_idx);
+            return true;
+        }
+        auto name = value->name();
+        FlatVector::GetData<string_t>(vector)[row_idx] = StringVector::AddString(vector, name.data(), name.size());
+        return true;
+    }
+    default:
+        SetProtobufNull(vector, row_idx);
+        return true;
+    }
+}
+
+void DecodeProtobufFieldsToChunk(DataChunk &chunk, idx_t row_idx, const vector<idx_t> &output_columns,
+                                 const google::protobuf::Message *message,
+                                 const vector<vector<const google::protobuf::FieldDescriptor *>> &field_paths) {
+    for (idx_t i = 0; i < output_columns.size(); i++) {
+        auto &vector = chunk.data[output_columns[i]];
+        SetProtobufNull(vector, row_idx);
+        if (!message || i >= field_paths.size() || field_paths[i].empty()) {
+            continue;
+        }
+
+        const google::protobuf::Message *current_message = message;
+        const google::protobuf::Reflection *reflection = message->GetReflection();
+        bool missing = false;
+        for (idx_t path_idx = 0; path_idx + 1 < field_paths[i].size(); path_idx++) {
+            const auto *field = field_paths[i][path_idx];
+            if (!field || field->is_repeated() || field->type() != google::protobuf::FieldDescriptor::TYPE_MESSAGE ||
+                !reflection->HasField(*current_message, field)) {
+                missing = true;
+                break;
+            }
+            current_message = &reflection->GetMessage(*current_message, field);
+            reflection = current_message->GetReflection();
+        }
+        if (missing) {
+            continue;
+        }
+
+        const auto *leaf = field_paths[i].back();
+        if (!leaf || !WriteProtobufScalar(vector, row_idx, *current_message, *reflection, *leaf)) {
+            chunk.SetValue(output_columns[i], row_idx, ExtractProtobufValue(message, field_paths[i]));
+        }
+    }
+}
+
 } // namespace duckdb
