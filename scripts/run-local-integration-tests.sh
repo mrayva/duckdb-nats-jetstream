@@ -226,6 +226,11 @@ RESET_STREAMS=1 \
 "$ROOT_DIR/scripts/run-ingest-rehydrate-harness.sh"
 echo "PASS scripts/run-ingest-rehydrate-harness.sh"
 
+echo "RUN scripts/run-ingest-exactly-once-harness.sh"
+NATS_CLI="$NATS_CLI" \
+"$ROOT_DIR/scripts/run-ingest-exactly-once-harness.sh"
+echo "PASS scripts/run-ingest-exactly-once-harness.sh"
+
 echo "RUN scripts/run-subscribe-harness.sh"
 NATS_URL="$NATS_URL" \
 NATS_CLI="$NATS_CLI" \

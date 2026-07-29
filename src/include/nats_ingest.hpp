@@ -52,6 +52,7 @@ struct NatsIngestProgress {
     uint64_t last_committed_seq = 0;
     uint64_t last_delivered_seq = 0;
     uint64_t rows_inserted = 0;
+    uint64_t duplicates_skipped = 0;
     uint64_t batches_committed = 0;
     uint64_t fetches_completed = 0;
     uint64_t last_batch_rows = 0;

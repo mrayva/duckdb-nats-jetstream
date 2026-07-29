@@ -215,6 +215,10 @@ DuckDB checkpoint; core subscriptions explicitly reattach after reconnect.
 Status functions expose `connected`, `reconnecting`, `reconnect_count`, and
 `last_reconnect_time`. Run `scripts/run-reconnect-harness.sh` for an isolated
 server restart regression test.
+Use `scripts/run-ingest-exactly-once-harness.sh` to force a post-commit
+redelivery across a server restart and verify that the target row count stays
+exactly once; `duplicates_skipped` reports messages discarded by checkpoint or
+same-batch sequence deduplication.
 
 ## Authentication And TLS
 

@@ -120,6 +120,7 @@ struct NatsIngestSnapshot {
     uint64_t last_committed_seq = 0;
     uint64_t last_delivered_seq = 0;
     uint64_t rows_inserted = 0;
+    uint64_t duplicates_skipped = 0;
     uint64_t batches_committed = 0;
     uint64_t fetches_completed = 0;
     uint64_t last_batch_rows = 0;
@@ -290,6 +291,7 @@ static void EnsureRegistryTable(Connection &conn) {
         << "tls_key_file VARCHAR,"
         << "tls_server_name VARCHAR,"
         << "tls_skip_verify BOOLEAN NOT NULL DEFAULT FALSE,"
+        << "duplicates_skipped UBIGINT NOT NULL DEFAULT 0,"
         << "updated_at TIMESTAMP NOT NULL"
         << ")";
     ExecuteOrThrow(conn, sql.str(), "Failed to create ingest registry table");
@@ -311,6 +313,14 @@ static void EnsureRegistryTable(Connection &conn) {
                    "UPDATE " + string(NATS_INGEST_REGISTRY_TABLE) +
                        " SET tls_skip_verify = COALESCE(tls_skip_verify, FALSE)",
                    "Failed to backfill ingest registry TLS settings");
+    ExecuteOrThrow(conn,
+                   "ALTER TABLE " + string(NATS_INGEST_REGISTRY_TABLE) +
+                       " ADD COLUMN IF NOT EXISTS duplicates_skipped UBIGINT DEFAULT 0",
+                   "Failed to migrate ingest duplicate metrics");
+    ExecuteOrThrow(conn,
+                   "UPDATE " + string(NATS_INGEST_REGISTRY_TABLE) +
+                       " SET duplicates_skipped = COALESCE(duplicates_skipped, 0)",
+                   "Failed to backfill ingest duplicate metrics");
 }
 
 static void UpsertRegistry(Connection &conn, const NatsIngestSnapshot &snapshot) {
@@ -321,7 +331,8 @@ static void UpsertRegistry(Connection &conn, const NatsIngestSnapshot &snapshot)
            "proto_message, proto_fields, running, stop_requested, stopped, failed, paused, pause_requested, "
            "last_committed_seq, last_delivered_seq, rows_inserted, batches_committed, fetches_completed, last_batch_rows, "
            "sequence_lag, last_start_time, last_fetch_time, last_ack_time, last_commit_time, last_error_time, last_error, "
-           "credentials_file, tls_ca_file, tls_cert_file, tls_key_file, tls_server_name, tls_skip_verify, updated_at) VALUES ("
+           "credentials_file, tls_ca_file, tls_cert_file, tls_key_file, tls_server_name, tls_skip_verify, "
+           "duplicates_skipped, updated_at) VALUES ("
         << SqlStringLiteral(snapshot.job_name) << ", "
         << SqlStringLiteral(snapshot.stream_name) << ", "
         << SqlStringLiteral(snapshot.target_table) << ", "
@@ -364,6 +375,7 @@ static void UpsertRegistry(Connection &conn, const NatsIngestSnapshot &snapshot)
         << (snapshot.tls_key_file.empty() ? "NULL" : SqlStringLiteral(snapshot.tls_key_file)) << ", "
         << (snapshot.tls_server_name.empty() ? "NULL" : SqlStringLiteral(snapshot.tls_server_name)) << ", "
         << (snapshot.tls_skip_verify ? "TRUE" : "FALSE") << ", "
+        << snapshot.duplicates_skipped << ", "
         << "CURRENT_TIMESTAMP"
         << ") ON CONFLICT(job_name) DO UPDATE SET "
         << "stream_name = excluded.stream_name, "
@@ -407,6 +419,7 @@ static void UpsertRegistry(Connection &conn, const NatsIngestSnapshot &snapshot)
         << "tls_key_file = excluded.tls_key_file, "
         << "tls_server_name = excluded.tls_server_name, "
         << "tls_skip_verify = excluded.tls_skip_verify, "
+        << "duplicates_skipped = excluded.duplicates_skipped, "
         << "updated_at = excluded.updated_at";
     ExecuteOrThrow(conn, sql.str(), "Failed to update ingest registry");
 }
@@ -422,7 +435,7 @@ static bool LoadRegistrySnapshot(Connection &conn, const string &job_name, NatsI
            "proto_message, proto_fields, running, stop_requested, stopped, failed, paused, pause_requested, last_committed_seq, "
            "last_delivered_seq, rows_inserted, batches_committed, fetches_completed, last_batch_rows, sequence_lag, last_start_time, "
            "last_fetch_time, last_ack_time, last_commit_time, last_error_time, last_error, credentials_file, tls_ca_file, "
-           "tls_cert_file, tls_key_file, tls_server_name, tls_skip_verify "
+           "tls_cert_file, tls_key_file, tls_server_name, tls_skip_verify, duplicates_skipped "
         << "FROM " << NATS_INGEST_REGISTRY_TABLE << " WHERE job_name = " << SqlStringLiteral(job_name);
 
     auto result = conn.Query(sql.str());
@@ -515,6 +528,7 @@ static bool LoadRegistrySnapshot(Connection &conn, const string &job_name, NatsI
         snapshot.tls_server_name = chunk->GetValue(40, 0).GetValue<string>();
     }
     snapshot.tls_skip_verify = chunk->GetValue(41, 0).GetValue<bool>();
+    snapshot.duplicates_skipped = chunk->GetValue(42, 0).GetValue<uint64_t>();
     return true;
 }
 
@@ -525,7 +539,7 @@ static vector<NatsIngestSnapshot> LoadRegistrySnapshots(Connection &conn) {
            "proto_message, proto_fields, running, stop_requested, stopped, failed, paused, pause_requested, last_committed_seq, "
            "last_delivered_seq, rows_inserted, batches_committed, fetches_completed, last_batch_rows, sequence_lag, last_start_time, "
            "last_fetch_time, last_ack_time, last_commit_time, last_error_time, last_error, credentials_file, tls_ca_file, "
-           "tls_cert_file, tls_key_file, tls_server_name, tls_skip_verify "
+           "tls_cert_file, tls_key_file, tls_server_name, tls_skip_verify, duplicates_skipped "
         << "FROM " << NATS_INGEST_REGISTRY_TABLE << " ORDER BY job_name";
 
     auto result = conn.Query(sql.str());
@@ -617,6 +631,7 @@ static vector<NatsIngestSnapshot> LoadRegistrySnapshots(Connection &conn) {
                 snapshot.tls_server_name = chunk->GetValue(40, row).GetValue<string>();
             }
             snapshot.tls_skip_verify = chunk->GetValue(41, row).GetValue<bool>();
+            snapshot.duplicates_skipped = chunk->GetValue(42, row).GetValue<uint64_t>();
             snapshots.push_back(std::move(snapshot));
         }
     }
@@ -973,6 +988,7 @@ static NatsIngestSnapshot SnapshotJob(const shared_ptr<NatsIngestJobState> &job)
     snapshot.last_committed_seq = job->progress.last_committed_seq;
     snapshot.last_delivered_seq = job->progress.last_delivered_seq;
     snapshot.rows_inserted = job->progress.rows_inserted;
+    snapshot.duplicates_skipped = job->progress.duplicates_skipped;
     snapshot.batches_committed = job->progress.batches_committed;
     snapshot.fetches_completed = job->progress.fetches_completed;
     snapshot.last_batch_rows = job->progress.last_batch_rows;
@@ -1027,6 +1043,7 @@ static void RestoreJobProgress(const shared_ptr<NatsIngestJobState> &job, const 
     job->progress.last_committed_seq = std::max(job->progress.last_committed_seq, snapshot.last_committed_seq);
     job->progress.last_delivered_seq = std::max(job->progress.last_delivered_seq, snapshot.last_delivered_seq);
     job->progress.rows_inserted = std::max(job->progress.rows_inserted, snapshot.rows_inserted);
+    job->progress.duplicates_skipped = std::max(job->progress.duplicates_skipped, snapshot.duplicates_skipped);
     job->progress.batches_committed = std::max(job->progress.batches_committed, snapshot.batches_committed);
     job->progress.fetches_completed = std::max(job->progress.fetches_completed, snapshot.fetches_completed);
     job->progress.last_batch_rows = snapshot.last_batch_rows;
@@ -1095,6 +1112,7 @@ static void FillSnapshotColumns(DataChunk &output, idx_t row, const NatsIngestSn
     } else {
         output.SetValue(26, row, Value::TIMESTAMP(snapshot.last_reconnect_time));
     }
+    output.SetValue(27, row, Value::UBIGINT(snapshot.duplicates_skipped));
 }
 
 static void AddSnapshotColumns(vector<LogicalType> &return_types, vector<string> &names) {
@@ -1152,6 +1170,8 @@ static void AddSnapshotColumns(vector<LogicalType> &return_types, vector<string>
     return_types.emplace_back(LogicalType(LogicalTypeId::UBIGINT));
     names.emplace_back("last_reconnect_time");
     return_types.emplace_back(LogicalType(LogicalTypeId::TIMESTAMP));
+    names.emplace_back("duplicates_skipped");
+    return_types.emplace_back(LogicalType(LogicalTypeId::UBIGINT));
 }
 
 static void InitializeJobStateFromConfig(const shared_ptr<NatsIngestJobState> &job, ClientContext &context) {
@@ -1253,6 +1273,14 @@ static void InitializeIngestResources(const shared_ptr<NatsIngestJobState> &job)
     sub_opts.Config.DeliverPolicy = js_DeliverByStartSequence;
     sub_opts.Config.AckPolicy = js_AckExplicit;
     sub_opts.Config.AckWait = 5LL * 1000LL * 1000LL * 1000LL;
+    const char *ack_wait_env = std::getenv("NATS_INGEST_ACK_WAIT_MS");
+    if (ack_wait_env != nullptr) {
+        char *end = nullptr;
+        auto parsed_ack_wait = std::strtoull(ack_wait_env, &end, 10);
+        if (end != ack_wait_env && *end == '\0' && parsed_ack_wait > 0) {
+            sub_opts.Config.AckWait = static_cast<int64_t>(parsed_ack_wait) * 1000LL * 1000LL;
+        }
+    }
     sub_opts.Config.ReplayPolicy = js_ReplayInstant;
     sub_opts.Config.InactiveThreshold = 60LL * 1000LL * 1000LL * 1000LL;
 
@@ -1648,6 +1676,15 @@ static void RunIngestWorker(const shared_ptr<NatsIngestJobState> &job) {
                 fail_after_append_rows = parsed_rows;
             }
         }
+        uint64_t delay_before_ack_ms = 0;
+        const char *delay_before_ack_env = std::getenv("NATS_INGEST_DELAY_BEFORE_ACK_MS");
+        if (delay_before_ack_env != nullptr) {
+            char *end = nullptr;
+            auto parsed_delay = std::strtoull(delay_before_ack_env, &end, 10);
+            if (end != delay_before_ack_env && *end == '\0') {
+                delay_before_ack_ms = parsed_delay;
+            }
+        }
 
         shared_ptr<DiskSourceTree> source_tree;
         shared_ptr<ProtobufErrorCollector> error_collector;
@@ -1824,9 +1861,13 @@ static void RunIngestWorker(const shared_ptr<NatsIngestJobState> &job) {
                     batch_last_delivered_seq = std::max(batch_last_delivered_seq, msg_seq);
                     if (msg_seq != 0) {
                         if (msg_seq <= progress_snapshot.last_committed_seq) {
+                            lock_guard<std::mutex> guard(job->job_mutex);
+                            job->progress.duplicates_skipped++;
                             continue;
                         }
                         if (!batch_seen_sequences.insert(msg_seq).second) {
+                            lock_guard<std::mutex> guard(job->job_mutex);
+                            job->progress.duplicates_skipped++;
                             continue;
                         }
                     }
@@ -1999,6 +2040,10 @@ static void RunIngestWorker(const shared_ptr<NatsIngestJobState> &job) {
                 if (inject_fail_after_commit && !injected_fail_after_commit) {
                     injected_fail_after_commit = true;
                     std::abort();
+                }
+
+                if (delay_before_ack_ms > 0) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(delay_before_ack_ms));
                 }
 
                 phase_start = std::chrono::steady_clock::now();
