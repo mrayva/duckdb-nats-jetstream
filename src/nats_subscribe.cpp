@@ -351,6 +351,8 @@ static NatsSubscribeConfig ParseSubscribeConfig(TableFunctionBindInput &input) {
             config.payload_column = StringValue::Get(kv.second);
         } else if (kv.first == "json_extract") {
             config.json_fields = GetNamedStringList(input.named_parameters, "json_extract");
+        } else if (kv.first == "msgpack_extract") {
+            config.msgpack_fields = GetNamedStringList(input.named_parameters, "msgpack_extract");
         } else if (kv.first == "proto_file") {
             config.proto_file = StringValue::Get(kv.second);
         } else if (kv.first == "proto_message") {
@@ -369,7 +371,10 @@ static NatsSubscribeConfig ParseSubscribeConfig(TableFunctionBindInput &input) {
         throw std::runtime_error("subject parameter is required");
     }
     if (!config.json_fields.empty() || !config.proto_fields.empty()) {
-        throw std::runtime_error("core NATS live subscriptions currently support subject/payload only");
+        throw std::runtime_error("core NATS live subscriptions currently support MessagePack extraction only");
+    }
+    if (!config.msgpack_fields.empty()) {
+        config.msgpack_field_paths = SplitMsgpackFieldPaths(config.msgpack_fields);
     }
     if (config.batch_size == 0 || config.batch_size > 65536) {
         throw std::runtime_error("batch_size must be between 1 and 65536");
@@ -417,8 +422,11 @@ static void EnsureTargetTable(Connection &conn, const NatsSubscribeConfig &confi
     sql << "CREATE TABLE IF NOT EXISTS " << QuoteQualifiedTableName(qualified_name) << " ("
         << QuoteIdentifier(config.subject_column) << " VARCHAR,"
         << QuoteIdentifier(config.payload_column) << " BLOB,"
-        << "received_at TIMESTAMP"
-        << ")";
+        << "received_at TIMESTAMP";
+    for (const auto &field : config.msgpack_fields) {
+        sql << "," << QuoteIdentifier(field) << " VARCHAR";
+    }
+    sql << ")";
     auto result = conn.Query(sql.str());
     if (result->HasError()) {
         throw std::runtime_error("Failed to create subscription target table: " + result->GetError());
@@ -450,11 +458,37 @@ static void FlushSubscribeBatch(Connection &conn, const NatsSubscribeConfig &con
     }
     auto appender = CreateSubscribeAppender(conn, config.target_table);
     const auto &types = appender->GetActiveTypes();
-    if (types.size() != 3 || types[0].id() != LogicalTypeId::VARCHAR ||
+    if (types.size() != 3 + config.msgpack_fields.size() || types[0].id() != LogicalTypeId::VARCHAR ||
         (types[1].id() != LogicalTypeId::VARCHAR && types[1].id() != LogicalTypeId::BLOB) ||
         types[2].id() != LogicalTypeId::TIMESTAMP) {
-        throw std::runtime_error("Subscription target table must have exactly three columns: "
-                                 "VARCHAR subject, VARCHAR or BLOB payload, and TIMESTAMP received_at");
+        throw std::runtime_error("Subscription target table must have subject, payload, received_at, and the "
+                                 "configured MessagePack extraction columns");
+    }
+    for (idx_t i = 0; i < config.msgpack_fields.size(); i++) {
+        if (types[3 + i].id() != LogicalTypeId::VARCHAR) {
+            throw std::runtime_error("MessagePack extraction columns must be VARCHAR");
+        }
+    }
+    if (!config.msgpack_fields.empty()) {
+        vector<idx_t> output_columns;
+        output_columns.reserve(config.msgpack_fields.size());
+        for (idx_t i = 0; i < config.msgpack_fields.size(); i++) {
+            output_columns.push_back(3 + i);
+        }
+        DataChunk chunk;
+        chunk.Initialize(Allocator::Get(*conn.context), types, batch.size());
+        for (idx_t row = 0; row < batch.size(); row++) {
+            const auto &entry = batch[row];
+            chunk.SetValue(0, row, Value(entry.first));
+            chunk.SetValue(1, row, Value::BLOB_RAW(entry.second));
+            chunk.SetValue(2, row, Value::TIMESTAMP(Timestamp::GetCurrentTimestamp()));
+            NatsPayloadView payload {entry.second.data(), entry.second.size()};
+            DecodeMsgpackFieldPathsToChunk(chunk, row, output_columns, payload, config.msgpack_field_paths);
+        }
+        chunk.SetCardinality(batch.size());
+        appender->AppendDataChunk(chunk);
+        appender->Flush();
+        return;
     }
     for (auto &entry : batch) {
         auto payload = types[1].id() == LogicalTypeId::BLOB ? Value::BLOB_RAW(entry.second) : Value(entry.second);
@@ -990,6 +1024,7 @@ void NatsSubscribeFunction::Register(ExtensionLoader &loader) {
     start_fn.named_parameters["subject_column"] = LogicalType(LogicalTypeId::VARCHAR);
     start_fn.named_parameters["payload_column"] = LogicalType(LogicalTypeId::VARCHAR);
     start_fn.named_parameters["json_extract"] = LogicalType::LIST(LogicalType(LogicalTypeId::VARCHAR));
+    start_fn.named_parameters["msgpack_extract"] = LogicalType::LIST(LogicalType(LogicalTypeId::VARCHAR));
     start_fn.named_parameters["proto_file"] = LogicalType(LogicalTypeId::VARCHAR);
     start_fn.named_parameters["proto_message"] = LogicalType(LogicalTypeId::VARCHAR);
     start_fn.named_parameters["proto_extract"] = LogicalType::LIST(LogicalType(LogicalTypeId::VARCHAR));

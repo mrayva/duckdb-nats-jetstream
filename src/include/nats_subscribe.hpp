@@ -4,6 +4,7 @@
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/common/types/timestamp.hpp"
 #include "nats_connection.hpp"
+#include "nats_message_decode.hpp"
 #include <condition_variable>
 #include <google/protobuf/descriptor.h>
 #include <mutex>
@@ -35,6 +36,8 @@ struct NatsSubscribeConfig {
     string subject_column = "subject";
     string payload_column = "payload";
     vector<string> json_fields;
+    vector<string> msgpack_fields;
+    vector<vector<string>> msgpack_field_paths;
     string proto_file;
     string proto_message;
     vector<string> proto_fields;
