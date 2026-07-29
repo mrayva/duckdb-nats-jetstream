@@ -27,6 +27,16 @@ using namespace google::protobuf::compiler;
 
 namespace duckdb {
 
+struct NatsMessageDeleter {
+    void operator()(natsMsg *message) const {
+        if (message) {
+            natsMsg_Destroy(message);
+        }
+    }
+};
+
+using OwnedNatsMessage = unique_ptr<natsMsg, NatsMessageDeleter>;
+
 class SubscribeProtobufErrorCollector : public MultiFileErrorCollector {
 public:
 #if GOOGLE_PROTOBUF_VERSION >= 3022000
@@ -525,7 +535,7 @@ static unique_ptr<Appender> CreateSubscribeAppender(Connection &conn, const stri
 }
 
 static void FlushSubscribeBatch(Connection &conn, const NatsSubscribeConfig &config,
-                                const vector<pair<string, string>> &batch, Message *proto_message) {
+                                const vector<OwnedNatsMessage> &batch, Message *proto_message) {
     if (batch.empty()) {
         return;
     }
@@ -557,16 +567,20 @@ static void FlushSubscribeBatch(Connection &conn, const NatsSubscribeConfig &con
     auto payload_data = FlatVector::GetData<string_t>(payload_vector);
     auto received_at_data = FlatVector::GetData<timestamp_t>(received_at_vector);
     for (idx_t row = 0; row < batch.size(); row++) {
-        const auto &entry = batch[row];
-        subject_data[row] = StringVector::AddString(subject_vector, entry.first);
+        auto *message = batch[row].get();
+        const char *subject = natsMsg_GetSubject(message);
+        const char *data = static_cast<const char *>(natsMsg_GetData(message));
+        auto data_length = static_cast<idx_t>(std::max(natsMsg_GetDataLength(message), 0));
+        data = data ? data : "";
+        subject_data[row] = StringVector::AddString(subject_vector, subject ? subject : "");
         if (types[1].id() == LogicalTypeId::BLOB) {
-            payload_data[row] = StringVector::AddStringOrBlob(payload_vector, entry.second.data(), entry.second.size());
+            payload_data[row] = StringVector::AddStringOrBlob(payload_vector, data, data_length);
         } else {
-            payload_data[row] = StringVector::AddString(payload_vector, entry.second.data(), entry.second.size());
+            payload_data[row] = StringVector::AddString(payload_vector, data, data_length);
         }
         received_at_data[row] = Timestamp::GetCurrentTimestamp();
         if (!extracted_fields.empty()) {
-            NatsPayloadView payload {entry.second.data(), entry.second.size()};
+            NatsPayloadView payload {data, data_length};
             if (!config.json_fields.empty()) {
                 DecodeJsonFieldsToChunk(chunk, row, 3, payload, config.json_fields);
             } else if (!config.msgpack_fields.empty()) {
@@ -721,7 +735,7 @@ static void RunSubscribeWorker(const shared_ptr<NatsSubscribeJobState> &job) {
         }
         job->cv.notify_all();
 
-        vector<pair<string, string>> batch;
+        vector<OwnedNatsMessage> batch;
         batch.reserve(job->config.batch_size);
         natsStatus s = NATS_OK;
 
@@ -791,21 +805,12 @@ static void RunSubscribeWorker(const shared_ptr<NatsSubscribeJobState> &job) {
                 throw std::runtime_error(std::string("Failed to receive NATS message: ") + natsStatus_GetText(s));
             }
 
-            string subject = natsMsg_GetSubject(msg);
-            string payload;
-            const char *data = static_cast<const char *>(natsMsg_GetData(msg));
-            int len = natsMsg_GetDataLength(msg);
-            if (data && len > 0) {
-                payload.assign(data, data + len);
-            }
-            natsMsg_Destroy(msg);
-
             {
                 lock_guard<std::mutex> guard(job->mutex);
                 job->progress.last_message_time = Timestamp::GetCurrentTimestamp();
             }
 
-            batch.emplace_back(std::move(subject), std::move(payload));
+            batch.emplace_back(msg);
             if (batch.size() >= job->config.batch_size) {
                 FlushSubscribeBatch(conn, job->config, batch, proto_message.get());
                 {
