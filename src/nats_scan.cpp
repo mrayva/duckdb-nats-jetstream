@@ -586,57 +586,80 @@ static void SetProtobufOutputField(google::protobuf::Message &message,
     }
 
     auto *field = field_path.back();
-    if (!field || field->is_repeated() || field->type() == FieldDescriptor::TYPE_MESSAGE) {
-        throw BinderException("COPY TO protobuf output does not support repeated or message-valued fields");
+    if (!field || field->type() == FieldDescriptor::TYPE_MESSAGE) {
+        throw BinderException("COPY TO protobuf output does not support message-valued fields");
     }
-    switch (field->type()) {
-    case FieldDescriptor::TYPE_STRING:
-        reflection->SetString(current_message, field, value.ToString());
-        break;
-    case FieldDescriptor::TYPE_BYTES:
-        reflection->SetString(current_message, field, value.ToString());
-        break;
-    case FieldDescriptor::TYPE_INT32:
-    case FieldDescriptor::TYPE_SINT32:
-    case FieldDescriptor::TYPE_SFIXED32:
-        reflection->SetInt32(current_message, field, std::stoll(value.ToString()));
-        break;
-    case FieldDescriptor::TYPE_INT64:
-    case FieldDescriptor::TYPE_SINT64:
-    case FieldDescriptor::TYPE_SFIXED64:
-        reflection->SetInt64(current_message, field, std::stoll(value.ToString()));
-        break;
-    case FieldDescriptor::TYPE_UINT32:
-    case FieldDescriptor::TYPE_FIXED32:
-        reflection->SetUInt32(current_message, field, std::stoull(value.ToString()));
-        break;
-    case FieldDescriptor::TYPE_UINT64:
-    case FieldDescriptor::TYPE_FIXED64:
-        reflection->SetUInt64(current_message, field, std::stoull(value.ToString()));
-        break;
-    case FieldDescriptor::TYPE_FLOAT:
-        reflection->SetFloat(current_message, field, std::stof(value.ToString()));
-        break;
-    case FieldDescriptor::TYPE_DOUBLE:
-        reflection->SetDouble(current_message, field, std::stod(value.ToString()));
-        break;
-    case FieldDescriptor::TYPE_BOOL:
-        reflection->SetBool(current_message, field, value.GetValue<bool>());
-        break;
-    case FieldDescriptor::TYPE_ENUM: {
-        auto enum_value = field->enum_type()->FindValueByName(value.ToString());
-        if (!enum_value) {
-            enum_value = field->enum_type()->FindValueByNumber(std::stoi(value.ToString()));
+    auto write_scalar = [&](const Value &scalar) {
+        switch (field->type()) {
+        case FieldDescriptor::TYPE_STRING:
+            field->is_repeated() ? reflection->AddString(current_message, field, scalar.ToString())
+                                  : reflection->SetString(current_message, field, scalar.ToString());
+            break;
+        case FieldDescriptor::TYPE_BYTES:
+            field->is_repeated() ? reflection->AddString(current_message, field, scalar.ToString())
+                                  : reflection->SetString(current_message, field, scalar.ToString());
+            break;
+        case FieldDescriptor::TYPE_INT32:
+        case FieldDescriptor::TYPE_SINT32:
+        case FieldDescriptor::TYPE_SFIXED32:
+            field->is_repeated() ? reflection->AddInt32(current_message, field, std::stoll(scalar.ToString()))
+                                  : reflection->SetInt32(current_message, field, std::stoll(scalar.ToString()));
+            break;
+        case FieldDescriptor::TYPE_INT64:
+        case FieldDescriptor::TYPE_SINT64:
+        case FieldDescriptor::TYPE_SFIXED64:
+            field->is_repeated() ? reflection->AddInt64(current_message, field, std::stoll(scalar.ToString()))
+                                  : reflection->SetInt64(current_message, field, std::stoll(scalar.ToString()));
+            break;
+        case FieldDescriptor::TYPE_UINT32:
+        case FieldDescriptor::TYPE_FIXED32:
+            field->is_repeated() ? reflection->AddUInt32(current_message, field, std::stoull(scalar.ToString()))
+                                  : reflection->SetUInt32(current_message, field, std::stoull(scalar.ToString()));
+            break;
+        case FieldDescriptor::TYPE_UINT64:
+        case FieldDescriptor::TYPE_FIXED64:
+            field->is_repeated() ? reflection->AddUInt64(current_message, field, std::stoull(scalar.ToString()))
+                                  : reflection->SetUInt64(current_message, field, std::stoull(scalar.ToString()));
+            break;
+        case FieldDescriptor::TYPE_FLOAT:
+            field->is_repeated() ? reflection->AddFloat(current_message, field, std::stof(scalar.ToString()))
+                                  : reflection->SetFloat(current_message, field, std::stof(scalar.ToString()));
+            break;
+        case FieldDescriptor::TYPE_DOUBLE:
+            field->is_repeated() ? reflection->AddDouble(current_message, field, std::stod(scalar.ToString()))
+                                  : reflection->SetDouble(current_message, field, std::stod(scalar.ToString()));
+            break;
+        case FieldDescriptor::TYPE_BOOL:
+            field->is_repeated() ? reflection->AddBool(current_message, field, scalar.GetValue<bool>())
+                                  : reflection->SetBool(current_message, field, scalar.GetValue<bool>());
+            break;
+        case FieldDescriptor::TYPE_ENUM: {
+            auto enum_value = field->enum_type()->FindValueByName(scalar.ToString());
+            if (!enum_value) enum_value = field->enum_type()->FindValueByNumber(std::stoi(scalar.ToString()));
+            if (!enum_value) {
+                throw BinderException("COPY TO protobuf enum value '%s' was not found for field '%s'", scalar.ToString(),
+                                      field->full_name());
+            }
+            field->is_repeated() ? reflection->AddEnum(current_message, field, enum_value)
+                                 : reflection->SetEnum(current_message, field, enum_value);
+            break;
         }
-        if (!enum_value) {
-            throw BinderException("COPY TO protobuf enum value '%s' was not found for field '%s'", value.ToString(),
+        default:
+            throw BinderException("COPY TO protobuf field '%s' has an unsupported type", field->full_name());
+        }
+    };
+    if (field->is_repeated()) {
+        if (value.type().id() != LogicalTypeId::LIST && value.type().id() != LogicalTypeId::ARRAY) {
+            throw BinderException("COPY TO repeated protobuf field '%s' requires a LIST or ARRAY source column",
                                   field->full_name());
         }
-        reflection->SetEnum(current_message, field, enum_value);
-        break;
-    }
-    default:
-        throw BinderException("COPY TO protobuf field '%s' has an unsupported type", field->full_name());
+        const auto &children = value.type().id() == LogicalTypeId::LIST ? ListValue::GetChildren(value)
+                                                                          : ArrayValue::GetChildren(value);
+        for (const auto &child : children) {
+            if (!child.IsNull()) write_scalar(child);
+        }
+    } else {
+        write_scalar(value);
     }
 }
 
@@ -902,9 +925,8 @@ static unique_ptr<FunctionData> NatsCopyToBind(ClientContext &context, CopyFunct
             }
             for (const auto &field_path : proto_fields) {
                 auto resolved_path = ResolveProtobufFieldPath(result->proto_descriptor, field_path);
-                if (resolved_path.back()->is_repeated() ||
-                    resolved_path.back()->type() == FieldDescriptor::TYPE_MESSAGE) {
-                    throw BinderException("COPY TO protobuf field '%s' must be a singular scalar", field_path);
+                if (resolved_path.back()->type() == FieldDescriptor::TYPE_MESSAGE) {
+                    throw BinderException("COPY TO protobuf field '%s' must be a scalar or repeated scalar", field_path);
                 }
                 result->proto_field_paths.push_back(std::move(resolved_path));
             }

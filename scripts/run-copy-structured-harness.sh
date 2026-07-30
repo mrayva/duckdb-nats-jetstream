@@ -44,14 +44,15 @@ CREATE TABLE structured_source(
     device_id VARCHAR,
     kw DOUBLE,
     online BOOLEAN,
-    reading_count INTEGER
+    reading_count INTEGER,
+    tags VARCHAR[]
 );
 INSERT INTO structured_source VALUES
-    ('copy_roundtrip.json', 'json-device', 42.5, true, 7),
-    ('copy_roundtrip.msgpack', 'msgpack-device', 43.5, false, 8),
-    ('copy_roundtrip.cbor', 'cbor-device', 44.5, true, 9),
-    ('copy_roundtrip.flex', 'flex-device', 45.5, false, 10),
-    ('copy_roundtrip.proto', 'proto-device', 46.5, true, 11);
+    ('copy_roundtrip.json', 'json-device', 42.5, true, 7, NULL),
+    ('copy_roundtrip.msgpack', 'msgpack-device', 43.5, false, 8, NULL),
+    ('copy_roundtrip.cbor', 'cbor-device', 44.5, true, 9, NULL),
+    ('copy_roundtrip.flex', 'flex-device', 45.5, false, 10, NULL),
+    ('copy_roundtrip.proto', 'proto-device', 46.5, true, 11, ['p1', 'p2']);
 COPY (SELECT * FROM structured_source WHERE subject = 'copy_roundtrip.json')
 TO 'copy_roundtrip'
 (FORMAT nats_js, url '${NATS_URL}', payload_format 'json', payload_columns ['device_id', 'kw', 'online', 'reading_count']);
@@ -71,8 +72,8 @@ TO 'copy_roundtrip'
  payload_format 'protobuf',
  proto_file '${ROOT_DIR}/test/proto/telemetry.proto',
  proto_message 'Telemetry',
- payload_columns ['device_id', 'kw', 'online'],
- proto_fields ['device_id', 'metrics.kw', 'online']);
+ payload_columns ['device_id', 'kw', 'online', 'tags'],
+ proto_fields ['device_id', 'metrics.kw', 'online', 'tags']);
 SELECT 'rows=' || COUNT(*) FROM nats_scan('copy_roundtrip', url := '${NATS_URL}');
 SELECT 'json=' || device_id || '/' || kw || '/' || online || '/' || reading_count
 FROM nats_scan('copy_roundtrip', url := '${NATS_URL}', nats_subject := 'copy_roundtrip.json', json_extract := ['device_id', 'kw', 'online', 'reading_count']);
@@ -86,6 +87,10 @@ SELECT 'proto=' || device_id || '/' || metrics_kw || '/' || online
 FROM nats_scan('copy_roundtrip', url := '${NATS_URL}', nats_subject := 'copy_roundtrip.proto',
     proto_file := '${ROOT_DIR}/test/proto/telemetry.proto', proto_message := 'Telemetry',
     proto_extract := ['device_id', 'metrics.kw', 'online']);
+SELECT 'proto_tags=' || CASE WHEN tags LIKE '%p1%' AND tags LIKE '%p2%' THEN 'ok' ELSE 'bad' END
+FROM nats_scan('copy_roundtrip', url := '${NATS_URL}', nats_subject := 'copy_roundtrip.proto',
+    proto_file := '${ROOT_DIR}/test/proto/telemetry.proto', proto_message := 'Telemetry',
+    proto_extract := ['tags']);
 CREATE TABLE nested_source(
     subject VARCHAR,
     tags VARCHAR[],
@@ -107,6 +112,7 @@ EXPECT msgpack=msgpack-device/43.5/false/8 20
 EXPECT cbor=cbor-device/44.5/true/9 20
 EXPECT flex=flex-device/45.5/false/10 20
 EXPECT proto=proto-device/46.5/true 20
+EXPECT proto_tags=ok 20
 EXPECT nested=12.5/true/1 20
 QUIT
 SQL
