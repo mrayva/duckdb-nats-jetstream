@@ -937,6 +937,39 @@ static void AppendFlexValue(flexbuffers::Builder &builder, const Value &value) {
     }
 }
 
+static bool AppendFlexVectorField(flexbuffers::Builder &builder, const string &key,
+                                  const UnifiedVectorFormat &format, idx_t row_idx, LogicalTypeId type) {
+    auto value_idx = format.sel->get_index(row_idx);
+    auto key_ptr = key.c_str();
+    if (!format.validity.RowIsValid(value_idx)) {
+        builder.Null(key_ptr);
+        return true;
+    }
+    switch (type) {
+    case LogicalTypeId::VARCHAR:
+    case LogicalTypeId::BLOB: {
+        auto value = UnifiedVectorFormat::GetData<string_t>(format)[value_idx];
+        builder.String(key_ptr, string(value.GetData(), value.GetSize()));
+        return true;
+    }
+    case LogicalTypeId::BOOLEAN:
+        builder.Bool(key_ptr, UnifiedVectorFormat::GetData<bool>(format)[value_idx]);
+        return true;
+    case LogicalTypeId::TINYINT: builder.Int(key_ptr, UnifiedVectorFormat::GetData<int8_t>(format)[value_idx]); return true;
+    case LogicalTypeId::SMALLINT: builder.Int(key_ptr, UnifiedVectorFormat::GetData<int16_t>(format)[value_idx]); return true;
+    case LogicalTypeId::INTEGER: builder.Int(key_ptr, UnifiedVectorFormat::GetData<int32_t>(format)[value_idx]); return true;
+    case LogicalTypeId::BIGINT: builder.Int(key_ptr, UnifiedVectorFormat::GetData<int64_t>(format)[value_idx]); return true;
+    case LogicalTypeId::UTINYINT: builder.UInt(key_ptr, UnifiedVectorFormat::GetData<uint8_t>(format)[value_idx]); return true;
+    case LogicalTypeId::USMALLINT: builder.UInt(key_ptr, UnifiedVectorFormat::GetData<uint16_t>(format)[value_idx]); return true;
+    case LogicalTypeId::UINTEGER: builder.UInt(key_ptr, UnifiedVectorFormat::GetData<uint32_t>(format)[value_idx]); return true;
+    case LogicalTypeId::UBIGINT: builder.UInt(key_ptr, UnifiedVectorFormat::GetData<uint64_t>(format)[value_idx]); return true;
+    case LogicalTypeId::FLOAT: builder.Double(key_ptr, UnifiedVectorFormat::GetData<float>(format)[value_idx]); return true;
+    case LogicalTypeId::DOUBLE: builder.Double(key_ptr, UnifiedVectorFormat::GetData<double>(format)[value_idx]); return true;
+    default:
+        return false;
+    }
+}
+
 static void EncodeStructuredPayload(const NatsCopyToBindData &bind_data, const DataChunk &input, idx_t row_idx,
                                     const vector<UnifiedVectorFormat> &structured_formats, vector<uint8_t> &output) {
     const auto &types = bind_data.column_types;
@@ -965,7 +998,10 @@ static void EncodeStructuredPayload(const NatsCopyToBindData &bind_data, const D
         for (idx_t i = 0; i < bind_data.structured_column_indices.size(); i++) {
             auto column = bind_data.structured_column_indices[i];
             auto value = input.GetValue(column, row_idx);
-            AppendFlexField(builder, bind_data.structured_column_names[i], value);
+            if (!AppendFlexVectorField(builder, bind_data.structured_column_names[i], structured_formats[i], row_idx,
+                                       types[column].id())) {
+                AppendFlexField(builder, bind_data.structured_column_names[i], value);
+            }
         }
         builder.EndMap(start);
         builder.Finish();
