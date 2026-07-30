@@ -3,31 +3,24 @@
 #include "duckdb.hpp"
 #include <google/protobuf/descriptor.h>
 #include <google/protobuf/message.h>
-#include <utility>
 
 namespace duckdb {
 
-template <typename...>
-struct nats_voider {
-    using type = void;
+#ifdef NATS_DUCKDB_MUTABLE_VECTOR_API
+template <typename T>
+struct NatsMutableVectorData {
+    static T *Get(Vector &vector) {
+        return FlatVector::GetDataMutable<T>(vector);
+    }
 };
-
-template <typename... T>
-using nats_void_t = typename nats_voider<T...>::type;
-
-template <typename T, typename = void>
+#else
+template <typename T>
 struct NatsMutableVectorData {
     static T *Get(Vector &vector) {
         return FlatVector::GetData<T>(vector);
     }
 };
-
-template <typename T>
-struct NatsMutableVectorData<T, nats_void_t<decltype(FlatVector::GetDataMutable<T>(std::declval<Vector &>()))>> {
-    static T *Get(Vector &vector) {
-        return FlatVector::GetDataMutable<T>(vector);
-    }
-};
+#endif
 
 template <typename T>
 T *GetNatsMutableVectorData(Vector &vector) {

@@ -34,6 +34,34 @@ find_package(flatbuffers CONFIG REQUIRED)
 target_link_libraries(${EXTENSION_NAME} cnats::nats_static protobuf::libprotobuf protobuf::libprotoc flatbuffers::flatbuffers)
 target_link_libraries(${LOADABLE_EXTENSION_NAME} cnats::nats_static protobuf::libprotobuf protobuf::libprotoc flatbuffers::flatbuffers)
 
+# DuckDB 1.5.5/main changed several internal C++ extension APIs. Detect those
+# headers from the host DuckDB source so the extension remains buildable with
+# the repository's older pinned checkout as well.
+set(NATS_DUCKDB_API_DEFINITIONS)
+if(DEFINED DUCKDB_SOURCE_DIR)
+    set(NATS_DUCKDB_SOURCE_ROOT "${DUCKDB_SOURCE_DIR}")
+else()
+    set(NATS_DUCKDB_SOURCE_ROOT "${CMAKE_SOURCE_DIR}")
+endif()
+if(EXISTS "${NATS_DUCKDB_SOURCE_ROOT}/src/include/duckdb/parser/qualified_name.hpp")
+    file(READ "${NATS_DUCKDB_SOURCE_ROOT}/src/include/duckdb/parser/qualified_name.hpp" NATS_QUALIFIED_NAME_HEADER)
+    string(FIND "${NATS_QUALIFIED_NAME_HEADER}" "const Identifier &Catalog()" NATS_HAS_IDENTIFIER_NAMES)
+    if(NATS_HAS_IDENTIFIER_NAMES GREATER -1)
+        list(APPEND NATS_DUCKDB_API_DEFINITIONS NATS_DUCKDB_IDENTIFIER_API)
+    endif()
+
+    file(READ "${NATS_DUCKDB_SOURCE_ROOT}/src/include/duckdb/common/types/vector.hpp" NATS_VECTOR_HEADER)
+    if(EXISTS "${NATS_DUCKDB_SOURCE_ROOT}/src/include/duckdb/common/vector/flat_vector.hpp")
+        file(READ "${NATS_DUCKDB_SOURCE_ROOT}/src/include/duckdb/common/vector/flat_vector.hpp" NATS_VECTOR_HEADER)
+    endif()
+    string(FIND "${NATS_VECTOR_HEADER}" "GetDataMutable" NATS_HAS_MUTABLE_VECTOR_DATA)
+    if(NATS_HAS_MUTABLE_VECTOR_DATA GREATER -1)
+        list(APPEND NATS_DUCKDB_API_DEFINITIONS NATS_DUCKDB_MUTABLE_VECTOR_API)
+    endif()
+endif()
+target_compile_definitions(${EXTENSION_NAME} PRIVATE ${NATS_DUCKDB_API_DEFINITIONS})
+target_compile_definitions(${LOADABLE_EXTENSION_NAME} PRIVATE ${NATS_DUCKDB_API_DEFINITIONS})
+
 # Install static library
 install(
   TARGETS ${EXTENSION_NAME}

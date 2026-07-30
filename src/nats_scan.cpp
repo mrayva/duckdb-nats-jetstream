@@ -1,4 +1,5 @@
 #include "nats_scan.hpp"
+#include "nats_duckdb_compat.hpp"
 #include "nats_connection.hpp"
 #include "nats_message_decode.hpp"
 #include "nats_proto_schema.hpp"
@@ -1110,7 +1111,11 @@ static void EncodeStructuredPayload(const NatsCopyToBindData &bind_data, const D
 }
 
 static unique_ptr<FunctionData> NatsCopyToBind(ClientContext &context, CopyFunctionBindInput &input,
+#ifdef NATS_DUCKDB_IDENTIFIER_API
                                                const vector<Identifier> &identifiers,
+#else
+                                               const vector<string> &identifiers,
+#endif
                                                const vector<LogicalType> &sql_types) {
     vector<string> names;
     names.reserve(identifiers.size());

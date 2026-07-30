@@ -1,4 +1,5 @@
 #include "nats_ingest.hpp"
+#include "nats_duckdb_compat.hpp"
 #include "nats_message_decode.hpp"
 #include "nats_proto_schema.hpp"
 #include "nats_source.hpp"
@@ -1713,16 +1714,16 @@ static vector<NatsIngestColumnDef> BuildTargetTableColumns(const NatsIngestConfi
 
 static string BuildTargetTableCreateSql(const string &target_table, const NatsIngestConfig &config) {
     auto qualified_name = QualifiedName::Parse(target_table);
-    if (!qualified_name.Catalog().empty()) {
+    if (!NatsQualifiedCatalog(qualified_name).empty()) {
         throw std::runtime_error("auto-create target table does not support catalog-qualified names");
     }
 
     std::ostringstream sql;
     sql << "CREATE TABLE IF NOT EXISTS ";
-    if (!qualified_name.Schema().empty()) {
-        sql << QuoteIdentifier(string(qualified_name.Schema())) << ".";
+    if (!NatsQualifiedSchema(qualified_name).empty()) {
+        sql << QuoteIdentifier(string(NatsQualifiedSchema(qualified_name))) << ".";
     }
-    sql << QuoteIdentifier(string(qualified_name.Name())) << " (";
+    sql << QuoteIdentifier(string(NatsQualifiedTable(qualified_name))) << " (";
 
     auto columns = BuildTargetTableColumns(config);
     for (idx_t i = 0; i < columns.size(); i++) {
@@ -1751,8 +1752,8 @@ static void EnsureTargetTable(Connection &conn, NatsIngestConfig &config) {
 
 static TableCatalogEntry &ResolveTargetTable(ClientContext &context, const string &target_table) {
     auto qualified_name = QualifiedName::Parse(target_table);
-    auto &entry = Catalog::GetEntry(context, CatalogType::TABLE_ENTRY, qualified_name.Catalog(), qualified_name.Schema(),
-                                    qualified_name.Name());
+    auto &entry = Catalog::GetEntry(context, CatalogType::TABLE_ENTRY, NatsQualifiedCatalog(qualified_name),
+                                    NatsQualifiedSchema(qualified_name), NatsQualifiedTable(qualified_name));
     return entry.Cast<TableCatalogEntry>();
 }
 

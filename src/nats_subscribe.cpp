@@ -1,4 +1,5 @@
 #include "nats_subscribe.hpp"
+#include "nats_duckdb_compat.hpp"
 #include "nats_proto_schema.hpp"
 
 #include "duckdb/common/types/timestamp.hpp"
@@ -488,13 +489,13 @@ static string QuoteIdentifier(const string &identifier) {
 
 static string QuoteQualifiedTableName(const QualifiedName &name) {
     std::ostringstream result;
-    if (!name.Catalog().empty()) {
-        result << QuoteIdentifier(string(name.Catalog())) << ".";
+    if (!NatsQualifiedCatalog(name).empty()) {
+        result << QuoteIdentifier(string(NatsQualifiedCatalog(name))) << ".";
     }
-    if (!name.Schema().empty()) {
-        result << QuoteIdentifier(string(name.Schema())) << ".";
+    if (!NatsQualifiedSchema(name).empty()) {
+        result << QuoteIdentifier(string(NatsQualifiedSchema(name))) << ".";
     }
-    result << QuoteIdentifier(string(name.Name()));
+    result << QuoteIdentifier(string(NatsQualifiedTable(name)));
     return result.str();
 }
 
@@ -536,13 +537,14 @@ static void DisconnectNats(natsConnection **conn) {
 
 static unique_ptr<Appender> CreateSubscribeAppender(Connection &conn, const string &target_table) {
     auto qualified_name = QualifiedName::Parse(target_table);
-    if (!qualified_name.Catalog().empty()) {
-        return make_uniq<Appender>(conn, qualified_name.Catalog(), qualified_name.Schema(), qualified_name.Name());
+    if (!NatsQualifiedCatalog(qualified_name).empty()) {
+        return make_uniq<Appender>(conn, NatsQualifiedCatalog(qualified_name), NatsQualifiedSchema(qualified_name),
+                                   NatsQualifiedTable(qualified_name));
     }
-    if (!qualified_name.Schema().empty()) {
-        return make_uniq<Appender>(conn, qualified_name.Schema(), qualified_name.Name());
+    if (!NatsQualifiedSchema(qualified_name).empty()) {
+        return make_uniq<Appender>(conn, NatsQualifiedSchema(qualified_name), NatsQualifiedTable(qualified_name));
     }
-    return make_uniq<Appender>(conn, qualified_name.Name());
+    return make_uniq<Appender>(conn, NatsQualifiedTable(qualified_name));
 }
 
 static void FlushSubscribeBatch(Connection &conn, const NatsSubscribeConfig &config,
