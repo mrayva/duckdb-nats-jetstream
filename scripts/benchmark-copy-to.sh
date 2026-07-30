@@ -84,7 +84,7 @@ SQL
   local stream_count=""
   local deadline=$((SECONDS + 20))
   while [ "$SECONDS" -lt "$deadline" ]; do
-    stream_count="$("$NATS_CLI" stream info "$stream" --server "$NATS_URL" 2>/dev/null | awk '/Messages:/ {print $2; exit}')"
+    stream_count="$("$NATS_CLI" stream info "$stream" --server "$NATS_URL" 2>/dev/null | awk '/^[[:space:]]+Messages:/ {gsub(",", "", $NF); print $NF; exit}')"
     if [ "$stream_count" = "$expected_count" ]; then
       break
     fi
