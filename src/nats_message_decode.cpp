@@ -47,7 +47,7 @@ private:
     bool ReadScalarToVector(uint8_t tag, Vector &vector, idx_t row_idx) {
         auto set_string = [&](const char *data_ptr, idx_t length) {
             FlatVector::SetNull(vector, row_idx, false);
-            auto vector_data = FlatVector::GetData<string_t>(vector);
+            auto vector_data = GetNatsMutableVectorData<string_t>(vector);
             vector_data[row_idx] = StringVector::AddString(vector, data_ptr, length);
         };
         if ((tag & 0xe0) == 0xa0 || tag == 0xd9 || tag == 0xda || tag == 0xdb) {
@@ -272,7 +272,7 @@ void DecodeJsonFieldsToChunk(DataChunk &chunk, idx_t row_idx, idx_t first_column
     yyjson_val *root = yyjson_doc_get_root(doc);
     for (idx_t i = 0; i < field_names.size(); i++) {
         auto &vector = chunk.data[first_column + i];
-        auto vector_data = FlatVector::GetData<string_t>(vector);
+        auto vector_data = GetNatsMutableVectorData<string_t>(vector);
         yyjson_val *field = yyjson_obj_get(root, field_names[i].c_str());
 
         if (!field || yyjson_is_null(field)) {
@@ -378,7 +378,7 @@ private:
     bool SetScalar(uint8_t major, uint8_t additional, Vector &vector, idx_t row_idx) {
         auto set_string = [&](const char *value, idx_t length) {
             FlatVector::SetNull(vector, row_idx, false);
-            FlatVector::GetData<string_t>(vector)[row_idx] = StringVector::AddString(vector, value, length);
+            GetNatsMutableVectorData<string_t>(vector)[row_idx] = StringVector::AddString(vector, value, length);
         };
         if (major == 0 || major == 1) {
             uint64_t value;
@@ -525,7 +525,7 @@ void DecodeFlexbuffersFieldPathsToChunk(DataChunk &chunk, idx_t row_idx, const v
         if (value.IsString()) {
             auto string_value = value.AsString();
             FlatVector::SetNull(vector, row_idx, false);
-            FlatVector::GetData<string_t>(vector)[row_idx] =
+                GetNatsMutableVectorData<string_t>(vector)[row_idx] =
                 StringVector::AddString(vector, string_value.c_str(), string_value.length());
             continue;
         } else if (value.IsBool()) {
@@ -540,7 +540,7 @@ void DecodeFlexbuffersFieldPathsToChunk(DataChunk &chunk, idx_t row_idx, const v
             continue;
         }
         FlatVector::SetNull(vector, row_idx, false);
-        FlatVector::GetData<string_t>(vector)[row_idx] = StringVector::AddString(vector, text);
+        GetNatsMutableVectorData<string_t>(vector)[row_idx] = StringVector::AddString(vector, text);
     }
 }
 
@@ -755,40 +755,40 @@ static bool WriteProtobufScalar(Vector &vector, idx_t row_idx,
     switch (field.type()) {
     case Field::TYPE_STRING: {
         const auto &value = reflection.GetString(message, &field);
-        FlatVector::GetData<string_t>(vector)[row_idx] = StringVector::AddString(vector, value.data(), value.size());
+        GetNatsMutableVectorData<string_t>(vector)[row_idx] = StringVector::AddString(vector, value.data(), value.size());
         return true;
     }
     case Field::TYPE_BYTES: {
         const auto &value = reflection.GetString(message, &field);
-        FlatVector::GetData<string_t>(vector)[row_idx] = StringVector::AddStringOrBlob(vector, value.data(), value.size());
+        GetNatsMutableVectorData<string_t>(vector)[row_idx] = StringVector::AddStringOrBlob(vector, value.data(), value.size());
         return true;
     }
     case Field::TYPE_INT32:
     case Field::TYPE_SINT32:
     case Field::TYPE_SFIXED32:
-        FlatVector::GetData<int32_t>(vector)[row_idx] = reflection.GetInt32(message, &field);
+        GetNatsMutableVectorData<int32_t>(vector)[row_idx] = reflection.GetInt32(message, &field);
         return true;
     case Field::TYPE_INT64:
     case Field::TYPE_SINT64:
     case Field::TYPE_SFIXED64:
-        FlatVector::GetData<int64_t>(vector)[row_idx] = reflection.GetInt64(message, &field);
+        GetNatsMutableVectorData<int64_t>(vector)[row_idx] = reflection.GetInt64(message, &field);
         return true;
     case Field::TYPE_UINT32:
     case Field::TYPE_FIXED32:
-        FlatVector::GetData<uint32_t>(vector)[row_idx] = reflection.GetUInt32(message, &field);
+        GetNatsMutableVectorData<uint32_t>(vector)[row_idx] = reflection.GetUInt32(message, &field);
         return true;
     case Field::TYPE_UINT64:
     case Field::TYPE_FIXED64:
-        FlatVector::GetData<uint64_t>(vector)[row_idx] = reflection.GetUInt64(message, &field);
+        GetNatsMutableVectorData<uint64_t>(vector)[row_idx] = reflection.GetUInt64(message, &field);
         return true;
     case Field::TYPE_FLOAT:
-        FlatVector::GetData<float>(vector)[row_idx] = reflection.GetFloat(message, &field);
+        GetNatsMutableVectorData<float>(vector)[row_idx] = reflection.GetFloat(message, &field);
         return true;
     case Field::TYPE_DOUBLE:
-        FlatVector::GetData<double>(vector)[row_idx] = reflection.GetDouble(message, &field);
+        GetNatsMutableVectorData<double>(vector)[row_idx] = reflection.GetDouble(message, &field);
         return true;
     case Field::TYPE_BOOL:
-        FlatVector::GetData<bool>(vector)[row_idx] = reflection.GetBool(message, &field);
+        GetNatsMutableVectorData<bool>(vector)[row_idx] = reflection.GetBool(message, &field);
         return true;
     case Field::TYPE_ENUM: {
         const auto *value = reflection.GetEnum(message, &field);
@@ -797,7 +797,7 @@ static bool WriteProtobufScalar(Vector &vector, idx_t row_idx,
             return true;
         }
         auto name = value->name();
-        FlatVector::GetData<string_t>(vector)[row_idx] = StringVector::AddString(vector, name.data(), name.size());
+        GetNatsMutableVectorData<string_t>(vector)[row_idx] = StringVector::AddString(vector, name.data(), name.size());
         return true;
     }
     default:

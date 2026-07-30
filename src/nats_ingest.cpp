@@ -1050,7 +1050,7 @@ static NatsIngestConfig ParseStartConfig(TableFunctionBindInput &input) {
         } else if (kv.first == "durable_name") {
             config.durable_name = StringValue::Get(kv.second);
             has_durable_name = true;
-        } else if (ParseNatsConnectionParameter(config.connection, kv.first, kv.second)) {
+        } else if (ParseNatsConnectionParameter(config.connection, string(kv.first), kv.second)) {
         } else if (kv.first == "start_seq") {
             config.start_seq = UBigIntValue::Get(kv.second);
         } else if (kv.first == "batch_size") {
@@ -1713,16 +1713,16 @@ static vector<NatsIngestColumnDef> BuildTargetTableColumns(const NatsIngestConfi
 
 static string BuildTargetTableCreateSql(const string &target_table, const NatsIngestConfig &config) {
     auto qualified_name = QualifiedName::Parse(target_table);
-    if (!qualified_name.catalog.empty()) {
+    if (!qualified_name.Catalog().empty()) {
         throw std::runtime_error("auto-create target table does not support catalog-qualified names");
     }
 
     std::ostringstream sql;
     sql << "CREATE TABLE IF NOT EXISTS ";
-    if (!qualified_name.schema.empty()) {
-        sql << QuoteIdentifier(qualified_name.schema) << ".";
+    if (!qualified_name.Schema().empty()) {
+        sql << QuoteIdentifier(string(qualified_name.Schema())) << ".";
     }
-    sql << QuoteIdentifier(qualified_name.name) << " (";
+    sql << QuoteIdentifier(string(qualified_name.Name())) << " (";
 
     auto columns = BuildTargetTableColumns(config);
     for (idx_t i = 0; i < columns.size(); i++) {
@@ -1751,8 +1751,8 @@ static void EnsureTargetTable(Connection &conn, NatsIngestConfig &config) {
 
 static TableCatalogEntry &ResolveTargetTable(ClientContext &context, const string &target_table) {
     auto qualified_name = QualifiedName::Parse(target_table);
-    auto &entry = Catalog::GetEntry(context, CatalogType::TABLE_ENTRY, qualified_name.catalog, qualified_name.schema,
-                                    qualified_name.name);
+    auto &entry = Catalog::GetEntry(context, CatalogType::TABLE_ENTRY, qualified_name.Catalog(), qualified_name.Schema(),
+                                    qualified_name.Name());
     return entry.Cast<TableCatalogEntry>();
 }
 
@@ -2164,7 +2164,7 @@ static void RunIngestWorker(const shared_ptr<NatsIngestJobState> &job) {
                         std::abort();
                     }
 
-                    if (write_row == write_chunk.GetCapacity()) {
+                    if (write_row == STANDARD_VECTOR_SIZE) {
                         batch_stage = "append chunk";
                         try {
                             phase_start = std::chrono::steady_clock::now();

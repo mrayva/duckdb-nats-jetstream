@@ -353,13 +353,20 @@ static bool GetNamedBool(const case_insensitive_map_t<Value> &named_parameters, 
     return BooleanValue::Get(entry->second);
 }
 
-static vector<string> GetNamedStringList(const case_insensitive_map_t<Value> &named_parameters, const string &name) {
+template <typename NamedParameterMap>
+static vector<string> GetNamedStringList(const NamedParameterMap &named_parameters, const string &name) {
     vector<string> result;
-    auto entry = named_parameters.find(name);
-    if (entry == named_parameters.end() || entry->second.IsNull()) {
+    const Value *value = nullptr;
+    for (const auto &kv : named_parameters) {
+        if (StringUtil::CIEquals(string(kv.first), name)) {
+            value = &kv.second;
+            break;
+        }
+    }
+    if (!value || value->IsNull()) {
         return result;
     }
-    auto &list = ListValue::GetChildren(entry->second);
+    auto &list = ListValue::GetChildren(*value);
     for (auto &child : list) {
         result.push_back(StringValue::Get(child));
     }
@@ -378,7 +385,7 @@ static NatsSubscribeConfig ParseSubscribeConfig(TableFunctionBindInput &input) {
         } else if (kv.first == "target_table") {
             config.target_table = StringValue::Get(kv.second);
             has_target_table = true;
-        } else if (ParseNatsConnectionParameter(config.connection, kv.first, kv.second)) {
+        } else if (ParseNatsConnectionParameter(config.connection, string(kv.first), kv.second)) {
         } else if (kv.first == "subject") {
             config.subject = StringValue::Get(kv.second);
             has_subject = !config.subject.empty();
@@ -481,13 +488,13 @@ static string QuoteIdentifier(const string &identifier) {
 
 static string QuoteQualifiedTableName(const QualifiedName &name) {
     std::ostringstream result;
-    if (!name.catalog.empty()) {
-        result << QuoteIdentifier(name.catalog) << ".";
+    if (!name.Catalog().empty()) {
+        result << QuoteIdentifier(string(name.Catalog())) << ".";
     }
-    if (!name.schema.empty()) {
-        result << QuoteIdentifier(name.schema) << ".";
+    if (!name.Schema().empty()) {
+        result << QuoteIdentifier(string(name.Schema())) << ".";
     }
-    result << QuoteIdentifier(name.name);
+    result << QuoteIdentifier(string(name.Name()));
     return result.str();
 }
 
@@ -529,13 +536,13 @@ static void DisconnectNats(natsConnection **conn) {
 
 static unique_ptr<Appender> CreateSubscribeAppender(Connection &conn, const string &target_table) {
     auto qualified_name = QualifiedName::Parse(target_table);
-    if (!qualified_name.catalog.empty()) {
-        return make_uniq<Appender>(conn, qualified_name.catalog, qualified_name.schema, qualified_name.name);
+    if (!qualified_name.Catalog().empty()) {
+        return make_uniq<Appender>(conn, qualified_name.Catalog(), qualified_name.Schema(), qualified_name.Name());
     }
-    if (!qualified_name.schema.empty()) {
-        return make_uniq<Appender>(conn, qualified_name.schema, qualified_name.name);
+    if (!qualified_name.Schema().empty()) {
+        return make_uniq<Appender>(conn, qualified_name.Schema(), qualified_name.Name());
     }
-    return make_uniq<Appender>(conn, qualified_name.name);
+    return make_uniq<Appender>(conn, qualified_name.Name());
 }
 
 static void FlushSubscribeBatch(Connection &conn, const NatsSubscribeConfig &config,
@@ -569,9 +576,9 @@ static void FlushSubscribeBatch(Connection &conn, const NatsSubscribeConfig &con
     auto &subject_vector = chunk.data[0];
     auto &payload_vector = chunk.data[1];
     auto &received_at_vector = chunk.data[2];
-    auto subject_data = FlatVector::GetData<string_t>(subject_vector);
-    auto payload_data = FlatVector::GetData<string_t>(payload_vector);
-    auto received_at_data = FlatVector::GetData<timestamp_t>(received_at_vector);
+    auto subject_data = GetNatsMutableVectorData<string_t>(subject_vector);
+    auto payload_data = GetNatsMutableVectorData<string_t>(payload_vector);
+    auto received_at_data = GetNatsMutableVectorData<timestamp_t>(received_at_vector);
     for (idx_t row = 0; row < batch.size(); row++) {
         auto *message = batch[row].get();
         const char *subject = natsMsg_GetSubject(message);

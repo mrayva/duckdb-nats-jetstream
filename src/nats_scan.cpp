@@ -419,7 +419,7 @@ static void AppendJsonValue(string &output, const Value &value) {
         const auto &children = StructValue::GetChildren(value);
         for (idx_t i = 0; i < children.size(); i++) {
             if (i) output += ",";
-            AppendJsonEscaped(output, StructType::GetChildName(value.type(), i));
+            AppendJsonEscaped(output, string(StructType::GetChildName(value.type(), i)));
             output += ":";
             AppendJsonValue(output, children[i]);
         }
@@ -645,7 +645,7 @@ static void AppendStructuredValue(vector<uint8_t> &output, const Value &value, b
         AppendStructuredCount(output, children.size(), cbor, true);
         for (idx_t i = 0; i < children.size(); i++) {
             auto name = StructType::GetChildName(value.type(), i);
-            cbor ? AppendCborString(output, name) : AppendMsgpackString(output, name);
+            cbor ? AppendCborString(output, string(name)) : AppendMsgpackString(output, string(name));
             AppendStructuredValue(output, children[i], cbor);
         }
     } else if (type == LogicalTypeId::MAP) {
@@ -962,7 +962,7 @@ static void AppendFlexField(flexbuffers::Builder &builder, const string &key, co
             if (value.type().id() == LogicalTypeId::STRUCT) {
                 const auto &children = StructValue::GetChildren(value);
                 for (idx_t i = 0; i < children.size(); i++) {
-                    AppendFlexField(builder, StructType::GetChildName(value.type(), i), children[i]);
+                    AppendFlexField(builder, string(StructType::GetChildName(value.type(), i)), children[i]);
                 }
             } else {
                 for (const auto &entry : MapValue::GetChildren(value)) {
@@ -999,7 +999,7 @@ static void AppendFlexValue(flexbuffers::Builder &builder, const Value &value) {
             if (value.type().id() == LogicalTypeId::STRUCT) {
                 const auto &children = StructValue::GetChildren(value);
                 for (idx_t i = 0; i < children.size(); i++) {
-                    AppendFlexField(builder, StructType::GetChildName(value.type(), i), children[i]);
+                    AppendFlexField(builder, string(StructType::GetChildName(value.type(), i)), children[i]);
                 }
             } else {
                 for (const auto &entry : MapValue::GetChildren(value)) {
@@ -1110,7 +1110,13 @@ static void EncodeStructuredPayload(const NatsCopyToBindData &bind_data, const D
 }
 
 static unique_ptr<FunctionData> NatsCopyToBind(ClientContext &context, CopyFunctionBindInput &input,
-                                               const vector<string> &names, const vector<LogicalType> &sql_types) {
+                                               const vector<Identifier> &identifiers,
+                                               const vector<LogicalType> &sql_types) {
+    vector<string> names;
+    names.reserve(identifiers.size());
+    for (const auto &identifier : identifiers) {
+        names.push_back(string(identifier));
+    }
     auto result = make_uniq<NatsCopyToBindData>();
     result->column_types = sql_types;
     result->connection.url = ResolveNatsCopyUrl(input.info.options, "COPY TO", nullptr);
@@ -1465,7 +1471,7 @@ static unique_ptr<FunctionData> NatsScanBind(ClientContext &context, TableFuncti
             subject_contains = StringValue::Get(kv.second);
         } else if (kv.first == "nats_subject") {
             nats_subject = StringValue::Get(kv.second);
-        } else if (ParseNatsConnectionParameter(connection, kv.first, kv.second)) {
+        } else if (ParseNatsConnectionParameter(connection, string(kv.first), kv.second)) {
         } else if (kv.first == "start_seq") {
             start_seq = UBigIntValue::Get(kv.second);
         } else if (kv.first == "end_seq") {
@@ -1933,7 +1939,7 @@ static void NatsScanExecute(ClientContext &context, TableFunctionInput &data_p, 
     }
 
     while (count < max_rows && global_state.current_seq <= global_state.end_seq) {
-        if (context.interrupted) {
+        if (context.IsInterrupted()) {
             break;
         }
 
@@ -2020,7 +2026,7 @@ static void NatsScanExecute(ClientContext &context, TableFunctionInput &data_p, 
 
                 for (const auto &json_column : json_columns) {
                     auto &vec = output.data[json_column.output_idx];
-                    auto vec_data = FlatVector::GetData<string_t>(vec);
+                    auto vec_data = GetNatsMutableVectorData<string_t>(vec);
                     yyjson_val *field_val = yyjson_obj_get(root, bind_data.json_fields[json_column.field_idx].c_str());
 
                     if (field_val) {
@@ -2136,7 +2142,7 @@ static unique_ptr<FunctionData> NatsStreamStatsBind(ClientContext &context, Tabl
     NatsConnectionConfig connection;
 
     for (auto &kv : input.named_parameters) {
-        ParseNatsConnectionParameter(connection, kv.first, kv.second);
+        ParseNatsConnectionParameter(connection, string(kv.first), kv.second);
     }
     ValidateNatsConnectionConfig(connection);
 
@@ -2185,7 +2191,7 @@ static unique_ptr<FunctionData> NatsStreamRangeStatsBind(ClientContext &context,
             end_seq = UBigIntValue::Get(kv.second);
             has_end_seq = true;
         } else {
-            ParseNatsConnectionParameter(connection, kv.first, kv.second);
+            ParseNatsConnectionParameter(connection, string(kv.first), kv.second);
         }
     }
 
