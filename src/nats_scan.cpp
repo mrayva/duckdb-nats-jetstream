@@ -148,6 +148,8 @@ struct NatsCopyToBindData : public TableFunctionData {
     vector<LogicalType> column_types;
     vector<idx_t> structured_column_indices;
     vector<string> structured_column_names;
+    vector<string> structured_json_keys;
+    vector<vector<uint8_t>> structured_binary_keys;
     vector<vector<const FieldDescriptor *>> proto_field_paths;
     shared_ptr<DiskSourceTree> proto_source_tree;
     shared_ptr<ProtobufErrorCollector> proto_error_collector;
@@ -770,7 +772,7 @@ static void EncodeStructuredPayload(const NatsCopyToBindData &bind_data, const D
         string json_output = "{";
         for (idx_t i = 0; i < bind_data.structured_column_indices.size(); i++) {
             if (i) json_output += ",";
-            AppendJsonEscaped(json_output, bind_data.structured_column_names[i]);
+            json_output += bind_data.structured_json_keys[i];
             json_output += ":";
             AppendJsonValue(json_output, input.GetValue(bind_data.structured_column_indices[i], row_idx));
         }
@@ -798,8 +800,8 @@ static void EncodeStructuredPayload(const NatsCopyToBindData &bind_data, const D
     auto count = bind_data.structured_column_indices.size();
     AppendStructuredCount(output, count, cbor, true);
     for (idx_t i = 0; i < count; i++) {
-        cbor ? AppendCborString(output, bind_data.structured_column_names[i])
-             : AppendMsgpackString(output, bind_data.structured_column_names[i]);
+        const auto &key = bind_data.structured_binary_keys[i];
+        output.insert(output.end(), key.begin(), key.end());
         auto column = bind_data.structured_column_indices[i];
         AppendStructuredValue(output, input.GetValue(column, row_idx), cbor);
     }
@@ -886,6 +888,22 @@ static unique_ptr<FunctionData> NatsCopyToBind(ClientContext &context, CopyFunct
             }
             result->structured_column_indices.push_back(index);
             result->structured_column_names.push_back(column_name);
+        }
+
+        if (result->payload_format == NatsCopyToBindData::PayloadFormat::JSON) {
+            for (const auto &column_name : result->structured_column_names) {
+                string key;
+                AppendJsonEscaped(key, column_name);
+                result->structured_json_keys.push_back(std::move(key));
+            }
+        } else if (result->payload_format == NatsCopyToBindData::PayloadFormat::MSGPACK ||
+                   result->payload_format == NatsCopyToBindData::PayloadFormat::CBOR) {
+            bool cbor = result->payload_format == NatsCopyToBindData::PayloadFormat::CBOR;
+            for (const auto &column_name : result->structured_column_names) {
+                vector<uint8_t> key;
+                cbor ? AppendCborString(key, column_name) : AppendMsgpackString(key, column_name);
+                result->structured_binary_keys.push_back(std::move(key));
+            }
         }
 
         if (result->payload_format == NatsCopyToBindData::PayloadFormat::PROTOBUF) {
