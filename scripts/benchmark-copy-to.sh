@@ -61,6 +61,9 @@ bench_variant() {
   rm -f "$db_file"
   trap 'rc=$?; rm -f "$log_file" "$db_file"; exit $rc' RETURN
 
+  # Reuse the configured stream for each case without carrying rows between variants.
+  "$NATS_CLI" stream purge "$stream" --force --server "$NATS_URL" >/dev/null 2>&1 || true
+
   start_ns="$(date +%s%N)"
   if ! DUCKDB_LIB="$DUCKDB_LIB" python3 "$ROOT_DIR/scripts/duckdb_session.py" --duckdb-bin "$DUCKDB_BIN" --db-file "$db_file" <<SQL >"$log_file" 2>&1
 SEND
@@ -127,3 +130,46 @@ if [ "$RUN_BOTH_VARIANTS" = "1" ]; then
     ", subject 'copy_roundtrip_const.constant'" \
     "1000"
 fi
+
+structured_source="SELECT 'copy_roundtrip.bench' AS subject, 'device-' || i AS device_id,
+    i::DOUBLE AS kw, (i % 2 = 0) AS online FROM range(1000) t(i)"
+
+bench_variant \
+  "structured_json" \
+  "copy_roundtrip" \
+  "copy_bench_json" \
+  "$structured_source" \
+  ", payload_format 'json', payload_columns ['device_id', 'kw', 'online']" \
+  "1000"
+
+bench_variant \
+  "structured_msgpack" \
+  "copy_roundtrip" \
+  "copy_bench_msgpack" \
+  "$structured_source" \
+  ", payload_format 'msgpack', payload_columns ['device_id', 'kw', 'online']" \
+  "1000"
+
+bench_variant \
+  "structured_cbor" \
+  "copy_roundtrip" \
+  "copy_bench_cbor" \
+  "$structured_source" \
+  ", payload_format 'cbor', payload_columns ['device_id', 'kw', 'online']" \
+  "1000"
+
+bench_variant \
+  "structured_flexbuffers" \
+  "copy_roundtrip" \
+  "copy_bench_flexbuffers" \
+  "$structured_source" \
+  ", payload_format 'flexbuffers', payload_columns ['device_id', 'kw', 'online']" \
+  "1000"
+
+bench_variant \
+  "structured_protobuf" \
+  "copy_roundtrip" \
+  "copy_bench_protobuf" \
+  "$structured_source" \
+  ", payload_format 'protobuf', proto_file '${ROOT_DIR}/test/proto/telemetry.proto', proto_message 'Telemetry', proto_fields ['device_id', 'metrics.kw', 'online'], payload_columns ['device_id', 'kw', 'online']" \
+  "1000"
