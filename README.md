@@ -6,7 +6,7 @@
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/Platform-Linux%20%7C%20macOS%20%7C%20Windows%20%7C%20WebAssembly-lightgrey)](https://github.com/brannn/duckdb-nats-jetstream/actions)
 
-Query NATS JetStream message streams directly with SQL. Timestamp-based range queries, subject filtering, and extraction support for JSON, MessagePack, and Protocol Buffers payloads.
+Query NATS JetStream message streams directly with SQL. Timestamp-based range queries, subject filtering, and extraction support for JSON, MessagePack, CBOR, FlexBuffers, and Protocol Buffers payloads.
 
 ---
 
@@ -31,6 +31,19 @@ FROM nats_scan(
     msgpack_extract := ['device_id', 'metrics.kw']
 );
 ```
+
+CBOR and schema-less FlexBuffers payloads support the same projected field extraction API:
+
+```sql
+SELECT device_id, "metrics.kw"
+FROM nats_scan(
+    'telemetry',
+    cbor_extract := ['device_id', 'metrics.kw']
+);
+```
+
+Use `flexbuffers_extract := [...]` for FlexBuffers payloads. FlexBuffers builds require the
+FlatBuffers runtime dependency; the local subscription regression harness also requires `flatc`.
 
 ---
 
@@ -63,6 +76,8 @@ ORDER BY seq;
 - **Batched JetStream pulls** - Fetch messages in batches for large scans instead of one request per row
 - **JSON extraction** - Extract JSON fields as columns
 - **MessagePack extraction** - Extract MessagePack map fields as VARCHAR columns
+- **CBOR extraction** - Extract CBOR map fields as VARCHAR columns
+- **FlexBuffers extraction** - Extract schema-less FlexBuffers map fields as VARCHAR columns
 - **Protocol Buffers** - Native type support (VARCHAR, DOUBLE, BOOLEAN, INTEGER, etc.)
 - **Nested fields** - Access nested protobuf fields with dot notation
 - **Sequence ranges** - Query by message sequence numbers

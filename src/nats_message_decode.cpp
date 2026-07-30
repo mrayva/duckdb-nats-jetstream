@@ -1,6 +1,7 @@
 #include "nats_message_decode.hpp"
 
 #include "yyjson.hpp"
+#include <flatbuffers/flexbuffers.h>
 
 #include <cstring>
 #include <cstdio>
@@ -494,6 +495,53 @@ void DecodeCborFieldPathsToChunk(DataChunk &chunk, idx_t row_idx, const vector<i
     for (auto output_column : output_columns) FlatVector::SetNull(chunk.data[output_column], row_idx, true);
     CborReader reader(payload.data, payload.size);
     reader.Decode(chunk, row_idx, output_columns, field_paths);
+}
+
+void DecodeFlexbuffersFieldPathsToChunk(DataChunk &chunk, idx_t row_idx, const vector<idx_t> &output_columns,
+                                        const NatsPayloadView &payload, const vector<vector<string>> &field_paths) {
+    for (auto output_column : output_columns) {
+        FlatVector::SetNull(chunk.data[output_column], row_idx, true);
+    }
+    if (!payload.data || payload.size < 3 || !flexbuffers::VerifyBuffer(reinterpret_cast<const uint8_t *>(payload.data),
+                                                                         payload.size)) {
+        return;
+    }
+
+    auto root = flexbuffers::GetRoot(reinterpret_cast<const uint8_t *>(payload.data), payload.size);
+    for (idx_t field_idx = 0; field_idx < field_paths.size(); field_idx++) {
+        auto value = root;
+        for (const auto &part : field_paths[field_idx]) {
+            if (!value.IsMap()) {
+                value = flexbuffers::Reference();
+                break;
+            }
+            value = value.AsMap()[part.c_str()];
+        }
+        auto &vector = chunk.data[output_columns[field_idx]];
+        if (value.IsNull()) {
+            continue;
+        }
+        string text;
+        if (value.IsString()) {
+            auto string_value = value.AsString();
+            FlatVector::SetNull(vector, row_idx, false);
+            FlatVector::GetData<string_t>(vector)[row_idx] =
+                StringVector::AddString(vector, string_value.c_str(), string_value.length());
+            continue;
+        } else if (value.IsBool()) {
+            text = value.AsBool() ? "true" : "false";
+        } else if (value.IsInt()) {
+            text = std::to_string(value.AsInt64());
+        } else if (value.IsUInt()) {
+            text = std::to_string(value.AsUInt64());
+        } else if (value.IsFloat()) {
+            text = std::to_string(value.AsDouble());
+        } else {
+            continue;
+        }
+        FlatVector::SetNull(vector, row_idx, false);
+        FlatVector::GetData<string_t>(vector)[row_idx] = StringVector::AddString(vector, text);
+    }
 }
 
 bool DecodeProtobufPayload(google::protobuf::Message &message, const NatsPayloadView &payload) {

@@ -2,7 +2,8 @@
   "dependencies": [
     "vcpkg-cmake",
     "cnats",
-    "protobuf"
+    "protobuf",
+    "flatbuffers"
   ],
   "vcpkg-configuration": {
     "registries": [

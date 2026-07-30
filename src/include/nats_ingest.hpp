@@ -40,6 +40,8 @@ struct NatsIngestConfig {
     vector<vector<string>> msgpack_field_paths;
     vector<string> cbor_fields;
     vector<vector<string>> cbor_field_paths;
+    vector<string> flexbuffers_fields;
+    vector<vector<string>> flexbuffers_field_paths;
     string proto_file;
     string proto_message;
     vector<string> proto_fields;

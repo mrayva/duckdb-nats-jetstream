@@ -117,6 +117,7 @@ struct NatsIngestSnapshot {
     vector<string> json_fields;
     vector<string> msgpack_fields;
     vector<string> cbor_fields;
+    vector<string> flexbuffers_fields;
     string proto_file;
     string proto_message;
     vector<string> proto_fields;
@@ -345,6 +346,10 @@ static void EnsureRegistryTable(Connection &conn) {
                        " ADD COLUMN IF NOT EXISTS cbor_fields VARCHAR[]",
                    "Failed to migrate ingest CBOR settings");
     ExecuteOrThrow(conn,
+                   "ALTER TABLE " + string(NATS_INGEST_REGISTRY_TABLE) +
+                       " ADD COLUMN IF NOT EXISTS flexbuffers_fields VARCHAR[]",
+                   "Failed to migrate ingest FlexBuffers settings");
+    ExecuteOrThrow(conn,
                    "CREATE TABLE IF NOT EXISTS " + string(NATS_INGEST_LEASE_TABLE) + " ("
                    "stream_name VARCHAR NOT NULL,"
                    "durable_name VARCHAR NOT NULL,"
@@ -492,7 +497,7 @@ static void UpsertRegistry(Connection &conn, const NatsIngestSnapshot &snapshot)
            "last_committed_seq, last_delivered_seq, rows_inserted, batches_committed, fetches_completed, last_batch_rows, "
            "sequence_lag, last_start_time, last_fetch_time, last_ack_time, last_commit_time, last_error_time, last_error, "
            "credentials_file, tls_ca_file, tls_cert_file, tls_key_file, tls_server_name, tls_skip_verify, "
-           "duplicates_skipped, updated_at, msgpack_fields, cbor_fields) VALUES ("
+           "duplicates_skipped, updated_at, msgpack_fields, cbor_fields, flexbuffers_fields) VALUES ("
         << SqlStringLiteral(snapshot.job_name) << ", "
         << SqlStringLiteral(snapshot.stream_name) << ", "
         << SqlStringLiteral(snapshot.target_table) << ", "
@@ -538,7 +543,8 @@ static void UpsertRegistry(Connection &conn, const NatsIngestSnapshot &snapshot)
         << snapshot.duplicates_skipped << ", "
         << "CURRENT_TIMESTAMP, "
         << SqlListLiteral(snapshot.msgpack_fields) << ", "
-        << SqlListLiteral(snapshot.cbor_fields)
+        << SqlListLiteral(snapshot.cbor_fields) << ", "
+        << SqlListLiteral(snapshot.flexbuffers_fields)
         << ") ON CONFLICT(job_name) DO UPDATE SET "
         << "stream_name = excluded.stream_name, "
         << "target_table = excluded.target_table, "
@@ -584,6 +590,7 @@ static void UpsertRegistry(Connection &conn, const NatsIngestSnapshot &snapshot)
         << "duplicates_skipped = excluded.duplicates_skipped, "
         << "msgpack_fields = excluded.msgpack_fields, "
         << "cbor_fields = excluded.cbor_fields, "
+        << "flexbuffers_fields = excluded.flexbuffers_fields, "
         << "updated_at = excluded.updated_at";
     ExecuteOrThrow(conn, sql.str(), "Failed to update ingest registry");
 }
@@ -599,7 +606,7 @@ static bool LoadRegistrySnapshot(Connection &conn, const string &job_name, NatsI
            "proto_message, proto_fields, running, stop_requested, stopped, failed, paused, pause_requested, last_committed_seq, "
            "last_delivered_seq, rows_inserted, batches_committed, fetches_completed, last_batch_rows, sequence_lag, last_start_time, "
            "last_fetch_time, last_ack_time, last_commit_time, last_error_time, last_error, credentials_file, tls_ca_file, "
-           "tls_cert_file, tls_key_file, tls_server_name, tls_skip_verify, duplicates_skipped, msgpack_fields, cbor_fields "
+           "tls_cert_file, tls_key_file, tls_server_name, tls_skip_verify, duplicates_skipped, msgpack_fields, cbor_fields, flexbuffers_fields "
         << "FROM " << NATS_INGEST_REGISTRY_TABLE << " WHERE job_name = " << SqlStringLiteral(job_name);
 
     auto result = conn.Query(sql.str());
@@ -703,6 +710,11 @@ static bool LoadRegistrySnapshot(Connection &conn, const string &job_name, NatsI
             snapshot.cbor_fields.push_back(entry.GetValue<string>());
         }
     }
+    if (!chunk->GetValue(45, 0).IsNull()) {
+        for (auto &entry : ListValue::GetChildren(chunk->GetValue(45, 0))) {
+            snapshot.flexbuffers_fields.push_back(entry.GetValue<string>());
+        }
+    }
     return true;
 }
 
@@ -713,7 +725,7 @@ static vector<NatsIngestSnapshot> LoadRegistrySnapshots(Connection &conn) {
            "proto_message, proto_fields, running, stop_requested, stopped, failed, paused, pause_requested, last_committed_seq, "
            "last_delivered_seq, rows_inserted, batches_committed, fetches_completed, last_batch_rows, sequence_lag, last_start_time, "
            "last_fetch_time, last_ack_time, last_commit_time, last_error_time, last_error, credentials_file, tls_ca_file, "
-           "tls_cert_file, tls_key_file, tls_server_name, tls_skip_verify, duplicates_skipped, msgpack_fields, cbor_fields "
+           "tls_cert_file, tls_key_file, tls_server_name, tls_skip_verify, duplicates_skipped, msgpack_fields, cbor_fields, flexbuffers_fields "
         << "FROM " << NATS_INGEST_REGISTRY_TABLE << " ORDER BY job_name";
 
     auto result = conn.Query(sql.str());
@@ -814,6 +826,11 @@ static vector<NatsIngestSnapshot> LoadRegistrySnapshots(Connection &conn) {
             if (!chunk->GetValue(44, row).IsNull()) {
                 for (auto &entry : ListValue::GetChildren(chunk->GetValue(44, row))) {
                     snapshot.cbor_fields.push_back(entry.GetValue<string>());
+                }
+            }
+            if (!chunk->GetValue(45, row).IsNull()) {
+                for (auto &entry : ListValue::GetChildren(chunk->GetValue(45, row))) {
+                    snapshot.flexbuffers_fields.push_back(entry.GetValue<string>());
                 }
             }
             snapshots.push_back(std::move(snapshot));
@@ -1085,6 +1102,11 @@ static NatsIngestConfig ParseStartConfig(TableFunctionBindInput &input) {
             for (auto &child : list_children) {
                 config.cbor_fields.push_back(StringValue::Get(child));
             }
+        } else if (kv.first == "flexbuffers_extract") {
+            auto list_children = ListValue::GetChildren(kv.second);
+            for (auto &child : list_children) {
+                config.flexbuffers_fields.push_back(StringValue::Get(child));
+            }
         } else if (kv.first == "proto_file") {
             config.proto_file = StringValue::Get(kv.second);
         } else if (kv.first == "proto_message") {
@@ -1129,8 +1151,9 @@ static NatsIngestConfig ParseStartConfig(TableFunctionBindInput &input) {
         throw std::runtime_error("fetch_timeout_ms must be at least 1");
     }
     if (static_cast<int>(!config.json_fields.empty()) + static_cast<int>(!config.msgpack_fields.empty()) +
-            static_cast<int>(!config.cbor_fields.empty()) + static_cast<int>(!config.proto_fields.empty()) > 1) {
-        throw std::runtime_error("Cannot combine JSON, MessagePack, CBOR, and protobuf extraction parameters");
+            static_cast<int>(!config.cbor_fields.empty()) + static_cast<int>(!config.flexbuffers_fields.empty()) +
+            static_cast<int>(!config.proto_fields.empty()) > 1) {
+        throw std::runtime_error("Cannot combine JSON, MessagePack, CBOR, FlexBuffers, and protobuf extraction parameters");
     }
 
     if (!config.proto_fields.empty()) {
@@ -1145,6 +1168,7 @@ static NatsIngestConfig ParseStartConfig(TableFunctionBindInput &input) {
     config.create_target_table = create_target_table;
     config.msgpack_field_paths = SplitMsgpackFieldPaths(config.msgpack_fields);
     config.cbor_field_paths = SplitMsgpackFieldPaths(config.cbor_fields);
+    config.flexbuffers_field_paths = SplitMsgpackFieldPaths(config.flexbuffers_fields);
     ValidateNatsConnectionConfig(config.connection);
 
     return config;
@@ -1175,6 +1199,7 @@ static NatsIngestSnapshot SnapshotJob(const shared_ptr<NatsIngestJobState> &job)
     snapshot.json_fields = job->config.json_fields;
     snapshot.msgpack_fields = job->config.msgpack_fields;
     snapshot.cbor_fields = job->config.cbor_fields;
+    snapshot.flexbuffers_fields = job->config.flexbuffers_fields;
     snapshot.proto_file = job->config.proto_file;
     snapshot.proto_message = job->config.proto_message;
     snapshot.proto_fields = job->config.proto_fields;
@@ -1233,6 +1258,8 @@ static NatsIngestConfig SnapshotToConfig(const NatsIngestSnapshot &snapshot) {
     config.msgpack_field_paths = SplitMsgpackFieldPaths(config.msgpack_fields);
     config.cbor_fields = snapshot.cbor_fields;
     config.cbor_field_paths = SplitMsgpackFieldPaths(config.cbor_fields);
+    config.flexbuffers_fields = snapshot.flexbuffers_fields;
+    config.flexbuffers_field_paths = SplitMsgpackFieldPaths(config.flexbuffers_fields);
     config.proto_file = snapshot.proto_file;
     config.proto_message = snapshot.proto_message;
     config.proto_fields = snapshot.proto_fields;
@@ -1674,7 +1701,8 @@ static vector<NatsIngestColumnDef> BuildTargetTableColumns(const NatsIngestConfi
     columns.push_back({"subject", "VARCHAR"});
     columns.push_back({"sequence", "UBIGINT"});
     columns.push_back({"ts", "TIMESTAMP"});
-    columns.push_back({"payload", (config.json_fields.empty() && config.msgpack_fields.empty() && config.cbor_fields.empty()) ? "BLOB" : "VARCHAR"});
+    columns.push_back({"payload", (config.json_fields.empty() && config.msgpack_fields.empty() &&
+                                    config.cbor_fields.empty() && config.flexbuffers_fields.empty()) ? "BLOB" : "VARCHAR"});
 
     for (const auto &field_name : config.json_fields) {
         columns.push_back({field_name, "VARCHAR"});
@@ -1685,6 +1713,10 @@ static vector<NatsIngestColumnDef> BuildTargetTableColumns(const NatsIngestConfi
     }
 
     for (const auto &field_name : config.cbor_fields) {
+        columns.push_back({field_name, "VARCHAR"});
+    }
+
+    for (const auto &field_name : config.flexbuffers_fields) {
         columns.push_back({field_name, "VARCHAR"});
     }
 
@@ -1777,14 +1809,16 @@ static void AppendMessageRow(DataChunk &chunk, idx_t row_idx, const NatsIngestCo
                              const NatsMessageEnvelope &envelope,
                              Message *proto_msg, vector<Value> &json_values, bool reuse_json_values,
                              bool direct_json_write, const vector<idx_t> &msgpack_output_columns,
-                             const vector<idx_t> &cbor_output_columns, const vector<idx_t> &proto_output_columns) {
+                             const vector<idx_t> &cbor_output_columns, const vector<idx_t> &flexbuffers_output_columns,
+                             const vector<idx_t> &proto_output_columns) {
     const char *subject = envelope.Subject();
     uint64_t stream_seq = envelope.Sequence();
     int64_t timestamp_ns = envelope.TimestampNs();
     const char *msg_data = envelope.Data();
     int data_len = envelope.DataLength();
     NatsPayloadView payload {msg_data, static_cast<idx_t>(data_len)};
-    bool payload_as_varchar = !config.json_fields.empty() || !config.cbor_fields.empty();
+    bool payload_as_varchar = !config.json_fields.empty() || !config.cbor_fields.empty() ||
+                              !config.flexbuffers_fields.empty();
 
     chunk.SetValue(0, row_idx, Value(config.stream_name));
     chunk.SetValue(1, row_idx, Value(subject ? subject : ""));
@@ -1808,6 +1842,9 @@ static void AppendMessageRow(DataChunk &chunk, idx_t row_idx, const NatsIngestCo
         DecodeMsgpackFieldPathsToChunk(chunk, row_idx, msgpack_output_columns, payload, config.msgpack_field_paths);
     } else if (!config.cbor_fields.empty()) {
         DecodeCborFieldPathsToChunk(chunk, row_idx, cbor_output_columns, payload, config.cbor_field_paths);
+    } else if (!config.flexbuffers_fields.empty()) {
+        DecodeFlexbuffersFieldPathsToChunk(chunk, row_idx, flexbuffers_output_columns, payload,
+                                           config.flexbuffers_field_paths);
     } else if (!config.proto_fields.empty()) {
         AppendProtoFields(chunk, row_idx, config, proto_msg, payload, proto_output_columns);
     }
@@ -1957,6 +1994,11 @@ static void RunIngestWorker(const shared_ptr<NatsIngestJobState> &job) {
         cbor_output_columns.reserve(config.cbor_fields.size());
         for (idx_t i = 0; i < config.cbor_fields.size(); i++) {
             cbor_output_columns.push_back(5 + i);
+        }
+        vector<idx_t> flexbuffers_output_columns;
+        flexbuffers_output_columns.reserve(config.flexbuffers_fields.size());
+        for (idx_t i = 0; i < config.flexbuffers_fields.size(); i++) {
+            flexbuffers_output_columns.push_back(5 + i);
         }
         vector<idx_t> proto_output_columns;
         proto_output_columns.reserve(config.proto_fields.size());
@@ -2120,6 +2162,7 @@ static void RunIngestWorker(const shared_ptr<NatsIngestJobState> &job) {
                         phase_start = std::chrono::steady_clock::now();
                         AppendMessageRow(write_chunk, write_row, config, envelope, nullptr, json_values,
                                          reuse_json_values, direct_json_write, msgpack_output_columns, cbor_output_columns,
+                                         flexbuffers_output_columns,
                                          proto_output_columns);
                         timing.row_ns += static_cast<uint64_t>(
                             std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - phase_start)
@@ -2130,6 +2173,7 @@ static void RunIngestWorker(const shared_ptr<NatsIngestJobState> &job) {
                         phase_start = std::chrono::steady_clock::now();
                         AppendMessageRow(write_chunk, write_row, config, envelope, row_proto.get(), json_values,
                                          reuse_json_values, direct_json_write, msgpack_output_columns, cbor_output_columns,
+                                         flexbuffers_output_columns,
                                          proto_output_columns);
                         timing.row_ns += static_cast<uint64_t>(
                             std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - phase_start)
@@ -2814,6 +2858,7 @@ void NatsIngestFunction::Register(ExtensionLoader &loader) {
     start_fn.named_parameters["json_extract"] = LogicalType::LIST(LogicalType(LogicalTypeId::VARCHAR));
     start_fn.named_parameters["msgpack_extract"] = LogicalType::LIST(LogicalType(LogicalTypeId::VARCHAR));
     start_fn.named_parameters["cbor_extract"] = LogicalType::LIST(LogicalType(LogicalTypeId::VARCHAR));
+    start_fn.named_parameters["flexbuffers_extract"] = LogicalType::LIST(LogicalType(LogicalTypeId::VARCHAR));
     start_fn.named_parameters["proto_file"] = LogicalType(LogicalTypeId::VARCHAR);
     start_fn.named_parameters["proto_message"] = LogicalType(LogicalTypeId::VARCHAR);
     start_fn.named_parameters["proto_extract"] = LogicalType::LIST(LogicalType(LogicalTypeId::VARCHAR));

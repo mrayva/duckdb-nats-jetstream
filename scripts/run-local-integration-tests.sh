@@ -270,6 +270,10 @@ echo "RUN scripts/run-subscribe-cbor-harness.sh"
   NATS_URL="$NATS_URL" NATS_CLI="$NATS_CLI" "$ROOT_DIR/scripts/run-subscribe-cbor-harness.sh"
 echo "PASS scripts/run-subscribe-cbor-harness.sh"
 
+echo "RUN scripts/run-subscribe-flexbuffers-harness.sh"
+  NATS_URL="$NATS_URL" NATS_CLI="$NATS_CLI" "$ROOT_DIR/scripts/run-subscribe-flexbuffers-harness.sh"
+echo "PASS scripts/run-subscribe-flexbuffers-harness.sh"
+
 echo "RUN scripts/run-subscribe-pause-resume-harness.sh"
 NATS_URL="$NATS_URL" \
 NATS_CLI="$NATS_CLI" \

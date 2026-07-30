@@ -27,11 +27,12 @@ find_package(OpenSSL REQUIRED)
 find_package(unofficial-sodium CONFIG REQUIRED)
 find_package(cnats CONFIG REQUIRED)
 find_package(Protobuf CONFIG REQUIRED)
+find_package(flatbuffers CONFIG REQUIRED)
 
 # Link dependencies - use plain signature to match DuckDB's build functions
 # cnats exports 'cnats::nats_static' target for static library
-target_link_libraries(${EXTENSION_NAME} cnats::nats_static protobuf::libprotobuf protobuf::libprotoc)
-target_link_libraries(${LOADABLE_EXTENSION_NAME} cnats::nats_static protobuf::libprotobuf protobuf::libprotoc)
+target_link_libraries(${EXTENSION_NAME} cnats::nats_static protobuf::libprotobuf protobuf::libprotoc flatbuffers::flatbuffers)
+target_link_libraries(${LOADABLE_EXTENSION_NAME} cnats::nats_static protobuf::libprotobuf protobuf::libprotoc flatbuffers::flatbuffers)
 
 # Install static library
 install(
