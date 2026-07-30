@@ -49,7 +49,7 @@ FlatBuffers runtime dependency; the local subscription regression harness also r
 
 `COPY TO ... (FORMAT nats_js)` publishes raw `payload` values by default. To serialize selected
 source columns as one structured object per message, set `payload_format` to `json`, `msgpack`,
-`cbor`, or `flexbuffers` and provide `payload_columns`:
+`cbor`, or `flexbuffers` and provide `payload_columns`. Protobuf output is schema-driven:
 
 ```sql
 COPY readings
@@ -61,7 +61,9 @@ TO 'telemetry'
 ```
 
 The subject still comes from `subject` unless a constant `subject` option is supplied. The
-structured COPY TO regression is covered by `scripts/run-copy-structured-harness.sh`.
+structured COPY TO regression is covered by `scripts/run-copy-structured-harness.sh`. Protobuf
+output uses `payload_format 'protobuf'`, `proto_file`, `proto_message`, and optional
+`proto_fields` to map source columns to scalar or nested singular fields.
 
 ---
 

@@ -135,7 +135,7 @@ struct NatsCopyBindData : public TableFunctionData {
 };
 
 struct NatsCopyToBindData : public TableFunctionData {
-    enum class PayloadFormat { RAW, JSON, MSGPACK, CBOR, FLEXBUFFERS };
+    enum class PayloadFormat { RAW, JSON, MSGPACK, CBOR, FLEXBUFFERS, PROTOBUF };
     string stream_name;
     NatsConnectionConfig connection;
     string subject_column = "subject";
@@ -148,6 +148,11 @@ struct NatsCopyToBindData : public TableFunctionData {
     vector<LogicalType> column_types;
     vector<idx_t> structured_column_indices;
     vector<string> structured_column_names;
+    vector<vector<const FieldDescriptor *>> proto_field_paths;
+    shared_ptr<DiskSourceTree> proto_source_tree;
+    shared_ptr<ProtobufErrorCollector> proto_error_collector;
+    shared_ptr<Importer> proto_importer;
+    const Descriptor *proto_descriptor = nullptr;
 };
 
 struct NatsCopyToGlobalState : public GlobalFunctionData {
@@ -333,6 +338,7 @@ static void NatsCopyListOptions(ClientContext &, CopyOptionsInput &input) {
     copy_options["payload_column"] = CopyOption(LogicalType::VARCHAR, CopyOptionMode::READ_WRITE);
     copy_options["payload_format"] = CopyOption(LogicalType::VARCHAR, CopyOptionMode::READ_WRITE);
     copy_options["payload_columns"] = CopyOption(LogicalType::ANY, CopyOptionMode::READ_WRITE);
+    copy_options["proto_fields"] = CopyOption(LogicalType::ANY, CopyOptionMode::READ_WRITE);
 }
 
 static void DisconnectNats(natsConnection **conn) {
@@ -484,9 +490,102 @@ static void AppendStructuredScalar(vector<uint8_t> &output, const Value &value, 
     }
 }
 
+static void SetProtobufOutputField(google::protobuf::Message &message,
+                                   const vector<const FieldDescriptor *> &field_path, const Value &value) {
+    if (value.IsNull() || field_path.empty()) {
+        return;
+    }
+    Message *current_message = &message;
+    const Reflection *reflection = current_message->GetReflection();
+    for (idx_t i = 0; i + 1 < field_path.size(); i++) {
+        auto *field = field_path[i];
+        if (!field || field->is_repeated() || field->type() != FieldDescriptor::TYPE_MESSAGE) {
+            throw BinderException("COPY TO protobuf fields must use singular message paths");
+        }
+        current_message = reflection->MutableMessage(current_message, field);
+        reflection = current_message->GetReflection();
+    }
+
+    auto *field = field_path.back();
+    if (!field || field->is_repeated() || field->type() == FieldDescriptor::TYPE_MESSAGE) {
+        throw BinderException("COPY TO protobuf output does not support repeated or message-valued fields");
+    }
+    switch (field->type()) {
+    case FieldDescriptor::TYPE_STRING:
+        reflection->SetString(current_message, field, value.ToString());
+        break;
+    case FieldDescriptor::TYPE_BYTES:
+        reflection->SetString(current_message, field, value.ToString());
+        break;
+    case FieldDescriptor::TYPE_INT32:
+    case FieldDescriptor::TYPE_SINT32:
+    case FieldDescriptor::TYPE_SFIXED32:
+        reflection->SetInt32(current_message, field, std::stoll(value.ToString()));
+        break;
+    case FieldDescriptor::TYPE_INT64:
+    case FieldDescriptor::TYPE_SINT64:
+    case FieldDescriptor::TYPE_SFIXED64:
+        reflection->SetInt64(current_message, field, std::stoll(value.ToString()));
+        break;
+    case FieldDescriptor::TYPE_UINT32:
+    case FieldDescriptor::TYPE_FIXED32:
+        reflection->SetUInt32(current_message, field, std::stoull(value.ToString()));
+        break;
+    case FieldDescriptor::TYPE_UINT64:
+    case FieldDescriptor::TYPE_FIXED64:
+        reflection->SetUInt64(current_message, field, std::stoull(value.ToString()));
+        break;
+    case FieldDescriptor::TYPE_FLOAT:
+        reflection->SetFloat(current_message, field, std::stof(value.ToString()));
+        break;
+    case FieldDescriptor::TYPE_DOUBLE:
+        reflection->SetDouble(current_message, field, std::stod(value.ToString()));
+        break;
+    case FieldDescriptor::TYPE_BOOL:
+        reflection->SetBool(current_message, field, value.GetValue<bool>());
+        break;
+    case FieldDescriptor::TYPE_ENUM: {
+        auto enum_value = field->enum_type()->FindValueByName(value.ToString());
+        if (!enum_value) {
+            enum_value = field->enum_type()->FindValueByNumber(std::stoi(value.ToString()));
+        }
+        if (!enum_value) {
+            throw BinderException("COPY TO protobuf enum value '%s' was not found for field '%s'", value.ToString(),
+                                  field->full_name());
+        }
+        reflection->SetEnum(current_message, field, enum_value);
+        break;
+    }
+    default:
+        throw BinderException("COPY TO protobuf field '%s' has an unsupported type", field->full_name());
+    }
+}
+
+static vector<uint8_t> EncodeProtobufPayload(const NatsCopyToBindData &bind_data, const DataChunk &input,
+                                             idx_t row_idx) {
+    DynamicMessageFactory factory;
+    const auto *prototype = factory.GetPrototype(bind_data.proto_descriptor);
+    if (!prototype) {
+        throw BinderException("COPY TO could not create protobuf message '%s'", bind_data.proto_descriptor->full_name());
+    }
+    auto message = unique_ptr<Message>(prototype->New());
+    for (idx_t i = 0; i < bind_data.structured_column_indices.size(); i++) {
+        auto column = bind_data.structured_column_indices[i];
+        SetProtobufOutputField(*message, bind_data.proto_field_paths[i], input.GetValue(column, row_idx));
+    }
+    string serialized;
+    if (!message->SerializeToString(&serialized)) {
+        throw BinderException("COPY TO failed to serialize protobuf message '%s'", bind_data.proto_descriptor->full_name());
+    }
+    return vector<uint8_t>(serialized.begin(), serialized.end());
+}
+
 static vector<uint8_t> EncodeStructuredPayload(const NatsCopyToBindData &bind_data, const DataChunk &input,
                                                idx_t row_idx) {
     const auto &types = bind_data.column_types;
+    if (bind_data.payload_format == NatsCopyToBindData::PayloadFormat::PROTOBUF) {
+        return EncodeProtobufPayload(bind_data, input, row_idx);
+    }
     if (bind_data.payload_format == NatsCopyToBindData::PayloadFormat::JSON) {
         string output = "{";
         for (idx_t i = 0; i < bind_data.structured_column_indices.size(); i++) {
@@ -574,6 +673,8 @@ static unique_ptr<FunctionData> NatsCopyToBind(ClientContext &context, CopyFunct
         result->payload_format = NatsCopyToBindData::PayloadFormat::CBOR;
     } else if (payload_format == "flexbuffers" || payload_format == "flex") {
         result->payload_format = NatsCopyToBindData::PayloadFormat::FLEXBUFFERS;
+    } else if (payload_format == "protobuf" || payload_format == "proto") {
+        result->payload_format = NatsCopyToBindData::PayloadFormat::PROTOBUF;
     } else {
         throw BinderException("COPY TO FORMAT nats_js does not support payload_format '%s'", payload_format);
     }
@@ -628,6 +729,53 @@ static unique_ptr<FunctionData> NatsCopyToBind(ClientContext &context, CopyFunct
             }
             result->structured_column_indices.push_back(index);
             result->structured_column_names.push_back(column_name);
+        }
+
+        if (result->payload_format == NatsCopyToBindData::PayloadFormat::PROTOBUF) {
+            auto proto_file = GetCopyOptionString(input.info.options, "proto_file").value_or("");
+            auto proto_message = GetCopyOptionString(input.info.options, "proto_message").value_or("");
+            if (proto_file.empty() || proto_message.empty()) {
+                throw BinderException("COPY TO protobuf requires proto_file and proto_message");
+            }
+
+            auto proto_fields = GetCopyOptionStringList(input.info.options, "proto_fields");
+            if (proto_fields.empty()) {
+                proto_fields = result->structured_column_names;
+            }
+            if (proto_fields.size() != result->structured_column_indices.size()) {
+                throw BinderException("COPY TO protobuf requires one proto_fields entry per payload column");
+            }
+
+            result->proto_source_tree = make_shared_ptr<DiskSourceTree>();
+            std::filesystem::path proto_path(proto_file);
+            string proto_dir = proto_path.parent_path().string();
+            if (proto_dir.empty()) {
+                proto_dir = ".";
+            }
+            result->proto_source_tree->MapPath("", proto_dir);
+            result->proto_error_collector = make_shared_ptr<ProtobufErrorCollector>();
+            result->proto_importer = make_shared_ptr<Importer>(result->proto_source_tree.get(),
+                                                               result->proto_error_collector.get());
+            auto file_desc = result->proto_importer->Import(proto_path.filename().string());
+            if (!file_desc) {
+                string error = "Failed to import protobuf schema file: " + proto_file;
+                if (result->proto_error_collector->HasErrors()) {
+                    error += "\n" + result->proto_error_collector->GetErrors();
+                }
+                throw BinderException("%s", error);
+            }
+            result->proto_descriptor = file_desc->FindMessageTypeByName(proto_message);
+            if (!result->proto_descriptor) {
+                throw BinderException("Protobuf message type '%s' was not found in %s", proto_message, proto_file);
+            }
+            for (const auto &field_path : proto_fields) {
+                auto resolved_path = ResolveProtobufFieldPath(result->proto_descriptor, field_path);
+                if (resolved_path.back()->is_repeated() ||
+                    resolved_path.back()->type() == FieldDescriptor::TYPE_MESSAGE) {
+                    throw BinderException("COPY TO protobuf field '%s' must be a singular scalar", field_path);
+                }
+                result->proto_field_paths.push_back(std::move(resolved_path));
+            }
         }
     }
 

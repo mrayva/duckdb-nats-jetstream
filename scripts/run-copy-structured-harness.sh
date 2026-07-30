@@ -50,7 +50,8 @@ INSERT INTO structured_source VALUES
     ('copy_roundtrip.json', 'json-device', 42.5, true, 7),
     ('copy_roundtrip.msgpack', 'msgpack-device', 43.5, false, 8),
     ('copy_roundtrip.cbor', 'cbor-device', 44.5, true, 9),
-    ('copy_roundtrip.flex', 'flex-device', 45.5, false, 10);
+    ('copy_roundtrip.flex', 'flex-device', 45.5, false, 10),
+    ('copy_roundtrip.proto', 'proto-device', 46.5, true, 11);
 COPY (SELECT * FROM structured_source WHERE subject = 'copy_roundtrip.json')
 TO 'copy_roundtrip'
 (FORMAT nats_js, url '${NATS_URL}', payload_format 'json', payload_columns ['device_id', 'kw', 'online', 'reading_count']);
@@ -63,6 +64,15 @@ TO 'copy_roundtrip'
 COPY (SELECT * FROM structured_source WHERE subject = 'copy_roundtrip.flex')
 TO 'copy_roundtrip'
 (FORMAT nats_js, url '${NATS_URL}', payload_format 'flexbuffers', payload_columns ['device_id', 'kw', 'online', 'reading_count']);
+COPY (SELECT * FROM structured_source WHERE subject = 'copy_roundtrip.proto')
+TO 'copy_roundtrip'
+(FORMAT nats_js,
+ url '${NATS_URL}',
+ payload_format 'protobuf',
+ proto_file '${ROOT_DIR}/test/proto/telemetry.proto',
+ proto_message 'Telemetry',
+ payload_columns ['device_id', 'kw', 'online'],
+ proto_fields ['device_id', 'metrics.kw', 'online']);
 SELECT 'rows=' || COUNT(*) FROM nats_scan('copy_roundtrip', url := '${NATS_URL}');
 SELECT 'json=' || device_id || '/' || kw || '/' || online || '/' || reading_count
 FROM nats_scan('copy_roundtrip', url := '${NATS_URL}', nats_subject := 'copy_roundtrip.json', json_extract := ['device_id', 'kw', 'online', 'reading_count']);
@@ -72,12 +82,17 @@ SELECT 'cbor=' || device_id || '/' || kw || '/' || online || '/' || reading_coun
 FROM nats_scan('copy_roundtrip', url := '${NATS_URL}', nats_subject := 'copy_roundtrip.cbor', cbor_extract := ['device_id', 'kw', 'online', 'reading_count']);
 SELECT 'flex=' || device_id || '/' || kw || '/' || online || '/' || reading_count
 FROM nats_scan('copy_roundtrip', url := '${NATS_URL}', nats_subject := 'copy_roundtrip.flex', flexbuffers_extract := ['device_id', 'kw', 'online', 'reading_count']);
+SELECT 'proto=' || device_id || '/' || metrics_kw || '/' || online
+FROM nats_scan('copy_roundtrip', url := '${NATS_URL}', nats_subject := 'copy_roundtrip.proto',
+    proto_file := '${ROOT_DIR}/test/proto/telemetry.proto', proto_message := 'Telemetry',
+    proto_extract := ['device_id', 'metrics.kw', 'online']);
 END
-EXPECT rows=4 20
+EXPECT rows=5 20
 EXPECT json=json-device/42.5/true/7 20
 EXPECT msgpack=msgpack-device/43.5/false/8 20
 EXPECT cbor=cbor-device/44.5/true/9 20
 EXPECT flex=flex-device/45.5/false/10 20
+EXPECT proto=proto-device/46.5/true 20
 QUIT
 SQL
 then
