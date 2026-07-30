@@ -580,7 +580,7 @@ static void SetProtobufOutputField(google::protobuf::Message &message,
     const Reflection *reflection = current_message->GetReflection();
     for (idx_t i = 0; i + 1 < field_path.size(); i++) {
         auto *field = field_path[i];
-        if (!field || field->is_repeated() || field->type() != FieldDescriptor::TYPE_MESSAGE) {
+        if (!field || field->is_repeated() || field->is_map() || field->type() != FieldDescriptor::TYPE_MESSAGE) {
             throw BinderException("COPY TO protobuf fields must use singular message paths");
         }
         current_message = reflection->MutableMessage(current_message, field);
@@ -588,7 +588,61 @@ static void SetProtobufOutputField(google::protobuf::Message &message,
     }
 
     auto *field = field_path.back();
-    if (!field || field->type() == FieldDescriptor::TYPE_MESSAGE) {
+    if (!field) {
+        throw BinderException("COPY TO protobuf output has an invalid field path");
+    }
+    if (field->is_map()) {
+        if (value.type().id() != LogicalTypeId::MAP) {
+            throw BinderException("COPY TO protobuf map field '%s' requires a MAP source column", field->full_name());
+        }
+        auto *map_key = field->message_type()->map_key();
+        auto *map_value = field->message_type()->map_value();
+        if (map_value->cpp_type() == FieldDescriptor::CPPTYPE_MESSAGE) {
+            throw BinderException("COPY TO protobuf map field '%s' does not support message values", field->full_name());
+        }
+        for (const auto &entry : MapValue::GetChildren(value)) {
+            const auto &key_value = StructValue::GetChildren(entry);
+            auto *map_entry = reflection->AddMessage(&message, field);
+            auto *entry_key = field->message_type()->FindFieldByName("key");
+            auto *entry_value = field->message_type()->FindFieldByName("value");
+            const auto *entry_reflection = map_entry->GetReflection();
+            switch (map_key->cpp_type()) {
+            case FieldDescriptor::CPPTYPE_INT32: entry_reflection->SetInt32(map_entry, entry_key, std::stoll(key_value[0].ToString())); break;
+            case FieldDescriptor::CPPTYPE_INT64: entry_reflection->SetInt64(map_entry, entry_key, std::stoll(key_value[0].ToString())); break;
+            case FieldDescriptor::CPPTYPE_UINT32: entry_reflection->SetUInt32(map_entry, entry_key, std::stoull(key_value[0].ToString())); break;
+            case FieldDescriptor::CPPTYPE_UINT64: entry_reflection->SetUInt64(map_entry, entry_key, std::stoull(key_value[0].ToString())); break;
+            case FieldDescriptor::CPPTYPE_BOOL: entry_reflection->SetBool(map_entry, entry_key, key_value[0].GetValue<bool>()); break;
+            case FieldDescriptor::CPPTYPE_STRING: entry_reflection->SetString(map_entry, entry_key, key_value[0].ToString()); break;
+            default:
+                throw BinderException("COPY TO protobuf map field '%s' has an unsupported key type", field->full_name());
+            }
+            const auto &map_scalar = key_value[1];
+            if (map_scalar.IsNull()) continue;
+            switch (map_value->cpp_type()) {
+            case FieldDescriptor::CPPTYPE_INT32: entry_reflection->SetInt32(map_entry, entry_value, std::stoll(map_scalar.ToString())); break;
+            case FieldDescriptor::CPPTYPE_INT64: entry_reflection->SetInt64(map_entry, entry_value, std::stoll(map_scalar.ToString())); break;
+            case FieldDescriptor::CPPTYPE_UINT32: entry_reflection->SetUInt32(map_entry, entry_value, std::stoull(map_scalar.ToString())); break;
+            case FieldDescriptor::CPPTYPE_UINT64: entry_reflection->SetUInt64(map_entry, entry_value, std::stoull(map_scalar.ToString())); break;
+            case FieldDescriptor::CPPTYPE_BOOL: entry_reflection->SetBool(map_entry, entry_value, map_scalar.GetValue<bool>()); break;
+            case FieldDescriptor::CPPTYPE_FLOAT: entry_reflection->SetFloat(map_entry, entry_value, std::stof(map_scalar.ToString())); break;
+            case FieldDescriptor::CPPTYPE_DOUBLE: entry_reflection->SetDouble(map_entry, entry_value, std::stod(map_scalar.ToString())); break;
+            case FieldDescriptor::CPPTYPE_STRING: entry_reflection->SetString(map_entry, entry_value, map_scalar.ToString()); break;
+            case FieldDescriptor::CPPTYPE_ENUM: {
+                auto enum_value = entry_value->enum_type()->FindValueByName(map_scalar.ToString());
+                if (!enum_value) enum_value = entry_value->enum_type()->FindValueByNumber(std::stoi(map_scalar.ToString()));
+                if (!enum_value) {
+                    throw BinderException("COPY TO protobuf map field '%s' has an invalid enum value", field->full_name());
+                }
+                entry_reflection->SetEnum(map_entry, entry_value, enum_value);
+                break;
+            }
+            default:
+                throw BinderException("COPY TO protobuf map field '%s' has an unsupported value type", field->full_name());
+            }
+        }
+        return;
+    }
+    if (field->type() == FieldDescriptor::TYPE_MESSAGE) {
         throw BinderException("COPY TO protobuf output does not support message-valued fields");
     }
     auto write_scalar = [&](const Value &scalar) {
@@ -945,7 +999,7 @@ static unique_ptr<FunctionData> NatsCopyToBind(ClientContext &context, CopyFunct
             }
             for (const auto &field_path : proto_fields) {
                 auto resolved_path = ResolveProtobufFieldPath(result->proto_descriptor, field_path);
-                if (resolved_path.back()->type() == FieldDescriptor::TYPE_MESSAGE) {
+                if (resolved_path.back()->type() == FieldDescriptor::TYPE_MESSAGE && !resolved_path.back()->is_map()) {
                     throw BinderException("COPY TO protobuf field '%s' must be a scalar or repeated scalar", field_path);
                 }
                 result->proto_field_paths.push_back(std::move(resolved_path));
