@@ -219,6 +219,24 @@ private:
     idx_t remaining;
 };
 
+static yyjson_val *FindJsonFieldPath(yyjson_val *root, const string &field_path) {
+    yyjson_val *current = root;
+    size_t start = 0;
+    while (current) {
+        auto end = field_path.find('.', start);
+        auto component = field_path.substr(start, end == string::npos ? string::npos : end - start);
+        if (!yyjson_is_obj(current)) {
+            return nullptr;
+        }
+        current = yyjson_obj_get(current, component.c_str());
+        if (end == string::npos) {
+            return current;
+        }
+        start = end + 1;
+    }
+    return nullptr;
+}
+
 } // namespace
 
 void DecodeJsonFields(const NatsPayloadView &payload, const vector<string> &field_names, vector<Value> &values) {
@@ -236,7 +254,7 @@ void DecodeJsonFields(const NatsPayloadView &payload, const vector<string> &fiel
     yyjson_val *root = yyjson_doc_get_root(doc);
     for (idx_t i = 0; i < field_names.size(); i++) {
         const auto &field_name = field_names[i];
-        yyjson_val *field = yyjson_obj_get(root, field_name.c_str());
+        yyjson_val *field = FindJsonFieldPath(root, field_name);
         if (!field || yyjson_is_null(field)) {
             values[i] = Value();
         } else if (yyjson_is_str(field)) {
@@ -273,7 +291,7 @@ void DecodeJsonFieldsToChunk(DataChunk &chunk, idx_t row_idx, idx_t first_column
     for (idx_t i = 0; i < field_names.size(); i++) {
         auto &vector = chunk.data[first_column + i];
         auto vector_data = GetNatsMutableVectorData<string_t>(vector);
-        yyjson_val *field = yyjson_obj_get(root, field_names[i].c_str());
+        yyjson_val *field = FindJsonFieldPath(root, field_names[i]);
 
         if (!field || yyjson_is_null(field)) {
             FlatVector::SetNull(vector, row_idx, true);

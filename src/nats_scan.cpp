@@ -169,6 +169,24 @@ struct NatsCopyToGlobalState : public GlobalFunctionData {
 struct NatsCopyToLocalState : public LocalFunctionData {
 };
 
+static yyjson_val *FindJsonFieldPath(yyjson_val *root, const string &field_path) {
+    yyjson_val *current = root;
+    size_t start = 0;
+    while (current) {
+        auto end = field_path.find('.', start);
+        auto component = field_path.substr(start, end == string::npos ? string::npos : end - start);
+        if (!yyjson_is_obj(current)) {
+            return nullptr;
+        }
+        current = yyjson_obj_get(current, component.c_str());
+        if (end == string::npos) {
+            return current;
+        }
+        start = end + 1;
+    }
+    return nullptr;
+}
+
 static std::optional<string> GetCopyOptionString(const case_insensitive_map_t<vector<Value>> &options,
                                                  const string &name) {
     auto it = options.find(name);
@@ -2032,7 +2050,7 @@ static void NatsScanExecute(ClientContext &context, TableFunctionInput &data_p, 
                 for (const auto &json_column : json_columns) {
                     auto &vec = output.data[json_column.output_idx];
                     auto vec_data = GetNatsMutableVectorData<string_t>(vec);
-                    yyjson_val *field_val = yyjson_obj_get(root, bind_data.json_fields[json_column.field_idx].c_str());
+                    yyjson_val *field_val = FindJsonFieldPath(root, bind_data.json_fields[json_column.field_idx]);
 
                     if (field_val) {
                         if (yyjson_is_str(field_val)) {

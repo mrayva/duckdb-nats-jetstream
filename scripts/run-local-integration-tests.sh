@@ -19,6 +19,7 @@ NATS_CLI="${NATS_CLI:-$HOME/nats}"
 PYTHON_BIN="${PYTHON_BIN:-$ROOT_DIR/.venv/bin/python}"
 TIP_ROOT="${TIP_ROOT:-/tmp/duckdb-tip-clean}"
 DUCKDB_HOST_LIB="${DUCKDB_HOST_LIB:-$(duckdb_host_lib_resolve)}"
+DUCKDB_LIB="${DUCKDB_LIB:-$DUCKDB_HOST_LIB}"
 COPY_DUCKDB_BIN="${COPY_DUCKDB_BIN:-$TIP_ROOT/build/release/duckdb}"
 COPY_DUCKDB_LIB="${COPY_DUCKDB_LIB:-$DUCKDB_HOST_LIB}"
 COPY_EXTENSION_PATH="${COPY_EXTENSION_PATH:-$TIP_ROOT/build/nats_js-tip/extension/nats_js/nats_js.duckdb_extension}"
@@ -52,14 +53,14 @@ run_sql_test() {
   local test_file="$1"
   local log_file="$2"
   sed "s#build/release/extension/nats_js/nats_js.duckdb_extension#$EXTENSION_PATH#g" "$ROOT_DIR/$test_file" \
-    | "$DUCKDB_BIN" -unsigned :memory: >"$log_file"
+    | "$DUCKDB_BIN" -unsigned :memory: >"$log_file" 2>&1
 }
 
 run_copy_sql_test() {
   local test_file="$1"
   local log_file="$2"
   sed "s#build/release/extension/nats_js/nats_js.duckdb_extension#$COPY_EXTENSION_PATH#g" "$ROOT_DIR/$test_file" \
-    | "$COPY_DUCKDB_BIN" -unsigned :memory: >"$log_file"
+    | "$COPY_DUCKDB_BIN" -unsigned :memory: >"$log_file" 2>&1
 }
 
 echo "Checking NATS connection at $NATS_URL"
@@ -99,7 +100,7 @@ for test_file in "${success_tests[@]}"; do
 done
 
 echo "RUN test/sql/test_protobuf_errors.sql (expected errors)"
-if run_sql_test "test/sql/test_protobuf_errors.sql" /tmp/test_protobuf_errors.sql.log >/tmp/test_protobuf_errors.sql.log 2>&1; then
+if run_sql_test "test/sql/test_protobuf_errors.sql" /tmp/test_protobuf_errors.sql.log; then
   echo "Expected protobuf error suite to fail, but it exited 0" >&2
   exit 1
 fi
@@ -107,7 +108,7 @@ fi
 for pattern in \
   "proto_file parameter is required" \
   "proto_message parameter is required" \
-  "Failed to import protobuf schema file" \
+  "Failed to stat protobuf schema file" \
   "Message type 'NonExistentMessage' not found" \
   "Field 'nonexis" \
   "Cannot use both json_extract and proto_extract"; do
@@ -120,8 +121,7 @@ done
 echo "PASS test/sql/test_protobuf_errors.sql"
 
 echo "RUN test/sql/test_connection_options_errors.sql (expected errors)"
-if run_sql_test "test/sql/test_connection_options_errors.sql" /tmp/test_connection_options_errors.sql.log \
-    >/tmp/test_connection_options_errors.sql.log 2>&1; then
+if run_sql_test "test/sql/test_connection_options_errors.sql" /tmp/test_connection_options_errors.sql.log; then
   echo "Expected connection option error suite to fail, but it exited 0" >&2
   exit 1
 fi
@@ -143,7 +143,7 @@ run_copy_sql_test "test/sql/test_copy_from.sql" "$log_file"
 echo "PASS test/sql/test_copy_from.sql"
 
 echo "RUN test/sql/test_copy_from_errors.sql (expected errors)"
-if run_copy_sql_test "test/sql/test_copy_from_errors.sql" /tmp/test_copy_from_errors.sql.log >/tmp/test_copy_from_errors.sql.log 2>&1; then
+if run_copy_sql_test "test/sql/test_copy_from_errors.sql" /tmp/test_copy_from_errors.sql.log; then
   echo "Expected COPY FROM error suite to fail, but it exited 0" >&2
   exit 1
 fi
@@ -165,7 +165,7 @@ run_copy_sql_test "test/sql/test_copy_to.sql" "$log_file"
 echo "PASS test/sql/test_copy_to.sql"
 
 echo "RUN test/sql/test_copy_to_errors.sql (expected errors)"
-if run_copy_sql_test "test/sql/test_copy_to_errors.sql" /tmp/test_copy_to_errors.sql.log >/tmp/test_copy_to_errors.sql.log 2>&1; then
+if run_copy_sql_test "test/sql/test_copy_to_errors.sql" /tmp/test_copy_to_errors.sql.log; then
   echo "Expected COPY TO error suite to fail, but it exited 0" >&2
   exit 1
 fi
