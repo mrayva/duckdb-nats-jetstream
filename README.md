@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/brannn/duckdb-nats-jetstream/actions/workflows/MainDistributionPipeline.yml/badge.svg)](https://github.com/brannn/duckdb-nats-jetstream/actions/workflows/MainDistributionPipeline.yml)
 [![Version](https://img.shields.io/badge/Version-v0.2.1-orange)](https://github.com/brannn/duckdb-nats-jetstream/releases/tag/v0.2.1)
-[![DuckDB Version](https://img.shields.io/badge/DuckDB-v1.5.4-blue)](https://github.com/duckdb/duckdb/releases/tag/v1.5.4)
+[![DuckDB Version](https://img.shields.io/badge/DuckDB-v1.5.5-blue)](https://github.com/duckdb/duckdb/releases/tag/v1.5.5)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/Platform-Linux%20%7C%20macOS%20%7C%20Windows%20%7C%20WebAssembly-lightgrey)](https://github.com/brannn/duckdb-nats-jetstream/actions)
 
@@ -191,7 +191,7 @@ range stats, full scans, subject pushdown, JSON extraction, and protobuf
 extraction:
 
 ```bash
-DUCKDB_BIN="$HOME/.duckdb/cli/1.5.4/duckdb" \
+DUCKDB_BIN="$HOME/duckdb" \
 NATS_CLI="$HOME/nats" \
 ./scripts/benchmark-local.sh
 ```
