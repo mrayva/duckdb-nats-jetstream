@@ -226,6 +226,15 @@ RESET_STREAMS=1 \
 "$ROOT_DIR/scripts/run-copy-to-harness.sh"
 echo "PASS scripts/run-copy-to-harness.sh"
 
+echo "RUN scripts/run-copy-structured-harness.sh"
+DUCKDB_BIN="$COPY_DUCKDB_BIN" \
+DUCKDB_LIB="$COPY_DUCKDB_LIB" \
+EXTENSION_PATH="$COPY_EXTENSION_PATH" \
+NATS_URL="$NATS_URL" \
+NATS_CLI="$NATS_CLI" \
+"$ROOT_DIR/scripts/run-copy-structured-harness.sh"
+echo "PASS scripts/run-copy-structured-harness.sh"
+
 echo "RUN scripts/run-ingest-rehydrate-harness.sh"
 NATS_URL="$NATS_URL" \
 NATS_CLI="$NATS_CLI" \

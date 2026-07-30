@@ -45,6 +45,24 @@ FROM nats_scan(
 Use `flexbuffers_extract := [...]` for FlexBuffers payloads. FlexBuffers builds require the
 FlatBuffers runtime dependency; the local subscription regression harness also requires `flatc`.
 
+## Structured COPY TO
+
+`COPY TO ... (FORMAT nats_js)` publishes raw `payload` values by default. To serialize selected
+source columns as one structured object per message, set `payload_format` to `json`, `msgpack`,
+`cbor`, or `flexbuffers` and provide `payload_columns`:
+
+```sql
+COPY readings
+TO 'telemetry'
+(FORMAT nats_js,
+ url 'nats://localhost:4222',
+ payload_format 'json',
+ payload_columns ['device_id', 'kw', 'online']);
+```
+
+The subject still comes from `subject` unless a constant `subject` option is supplied. The
+structured COPY TO regression is covered by `scripts/run-copy-structured-harness.sh`.
+
 ---
 
 ## Quick Start

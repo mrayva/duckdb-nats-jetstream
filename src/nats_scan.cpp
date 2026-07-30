@@ -10,6 +10,7 @@
 #include "duckdb/common/types/timestamp.hpp"
 #include "duckdb/common/types/vector.hpp"
 #include "yyjson.hpp"
+#include <flatbuffers/flexbuffers.h>
 #include <nats/nats.h>
 #include <google/protobuf/compiler/importer.h>
 #include <google/protobuf/dynamic_message.h>
@@ -134,6 +135,7 @@ struct NatsCopyBindData : public TableFunctionData {
 };
 
 struct NatsCopyToBindData : public TableFunctionData {
+    enum class PayloadFormat { RAW, JSON, MSGPACK, CBOR, FLEXBUFFERS };
     string stream_name;
     NatsConnectionConfig connection;
     string subject_column = "subject";
@@ -142,6 +144,10 @@ struct NatsCopyToBindData : public TableFunctionData {
     string subject_value;
     idx_t subject_idx = DConstants::INVALID_INDEX;
     idx_t payload_idx = DConstants::INVALID_INDEX;
+    PayloadFormat payload_format = PayloadFormat::RAW;
+    vector<LogicalType> column_types;
+    vector<idx_t> structured_column_indices;
+    vector<string> structured_column_names;
 };
 
 struct NatsCopyToGlobalState : public GlobalFunctionData {
@@ -187,7 +193,13 @@ static vector<string> GetCopyOptionStringList(const case_insensitive_map_t<vecto
         return result;
     }
     for (auto &child : it->second) {
-        result.push_back(StringValue::Get(child));
+        if (child.type().id() == LogicalTypeId::LIST) {
+            for (auto &list_child : ListValue::GetChildren(child)) {
+                result.push_back(StringValue::Get(list_child));
+            }
+        } else {
+            result.push_back(StringValue::Get(child));
+        }
     }
     return result;
 }
@@ -319,6 +331,8 @@ static void NatsCopyListOptions(ClientContext &, CopyOptionsInput &input) {
     copy_options["fetch_timeout_ms"] = CopyOption(LogicalType::BIGINT, CopyOptionMode::READ_WRITE);
     copy_options["subject_column"] = CopyOption(LogicalType::VARCHAR, CopyOptionMode::READ_WRITE);
     copy_options["payload_column"] = CopyOption(LogicalType::VARCHAR, CopyOptionMode::READ_WRITE);
+    copy_options["payload_format"] = CopyOption(LogicalType::VARCHAR, CopyOptionMode::READ_WRITE);
+    copy_options["payload_columns"] = CopyOption(LogicalType::ANY, CopyOptionMode::READ_WRITE);
 }
 
 static void DisconnectNats(natsConnection **conn) {
@@ -328,9 +342,217 @@ static void DisconnectNats(natsConnection **conn) {
     }
 }
 
+static bool IsCopyStringType(LogicalTypeId type) {
+    return type == LogicalTypeId::VARCHAR || type == LogicalTypeId::BLOB;
+}
+
+static bool IsCopySignedType(LogicalTypeId type) {
+    return type == LogicalTypeId::TINYINT || type == LogicalTypeId::SMALLINT || type == LogicalTypeId::INTEGER ||
+           type == LogicalTypeId::BIGINT || type == LogicalTypeId::HUGEINT;
+}
+
+static bool IsCopyUnsignedType(LogicalTypeId type) {
+    return type == LogicalTypeId::UTINYINT || type == LogicalTypeId::USMALLINT || type == LogicalTypeId::UINTEGER ||
+           type == LogicalTypeId::UBIGINT || type == LogicalTypeId::UHUGEINT;
+}
+
+static string CopyValueText(const Value &value) {
+    if (value.IsNull()) {
+        return string();
+    }
+    if (value.type().id() == LogicalTypeId::VARCHAR) {
+        return StringValue::Get(value);
+    }
+    return value.ToString();
+}
+
+static void AppendJsonEscaped(string &output, const string &value) {
+    output.push_back('"');
+    for (unsigned char ch : value) {
+        switch (ch) {
+        case '"': output += "\\\""; break;
+        case '\\': output += "\\\\"; break;
+        case '\b': output += "\\b"; break;
+        case '\f': output += "\\f"; break;
+        case '\n': output += "\\n"; break;
+        case '\r': output += "\\r"; break;
+        case '\t': output += "\\t"; break;
+        default:
+            if (ch < 0x20) {
+                char buffer[7];
+                snprintf(buffer, sizeof(buffer), "\\u%04x", ch);
+                output += buffer;
+            } else {
+                output.push_back(static_cast<char>(ch));
+            }
+        }
+    }
+    output.push_back('"');
+}
+
+static void AppendJsonValue(string &output, const Value &value, LogicalTypeId type) {
+    if (value.IsNull()) {
+        output += "null";
+    } else if (IsCopyStringType(type)) {
+        AppendJsonEscaped(output, CopyValueText(value));
+    } else if (type == LogicalTypeId::BOOLEAN || IsCopySignedType(type) || IsCopyUnsignedType(type) ||
+               type == LogicalTypeId::FLOAT || type == LogicalTypeId::DOUBLE || type == LogicalTypeId::DECIMAL) {
+        output += value.ToString();
+    } else {
+        AppendJsonEscaped(output, value.ToString());
+    }
+}
+
+static void AppendBigEndian(vector<uint8_t> &output, uint64_t value, idx_t width) {
+    for (idx_t i = width; i > 0; i--) {
+        output.push_back(static_cast<uint8_t>(value >> ((i - 1) * 8)));
+    }
+}
+
+static void AppendMsgpackString(vector<uint8_t> &output, const string &value) {
+    auto size = value.size();
+    if (size < 32) {
+        output.push_back(static_cast<uint8_t>(0xa0 | size));
+    } else if (size <= UINT8_MAX) {
+        output.push_back(0xd9);
+        output.push_back(static_cast<uint8_t>(size));
+    } else if (size <= UINT16_MAX) {
+        output.push_back(0xda);
+        AppendBigEndian(output, size, 2);
+    } else {
+        output.push_back(0xdb);
+        AppendBigEndian(output, size, 4);
+    }
+    output.insert(output.end(), value.begin(), value.end());
+}
+
+static void AppendCborString(vector<uint8_t> &output, const string &value) {
+    auto size = value.size();
+    if (size < 24) {
+        output.push_back(static_cast<uint8_t>(0x60 | size));
+    } else if (size <= UINT8_MAX) {
+        output.push_back(0x78);
+        output.push_back(static_cast<uint8_t>(size));
+    } else if (size <= UINT16_MAX) {
+        output.push_back(0x79);
+        AppendBigEndian(output, size, 2);
+    } else {
+        output.push_back(0x7a);
+        AppendBigEndian(output, size, 4);
+    }
+    output.insert(output.end(), value.begin(), value.end());
+}
+
+static void AppendStructuredScalar(vector<uint8_t> &output, const Value &value, LogicalTypeId type,
+                                   bool cbor) {
+    if (value.IsNull()) {
+        output.push_back(0xc0);
+    } else if (IsCopyStringType(type)) {
+        cbor ? AppendCborString(output, CopyValueText(value)) : AppendMsgpackString(output, CopyValueText(value));
+    } else if (type == LogicalTypeId::BOOLEAN) {
+        output.push_back(cbor ? (value.GetValue<bool>() ? 0xf5 : 0xf4) : (value.GetValue<bool>() ? 0xc3 : 0xc2));
+    } else if (IsCopySignedType(type)) {
+        auto number = std::stoll(value.ToString());
+        if (cbor) {
+            if (number >= 0) {
+                if (number < 24) output.push_back(static_cast<uint8_t>(number));
+                else { output.push_back(0x1b); AppendBigEndian(output, static_cast<uint64_t>(number), 8); }
+            } else {
+                auto encoded = static_cast<uint64_t>(-(number + 1));
+                if (encoded < 24) output.push_back(static_cast<uint8_t>(0x20 | encoded));
+                else { output.push_back(0x3b); AppendBigEndian(output, encoded, 8); }
+            }
+        } else if (number >= -32 && number < 128) {
+            output.push_back(static_cast<uint8_t>(number));
+        } else {
+            output.push_back(0xd3);
+            AppendBigEndian(output, static_cast<uint64_t>(number), 8);
+        }
+    } else if (IsCopyUnsignedType(type)) {
+        auto number = std::stoull(value.ToString());
+        if (cbor && number < 24) output.push_back(static_cast<uint8_t>(number));
+        else if (!cbor && number < 128) output.push_back(static_cast<uint8_t>(number));
+        else { output.push_back(cbor ? 0x1b : 0xcf); AppendBigEndian(output, number, 8); }
+    } else if (type == LogicalTypeId::FLOAT || type == LogicalTypeId::DOUBLE || type == LogicalTypeId::DECIMAL) {
+        double number = std::stod(value.ToString());
+        uint64_t bits;
+        memcpy(&bits, &number, sizeof(bits));
+        output.push_back(cbor ? 0xfb : 0xcb);
+        AppendBigEndian(output, bits, 8);
+    } else {
+        cbor ? AppendCborString(output, value.ToString()) : AppendMsgpackString(output, value.ToString());
+    }
+}
+
+static vector<uint8_t> EncodeStructuredPayload(const NatsCopyToBindData &bind_data, const DataChunk &input,
+                                               idx_t row_idx) {
+    const auto &types = bind_data.column_types;
+    if (bind_data.payload_format == NatsCopyToBindData::PayloadFormat::JSON) {
+        string output = "{";
+        for (idx_t i = 0; i < bind_data.structured_column_indices.size(); i++) {
+            if (i) output += ",";
+            AppendJsonEscaped(output, bind_data.structured_column_names[i]);
+            output += ":";
+            AppendJsonValue(output, input.GetValue(bind_data.structured_column_indices[i], row_idx),
+                            types[bind_data.structured_column_indices[i]].id());
+        }
+        output += "}";
+        return vector<uint8_t>(output.begin(), output.end());
+    }
+    if (bind_data.payload_format == NatsCopyToBindData::PayloadFormat::FLEXBUFFERS) {
+        flexbuffers::Builder builder;
+        auto start = builder.StartMap();
+        for (idx_t i = 0; i < bind_data.structured_column_indices.size(); i++) {
+            auto column = bind_data.structured_column_indices[i];
+            auto value = input.GetValue(column, row_idx);
+            auto key = bind_data.structured_column_names[i].c_str();
+            if (value.IsNull()) builder.Null(key);
+            else if (types[column].id() == LogicalTypeId::BOOLEAN) builder.Bool(key, value.GetValue<bool>());
+            else if (IsCopySignedType(types[column].id())) builder.Int(key, std::stoll(value.ToString()));
+            else if (IsCopyUnsignedType(types[column].id())) builder.UInt(key, std::stoull(value.ToString()));
+            else if (types[column].id() == LogicalTypeId::FLOAT || types[column].id() == LogicalTypeId::DOUBLE ||
+                     types[column].id() == LogicalTypeId::DECIMAL) builder.Double(key, std::stod(value.ToString()));
+            else builder.String(key, CopyValueText(value));
+        }
+        builder.EndMap(start);
+        builder.Finish();
+        const auto &buffer = builder.GetBuffer();
+        return vector<uint8_t>(buffer.begin(), buffer.end());
+    }
+
+    vector<uint8_t> output;
+    bool cbor = bind_data.payload_format == NatsCopyToBindData::PayloadFormat::CBOR;
+    auto count = bind_data.structured_column_indices.size();
+    if (cbor) {
+        if (count < 24) {
+            output.push_back(static_cast<uint8_t>(0xa0 | count));
+        } else if (count <= UINT8_MAX) {
+            output.push_back(0xb8);
+            AppendBigEndian(output, count, 1);
+        } else if (count <= UINT16_MAX) {
+            output.push_back(0xb9);
+            AppendBigEndian(output, count, 2);
+        } else {
+            output.push_back(0xba);
+            AppendBigEndian(output, count, 4);
+        }
+    } else {
+        output.push_back(count < 16 ? static_cast<uint8_t>(0x80 | count) : 0xde);
+        if (count >= 16) AppendBigEndian(output, count, 2);
+    }
+    for (idx_t i = 0; i < count; i++) {
+        cbor ? AppendCborString(output, bind_data.structured_column_names[i])
+             : AppendMsgpackString(output, bind_data.structured_column_names[i]);
+        auto column = bind_data.structured_column_indices[i];
+        AppendStructuredScalar(output, input.GetValue(column, row_idx), types[column].id(), cbor);
+    }
+    return output;
+}
+
 static unique_ptr<FunctionData> NatsCopyToBind(ClientContext &context, CopyFunctionBindInput &input,
                                                const vector<string> &names, const vector<LogicalType> &sql_types) {
     auto result = make_uniq<NatsCopyToBindData>();
+    result->column_types = sql_types;
     result->connection.url = ResolveNatsCopyUrl(input.info.options, "COPY TO", nullptr);
     for (const auto &option : input.info.options) {
         if (!option.second.empty()) {
@@ -339,6 +561,22 @@ static unique_ptr<FunctionData> NatsCopyToBind(ClientContext &context, CopyFunct
     }
     ValidateNatsConnectionConfig(result->connection);
     result->stream_name = ResolveNatsCopyStreamName(input.info.file_path, "COPY TO");
+
+    auto payload_format = GetCopyOptionString(input.info.options, "payload_format").value_or("raw");
+    payload_format = StringUtil::Lower(payload_format);
+    if (payload_format == "raw") {
+        result->payload_format = NatsCopyToBindData::PayloadFormat::RAW;
+    } else if (payload_format == "json") {
+        result->payload_format = NatsCopyToBindData::PayloadFormat::JSON;
+    } else if (payload_format == "msgpack" || payload_format == "messagepack") {
+        result->payload_format = NatsCopyToBindData::PayloadFormat::MSGPACK;
+    } else if (payload_format == "cbor") {
+        result->payload_format = NatsCopyToBindData::PayloadFormat::CBOR;
+    } else if (payload_format == "flexbuffers" || payload_format == "flex") {
+        result->payload_format = NatsCopyToBindData::PayloadFormat::FLEXBUFFERS;
+    } else {
+        throw BinderException("COPY TO FORMAT nats_js does not support payload_format '%s'", payload_format);
+    }
 
     auto subject = GetCopyOptionString(input.info.options, "subject");
     if (subject.has_value() && !subject->empty()) {
@@ -356,16 +594,41 @@ static unique_ptr<FunctionData> NatsCopyToBind(ClientContext &context, CopyFunct
         result->payload_column = *payload_column;
     }
 
-    result->payload_idx = FindColumnIndex(names, result->payload_column);
-    if (result->payload_idx == DConstants::INVALID_INDEX) {
-        throw BinderException("COPY TO FORMAT nats_js requires a source column named \"%s\"",
-                              result->payload_column);
-    }
+    if (result->payload_format == NatsCopyToBindData::PayloadFormat::RAW) {
+        result->payload_idx = FindColumnIndex(names, result->payload_column);
+        if (result->payload_idx == DConstants::INVALID_INDEX) {
+            throw BinderException("COPY TO FORMAT nats_js requires a source column named \"%s\"",
+                                  result->payload_column);
+        }
 
-    auto payload_type = sql_types[result->payload_idx].id();
-    if (payload_type != LogicalTypeId::VARCHAR && payload_type != LogicalTypeId::BLOB) {
-        throw BinderException("COPY TO FORMAT nats_js requires payload column \"%s\" to be VARCHAR or BLOB",
-                              result->payload_column);
+        auto payload_type = sql_types[result->payload_idx].id();
+        if (payload_type != LogicalTypeId::VARCHAR && payload_type != LogicalTypeId::BLOB) {
+            throw BinderException("COPY TO FORMAT nats_js requires payload column \"%s\" to be VARCHAR or BLOB",
+                                  result->payload_column);
+        }
+    } else {
+        auto configured_columns = GetCopyOptionStringList(input.info.options, "payload_columns");
+        if (configured_columns.empty()) {
+            auto subject_index = FindColumnIndex(names, result->subject_column);
+            auto raw_payload_index = FindColumnIndex(names, result->payload_column);
+            for (idx_t i = 0; i < names.size(); i++) {
+                if (i == subject_index || i == raw_payload_index) {
+                    continue;
+                }
+                configured_columns.push_back(names[i]);
+            }
+        }
+        if (configured_columns.empty()) {
+            throw BinderException("COPY TO structured payloads require at least one payload column");
+        }
+        for (const auto &column_name : configured_columns) {
+            auto index = FindColumnIndex(names, column_name);
+            if (index == DConstants::INVALID_INDEX) {
+                throw BinderException("COPY TO FORMAT nats_js payload column \"%s\" was not found", column_name);
+            }
+            result->structured_column_indices.push_back(index);
+            result->structured_column_names.push_back(column_name);
+        }
     }
 
     if (!result->constant_subject) {
@@ -406,9 +669,12 @@ static void NatsCopyToSink(ExecutionContext &, FunctionData &bind_data, GlobalFu
 
     lock_guard<mutex> guard(state.lock);
 
-    UnifiedVectorFormat payload_format;
-    input.data[bdata.payload_idx].ToUnifiedFormat(input.size(), payload_format);
-    auto payloads = UnifiedVectorFormat::GetData<string_t>(payload_format);
+    UnifiedVectorFormat raw_payload_format;
+    const string_t *payloads = nullptr;
+    if (bdata.payload_format == NatsCopyToBindData::PayloadFormat::RAW) {
+        input.data[bdata.payload_idx].ToUnifiedFormat(input.size(), raw_payload_format);
+        payloads = UnifiedVectorFormat::GetData<string_t>(raw_payload_format);
+    }
 
     UnifiedVectorFormat subject_format;
     const string_t *subjects = nullptr;
@@ -418,20 +684,30 @@ static void NatsCopyToSink(ExecutionContext &, FunctionData &bind_data, GlobalFu
     }
 
     for (idx_t row_idx = 0; row_idx < input.size(); row_idx++) {
-        idx_t out_idx = payload_format.sel->get_index(row_idx);
-        if (!payload_format.validity.RowIsValid(out_idx)) {
-            throw BinderException("COPY TO FORMAT nats_js does not support NULL payload values");
-        }
-
-        string subject = bdata.constant_subject ? bdata.subject_value
-                                                : string(subjects[out_idx].GetData(), subjects[out_idx].GetSize());
-        if (!bdata.constant_subject && !subject_format.validity.RowIsValid(subject_format.sel->get_index(row_idx))) {
+        idx_t subject_idx = bdata.constant_subject ? 0 : subject_format.sel->get_index(row_idx);
+        if (!bdata.constant_subject && !subject_format.validity.RowIsValid(subject_idx)) {
             throw BinderException("COPY TO FORMAT nats_js does not support NULL subject values");
         }
+        string subject = bdata.constant_subject ? bdata.subject_value
+                                                : string(subjects[subject_idx].GetData(), subjects[subject_idx].GetSize());
 
-        auto &payload = payloads[out_idx];
-        int payload_len = static_cast<int>(payload.GetSize());
-        natsStatus s = natsConnection_Publish(state.conn, subject.c_str(), payload.GetData(), payload_len);
+        const void *payload_data = nullptr;
+        int payload_len = 0;
+        vector<uint8_t> encoded_payload;
+        if (bdata.payload_format == NatsCopyToBindData::PayloadFormat::RAW) {
+            idx_t out_idx = raw_payload_format.sel->get_index(row_idx);
+            if (!raw_payload_format.validity.RowIsValid(out_idx)) {
+                throw BinderException("COPY TO FORMAT nats_js does not support NULL payload values");
+            }
+            auto &payload = payloads[out_idx];
+            payload_data = payload.GetData();
+            payload_len = static_cast<int>(payload.GetSize());
+        } else {
+            encoded_payload = EncodeStructuredPayload(bdata, input, row_idx);
+            payload_data = encoded_payload.data();
+            payload_len = static_cast<int>(encoded_payload.size());
+        }
+        natsStatus s = natsConnection_Publish(state.conn, subject.c_str(), payload_data, payload_len);
         if (s != NATS_OK) {
             throw std::runtime_error(std::string("Failed to publish JetStream message: ") + natsStatus_GetText(s));
         }
