@@ -396,9 +396,41 @@ static void AppendJsonEscaped(string &output, const string &value) {
     output.push_back('"');
 }
 
-static void AppendJsonValue(string &output, const Value &value, LogicalTypeId type) {
+static void AppendJsonValue(string &output, const Value &value) {
     if (value.IsNull()) {
         output += "null";
+        return;
+    }
+    auto type = value.type().id();
+    if (type == LogicalTypeId::LIST || type == LogicalTypeId::ARRAY) {
+        output += "[";
+        const auto &children = type == LogicalTypeId::LIST ? ListValue::GetChildren(value) : ArrayValue::GetChildren(value);
+        for (idx_t i = 0; i < children.size(); i++) {
+            if (i) output += ",";
+            AppendJsonValue(output, children[i]);
+        }
+        output += "]";
+    } else if (type == LogicalTypeId::STRUCT) {
+        output += "{";
+        const auto &children = StructValue::GetChildren(value);
+        for (idx_t i = 0; i < children.size(); i++) {
+            if (i) output += ",";
+            AppendJsonEscaped(output, StructType::GetChildName(value.type(), i));
+            output += ":";
+            AppendJsonValue(output, children[i]);
+        }
+        output += "}";
+    } else if (type == LogicalTypeId::MAP) {
+        output += "{";
+        const auto &entries = MapValue::GetChildren(value);
+        for (idx_t i = 0; i < entries.size(); i++) {
+            if (i) output += ",";
+            const auto &entry = StructValue::GetChildren(entries[i]);
+            AppendJsonEscaped(output, CopyValueText(entry[0]));
+            output += ":";
+            AppendJsonValue(output, entry[1]);
+        }
+        output += "}";
     } else if (IsCopyStringType(type)) {
         AppendJsonEscaped(output, CopyValueText(value));
     } else if (type == LogicalTypeId::BOOLEAN || IsCopySignedType(type) || IsCopyUnsignedType(type) ||
@@ -449,10 +481,57 @@ static void AppendCborString(vector<uint8_t> &output, const string &value) {
     output.insert(output.end(), value.begin(), value.end());
 }
 
-static void AppendStructuredScalar(vector<uint8_t> &output, const Value &value, LogicalTypeId type,
-                                   bool cbor) {
+static void AppendStructuredCount(vector<uint8_t> &output, idx_t count, bool cbor, bool map) {
+    if (cbor) {
+        uint8_t major = map ? 0xa0 : 0x80;
+        if (count < 24) {
+            output.push_back(static_cast<uint8_t>(major | count));
+        } else if (count <= UINT8_MAX) {
+            output.push_back(static_cast<uint8_t>((map ? 0xb8 : 0x98)));
+            AppendBigEndian(output, count, 1);
+        } else if (count <= UINT16_MAX) {
+            output.push_back(static_cast<uint8_t>((map ? 0xb9 : 0x99)));
+            AppendBigEndian(output, count, 2);
+        } else {
+            output.push_back(static_cast<uint8_t>((map ? 0xba : 0x9a)));
+            AppendBigEndian(output, count, 4);
+        }
+    } else if (map) {
+        if (count < 16) output.push_back(static_cast<uint8_t>(0x80 | count));
+        else { output.push_back(0xde); AppendBigEndian(output, count, 2); }
+    } else {
+        if (count < 16) output.push_back(static_cast<uint8_t>(0x90 | count));
+        else { output.push_back(0xdc); AppendBigEndian(output, count, 2); }
+    }
+}
+
+static void AppendStructuredValue(vector<uint8_t> &output, const Value &value, bool cbor) {
     if (value.IsNull()) {
         output.push_back(0xc0);
+        return;
+    }
+    auto type = value.type().id();
+    if (type == LogicalTypeId::LIST || type == LogicalTypeId::ARRAY) {
+        const auto &children = type == LogicalTypeId::LIST ? ListValue::GetChildren(value) : ArrayValue::GetChildren(value);
+        AppendStructuredCount(output, children.size(), cbor, false);
+        for (const auto &child : children) AppendStructuredValue(output, child, cbor);
+    } else if (type == LogicalTypeId::STRUCT) {
+        const auto &children = StructValue::GetChildren(value);
+        AppendStructuredCount(output, children.size(), cbor, true);
+        for (idx_t i = 0; i < children.size(); i++) {
+            auto name = StructType::GetChildName(value.type(), i);
+            cbor ? AppendCborString(output, name) : AppendMsgpackString(output, name);
+            AppendStructuredValue(output, children[i], cbor);
+        }
+    } else if (type == LogicalTypeId::MAP) {
+        const auto &entries = MapValue::GetChildren(value);
+        AppendStructuredCount(output, entries.size(), cbor, true);
+        for (const auto &entry : entries) {
+            const auto &kv = StructValue::GetChildren(entry);
+            auto key = CopyValueText(kv[0]);
+            cbor ? AppendCborString(output, key) : AppendMsgpackString(output, key);
+            AppendStructuredValue(output, kv[1], cbor);
+        }
     } else if (IsCopyStringType(type)) {
         cbor ? AppendCborString(output, CopyValueText(value)) : AppendMsgpackString(output, CopyValueText(value));
     } else if (type == LogicalTypeId::BOOLEAN) {
@@ -580,6 +659,83 @@ static vector<uint8_t> EncodeProtobufPayload(const NatsCopyToBindData &bind_data
     return vector<uint8_t>(serialized.begin(), serialized.end());
 }
 
+static void AppendFlexValue(flexbuffers::Builder &builder, const Value &value);
+
+static void AppendFlexField(flexbuffers::Builder &builder, const string &key, const Value &value) {
+    auto key_ptr = key.c_str();
+    if (value.IsNull()) {
+        builder.Null(key_ptr);
+    } else if (value.type().id() == LogicalTypeId::LIST || value.type().id() == LogicalTypeId::ARRAY) {
+        builder.Vector(key_ptr, [&]() {
+            const auto &children = value.type().id() == LogicalTypeId::LIST ? ListValue::GetChildren(value)
+                                                                              : ArrayValue::GetChildren(value);
+            for (const auto &child : children) AppendFlexValue(builder, child);
+        });
+    } else if (value.type().id() == LogicalTypeId::STRUCT || value.type().id() == LogicalTypeId::MAP) {
+        builder.Map(key_ptr, [&]() {
+            if (value.type().id() == LogicalTypeId::STRUCT) {
+                const auto &children = StructValue::GetChildren(value);
+                for (idx_t i = 0; i < children.size(); i++) {
+                    AppendFlexField(builder, StructType::GetChildName(value.type(), i), children[i]);
+                }
+            } else {
+                for (const auto &entry : MapValue::GetChildren(value)) {
+                    const auto &kv = StructValue::GetChildren(entry);
+                    AppendFlexField(builder, CopyValueText(kv[0]), kv[1]);
+                }
+            }
+        });
+    } else if (value.type().id() == LogicalTypeId::BOOLEAN) {
+        builder.Bool(key_ptr, value.GetValue<bool>());
+    } else if (IsCopySignedType(value.type().id())) {
+        builder.Int(key_ptr, std::stoll(value.ToString()));
+    } else if (IsCopyUnsignedType(value.type().id())) {
+        builder.UInt(key_ptr, std::stoull(value.ToString()));
+    } else if (value.type().id() == LogicalTypeId::FLOAT || value.type().id() == LogicalTypeId::DOUBLE ||
+               value.type().id() == LogicalTypeId::DECIMAL) {
+        builder.Double(key_ptr, std::stod(value.ToString()));
+    } else {
+        builder.String(key_ptr, CopyValueText(value));
+    }
+}
+
+static void AppendFlexValue(flexbuffers::Builder &builder, const Value &value) {
+    if (value.IsNull()) {
+        builder.Null();
+    } else if (value.type().id() == LogicalTypeId::LIST || value.type().id() == LogicalTypeId::ARRAY) {
+        builder.Vector([&]() {
+            const auto &children = value.type().id() == LogicalTypeId::LIST ? ListValue::GetChildren(value)
+                                                                              : ArrayValue::GetChildren(value);
+            for (const auto &child : children) AppendFlexValue(builder, child);
+        });
+    } else if (value.type().id() == LogicalTypeId::STRUCT || value.type().id() == LogicalTypeId::MAP) {
+        builder.Map([&]() {
+            if (value.type().id() == LogicalTypeId::STRUCT) {
+                const auto &children = StructValue::GetChildren(value);
+                for (idx_t i = 0; i < children.size(); i++) {
+                    AppendFlexField(builder, StructType::GetChildName(value.type(), i), children[i]);
+                }
+            } else {
+                for (const auto &entry : MapValue::GetChildren(value)) {
+                    const auto &kv = StructValue::GetChildren(entry);
+                    AppendFlexField(builder, CopyValueText(kv[0]), kv[1]);
+                }
+            }
+        });
+    } else if (value.type().id() == LogicalTypeId::BOOLEAN) {
+        builder.Bool(value.GetValue<bool>());
+    } else if (IsCopySignedType(value.type().id())) {
+        builder.Int(std::stoll(value.ToString()));
+    } else if (IsCopyUnsignedType(value.type().id())) {
+        builder.UInt(std::stoull(value.ToString()));
+    } else if (value.type().id() == LogicalTypeId::FLOAT || value.type().id() == LogicalTypeId::DOUBLE ||
+               value.type().id() == LogicalTypeId::DECIMAL) {
+        builder.Double(std::stod(value.ToString()));
+    } else {
+        builder.String(CopyValueText(value));
+    }
+}
+
 static vector<uint8_t> EncodeStructuredPayload(const NatsCopyToBindData &bind_data, const DataChunk &input,
                                                idx_t row_idx) {
     const auto &types = bind_data.column_types;
@@ -592,8 +748,7 @@ static vector<uint8_t> EncodeStructuredPayload(const NatsCopyToBindData &bind_da
             if (i) output += ",";
             AppendJsonEscaped(output, bind_data.structured_column_names[i]);
             output += ":";
-            AppendJsonValue(output, input.GetValue(bind_data.structured_column_indices[i], row_idx),
-                            types[bind_data.structured_column_indices[i]].id());
+            AppendJsonValue(output, input.GetValue(bind_data.structured_column_indices[i], row_idx));
         }
         output += "}";
         return vector<uint8_t>(output.begin(), output.end());
@@ -604,14 +759,7 @@ static vector<uint8_t> EncodeStructuredPayload(const NatsCopyToBindData &bind_da
         for (idx_t i = 0; i < bind_data.structured_column_indices.size(); i++) {
             auto column = bind_data.structured_column_indices[i];
             auto value = input.GetValue(column, row_idx);
-            auto key = bind_data.structured_column_names[i].c_str();
-            if (value.IsNull()) builder.Null(key);
-            else if (types[column].id() == LogicalTypeId::BOOLEAN) builder.Bool(key, value.GetValue<bool>());
-            else if (IsCopySignedType(types[column].id())) builder.Int(key, std::stoll(value.ToString()));
-            else if (IsCopyUnsignedType(types[column].id())) builder.UInt(key, std::stoull(value.ToString()));
-            else if (types[column].id() == LogicalTypeId::FLOAT || types[column].id() == LogicalTypeId::DOUBLE ||
-                     types[column].id() == LogicalTypeId::DECIMAL) builder.Double(key, std::stod(value.ToString()));
-            else builder.String(key, CopyValueText(value));
+            AppendFlexField(builder, bind_data.structured_column_names[i], value);
         }
         builder.EndMap(start);
         builder.Finish();
@@ -622,28 +770,12 @@ static vector<uint8_t> EncodeStructuredPayload(const NatsCopyToBindData &bind_da
     vector<uint8_t> output;
     bool cbor = bind_data.payload_format == NatsCopyToBindData::PayloadFormat::CBOR;
     auto count = bind_data.structured_column_indices.size();
-    if (cbor) {
-        if (count < 24) {
-            output.push_back(static_cast<uint8_t>(0xa0 | count));
-        } else if (count <= UINT8_MAX) {
-            output.push_back(0xb8);
-            AppendBigEndian(output, count, 1);
-        } else if (count <= UINT16_MAX) {
-            output.push_back(0xb9);
-            AppendBigEndian(output, count, 2);
-        } else {
-            output.push_back(0xba);
-            AppendBigEndian(output, count, 4);
-        }
-    } else {
-        output.push_back(count < 16 ? static_cast<uint8_t>(0x80 | count) : 0xde);
-        if (count >= 16) AppendBigEndian(output, count, 2);
-    }
+    AppendStructuredCount(output, count, cbor, true);
     for (idx_t i = 0; i < count; i++) {
         cbor ? AppendCborString(output, bind_data.structured_column_names[i])
              : AppendMsgpackString(output, bind_data.structured_column_names[i]);
         auto column = bind_data.structured_column_indices[i];
-        AppendStructuredScalar(output, input.GetValue(column, row_idx), types[column].id(), cbor);
+        AppendStructuredValue(output, input.GetValue(column, row_idx), cbor);
     }
     return output;
 }

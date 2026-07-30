@@ -86,6 +86,20 @@ SELECT 'proto=' || device_id || '/' || metrics_kw || '/' || online
 FROM nats_scan('copy_roundtrip', url := '${NATS_URL}', nats_subject := 'copy_roundtrip.proto',
     proto_file := '${ROOT_DIR}/test/proto/telemetry.proto', proto_message := 'Telemetry',
     proto_extract := ['device_id', 'metrics.kw', 'online']);
+CREATE TABLE nested_source(
+    subject VARCHAR,
+    tags VARCHAR[],
+    metrics STRUCT(kw DOUBLE, online BOOLEAN),
+    attrs MAP(VARCHAR, INTEGER)
+);
+INSERT INTO nested_source VALUES
+    ('copy_roundtrip.nested', ['a', 'b'], struct_pack(kw := 12.5, online := true), MAP {'x': 1, 'y': 2});
+COPY nested_source
+TO 'copy_roundtrip'
+(FORMAT nats_js, url '${NATS_URL}', payload_format 'json', payload_columns ['tags', 'metrics', 'attrs']);
+SELECT 'nested=' || "metrics.kw" || '/' || "metrics.online" || '/' || "attrs.x"
+FROM nats_scan('copy_roundtrip', url := '${NATS_URL}', nats_subject := 'copy_roundtrip.nested',
+    json_extract := ['metrics.kw', 'metrics.online', 'attrs.x']);
 END
 EXPECT rows=5 20
 EXPECT json=json-device/42.5/true/7 20
@@ -93,6 +107,7 @@ EXPECT msgpack=msgpack-device/43.5/false/8 20
 EXPECT cbor=cbor-device/44.5/true/9 20
 EXPECT flex=flex-device/45.5/false/10 20
 EXPECT proto=proto-device/46.5/true 20
+EXPECT nested=12.5/true/1 20
 QUIT
 SQL
 then
