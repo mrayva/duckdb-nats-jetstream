@@ -508,6 +508,7 @@ Extracted fields (JSON or protobuf) are appended as additional columns after the
 - Timestamp-based range queries with binary search (`start_time`, `end_time`)
 - Subject filtering (exact match)
 - JSON payload extraction with field mapping
+- Process-wide, modification-aware caching of parsed protobuf schemas
 - Protocol Buffers support:
   - Runtime .proto schema parsing
   - All primitive types (string, bytes, integers, floats, bool, enum)
@@ -556,7 +557,6 @@ Extracted fields (JSON or protobuf) are appended as additional columns after the
 #### Performance Enhancements
 - **Parallel scanning** - Multi-threaded message retrieval for multi-subject streams
 - **Vectorized decoding** - SIMD optimizations for JSON/protobuf parsing
-- **Schema caching** - Reuse parsed schemas across queries
 - **Connection pooling** - Reduce connection overhead for repeated queries
 
 #### Configuration & Usability

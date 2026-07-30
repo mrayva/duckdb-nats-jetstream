@@ -16,7 +16,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 include_directories(src/include)
 
 # Extension sources
-set(EXTENSION_SOURCES src/nats_scan.cpp src/nats_js_extension.cpp src/nats_connection.cpp src/nats_ingest.cpp src/nats_message_decode.cpp src/nats_source.cpp src/nats_subscribe.cpp)
+set(EXTENSION_SOURCES src/nats_scan.cpp src/nats_js_extension.cpp src/nats_connection.cpp src/nats_ingest.cpp src/nats_message_decode.cpp src/nats_proto_schema.cpp src/nats_source.cpp src/nats_subscribe.cpp)
 
 # Build static and loadable extensions using DuckDB's build functions
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})

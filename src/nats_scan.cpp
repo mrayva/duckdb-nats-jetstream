@@ -1,6 +1,7 @@
 #include "nats_scan.hpp"
 #include "nats_connection.hpp"
 #include "nats_message_decode.hpp"
+#include "nats_proto_schema.hpp"
 #include "nats_source.hpp"
 #include "duckdb/function/copy_function.hpp"
 #include "duckdb/function/table_function.hpp"
@@ -1222,28 +1223,11 @@ static unique_ptr<FunctionData> NatsCopyToBind(ClientContext &context, CopyFunct
                 throw BinderException("COPY TO protobuf requires one proto_fields entry per payload column");
             }
 
-            result->proto_source_tree = make_shared_ptr<DiskSourceTree>();
-            std::filesystem::path proto_path(proto_file);
-            string proto_dir = proto_path.parent_path().string();
-            if (proto_dir.empty()) {
-                proto_dir = ".";
-            }
-            result->proto_source_tree->MapPath("", proto_dir);
+            auto proto_schema = GetNatsProtobufSchema(proto_file, proto_message);
+            result->proto_source_tree = proto_schema->source_tree;
             result->proto_error_collector = make_shared_ptr<ProtobufErrorCollector>();
-            result->proto_importer = make_shared_ptr<Importer>(result->proto_source_tree.get(),
-                                                               result->proto_error_collector.get());
-            auto file_desc = result->proto_importer->Import(proto_path.filename().string());
-            if (!file_desc) {
-                string error = "Failed to import protobuf schema file: " + proto_file;
-                if (result->proto_error_collector->HasErrors()) {
-                    error += "\n" + result->proto_error_collector->GetErrors();
-                }
-                throw BinderException("%s", error);
-            }
-            result->proto_descriptor = file_desc->FindMessageTypeByName(proto_message);
-            if (!result->proto_descriptor) {
-                throw BinderException("Protobuf message type '%s' was not found in %s", proto_message, proto_file);
-            }
+            result->proto_importer = proto_schema->importer;
+            result->proto_descriptor = proto_schema->descriptor;
             for (const auto &field_path : proto_fields) {
                 auto resolved_path = ResolveProtobufFieldPath(result->proto_descriptor, field_path);
                 if (resolved_path.back()->type() == FieldDescriptor::TYPE_MESSAGE && !resolved_path.back()->is_map()) {
@@ -1572,34 +1556,11 @@ static unique_ptr<FunctionData> NatsScanBind(ClientContext &context, TableFuncti
     vector<vector<const FieldDescriptor*>> proto_field_paths;
 
     if (!proto_fields.empty()) {
-        source_tree = make_shared_ptr<DiskSourceTree>();
-
-        std::filesystem::path proto_path(proto_file);
-        string proto_dir = proto_path.parent_path().string();
-        string proto_filename = proto_path.filename().string();
-
-        if (proto_dir.empty()) {
-            proto_dir = ".";
-        }
-
-        source_tree->MapPath("", proto_dir);
-
+        auto proto_schema = GetNatsProtobufSchema(proto_file, proto_message);
+        source_tree = proto_schema->source_tree;
         error_collector = make_shared_ptr<ProtobufErrorCollector>();
-        importer = make_shared_ptr<Importer>(source_tree.get(), error_collector.get());
-
-        const FileDescriptor* file_desc = importer->Import(proto_filename);
-        if (!file_desc) {
-            string error_msg = "Failed to import protobuf schema file: " + proto_file;
-            if (error_collector->HasErrors()) {
-                error_msg += "\n" + error_collector->GetErrors();
-            }
-            throw std::runtime_error(error_msg);
-        }
-
-        descriptor = file_desc->FindMessageTypeByName(proto_message);
-        if (!descriptor) {
-            throw std::runtime_error("Message type '" + proto_message + "' not found in " + proto_file);
-        }
+        importer = proto_schema->importer;
+        descriptor = proto_schema->descriptor;
 
         // Resolve and validate requested fields once. The descriptor pointers
         // remain valid while bind_data owns the protobuf importer.
@@ -2542,34 +2503,11 @@ static unique_ptr<FunctionData> NatsCopyFromBind(ClientContext &context, CopyFro
     vector<vector<const FieldDescriptor *>> proto_field_paths;
 
     if (!proto_fields.empty()) {
-        source_tree = make_shared_ptr<DiskSourceTree>();
-
-        std::filesystem::path proto_path(proto_file);
-        string proto_dir = proto_path.parent_path().string();
-        string proto_filename = proto_path.filename().string();
-
-        if (proto_dir.empty()) {
-            proto_dir = ".";
-        }
-
-        source_tree->MapPath("", proto_dir);
-
+        auto proto_schema = GetNatsProtobufSchema(proto_file, proto_message);
+        source_tree = proto_schema->source_tree;
         error_collector = make_shared_ptr<ProtobufErrorCollector>();
-        importer = make_shared_ptr<Importer>(source_tree.get(), error_collector.get());
-
-        const FileDescriptor *file_desc = importer->Import(proto_filename);
-        if (!file_desc) {
-            string error_msg = "Failed to import protobuf schema file: " + proto_file;
-            if (error_collector->HasErrors()) {
-                error_msg += "\n" + error_collector->GetErrors();
-            }
-            throw std::runtime_error(error_msg);
-        }
-
-        descriptor = file_desc->FindMessageTypeByName(proto_message);
-        if (!descriptor) {
-            throw std::runtime_error("Message type '" + proto_message + "' not found in " + proto_file);
-        }
+        importer = proto_schema->importer;
+        descriptor = proto_schema->descriptor;
 
         for (const auto &field_path : proto_fields) {
             proto_field_paths.push_back(ResolveProtobufFieldPath(descriptor, field_path));

@@ -1,4 +1,5 @@
 #include "nats_subscribe.hpp"
+#include "nats_proto_schema.hpp"
 
 #include "duckdb/common/types/timestamp.hpp"
 #include "duckdb/common/types/vector.hpp"
@@ -62,22 +63,11 @@ static void ImportSubscribeProtoSchema(const string &proto_file, const string &p
                                        shared_ptr<DiskSourceTree> &source_tree,
                                        shared_ptr<SubscribeProtobufErrorCollector> &error_collector,
                                        shared_ptr<Importer> &importer, const Descriptor *&descriptor) {
-    source_tree = make_shared_ptr<DiskSourceTree>();
-    std::filesystem::path proto_path(proto_file);
-    source_tree->MapPath("", proto_path.parent_path().empty() ? "." : proto_path.parent_path().string());
+    auto schema = GetNatsProtobufSchema(proto_file, proto_message);
+    source_tree = schema->source_tree;
     error_collector = make_shared_ptr<SubscribeProtobufErrorCollector>();
-    importer = make_shared_ptr<Importer>(source_tree.get(), error_collector.get());
-    auto *file_desc = importer->Import(proto_path.filename().string());
-    if (!file_desc) {
-        string error = "Failed to import protobuf schema file: " + proto_file;
-        auto details = error_collector->GetErrors();
-        if (!details.empty()) error += "\n" + details;
-        throw std::runtime_error(error);
-    }
-    descriptor = file_desc->FindMessageTypeByName(proto_message);
-    if (!descriptor) {
-        throw std::runtime_error("Message type '" + proto_message + "' not found in " + proto_file);
-    }
+    importer = schema->importer;
+    descriptor = schema->descriptor;
 }
 
 static string SubscribeProtoSqlType(const FieldDescriptor *field) {

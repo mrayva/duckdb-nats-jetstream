@@ -1,5 +1,6 @@
 #include "nats_ingest.hpp"
 #include "nats_message_decode.hpp"
+#include "nats_proto_schema.hpp"
 #include "nats_source.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/catalog/catalog.hpp"
@@ -1012,34 +1013,11 @@ static void DisconnectJetStream(natsConnection **conn, jsCtx **js) {
 static void ImportProtoSchema(const string &proto_file, const string &proto_message,
                               shared_ptr<DiskSourceTree> &source_tree, shared_ptr<ProtobufErrorCollector> &error_collector,
                               shared_ptr<Importer> &importer, const Descriptor *&descriptor) {
-    source_tree = make_shared_ptr<DiskSourceTree>();
-
-    std::filesystem::path proto_path(proto_file);
-    string proto_dir = proto_path.parent_path().string();
-    string proto_filename = proto_path.filename().string();
-
-    if (proto_dir.empty()) {
-        proto_dir = ".";
-    }
-
-    source_tree->MapPath("", proto_dir);
-
+    auto schema = GetNatsProtobufSchema(proto_file, proto_message);
+    source_tree = schema->source_tree;
     error_collector = make_shared_ptr<ProtobufErrorCollector>();
-    importer = make_shared_ptr<Importer>(source_tree.get(), error_collector.get());
-
-    const FileDescriptor *file_desc = importer->Import(proto_filename);
-    if (!file_desc) {
-        string error_msg = "Failed to import protobuf schema file: " + proto_file;
-        if (error_collector->HasErrors()) {
-            error_msg += "\n" + error_collector->GetErrors();
-        }
-        throw std::runtime_error(error_msg);
-    }
-
-    descriptor = file_desc->FindMessageTypeByName(proto_message);
-    if (!descriptor) {
-        throw std::runtime_error("Message type '" + proto_message + "' not found in " + proto_file);
-    }
+    importer = schema->importer;
+    descriptor = schema->descriptor;
 }
 
 static void ResolveProtoFieldPaths(const Descriptor *descriptor, const vector<string> &proto_fields,
