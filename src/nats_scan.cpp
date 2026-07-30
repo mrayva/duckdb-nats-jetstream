@@ -663,8 +663,8 @@ static void SetProtobufOutputField(google::protobuf::Message &message,
     }
 }
 
-static vector<uint8_t> EncodeProtobufPayload(const NatsCopyToBindData &bind_data, const DataChunk &input,
-                                             idx_t row_idx) {
+static void EncodeProtobufPayload(const NatsCopyToBindData &bind_data, const DataChunk &input, idx_t row_idx,
+                                  vector<uint8_t> &output) {
     DynamicMessageFactory factory;
     const auto *prototype = factory.GetPrototype(bind_data.proto_descriptor);
     if (!prototype) {
@@ -679,7 +679,7 @@ static vector<uint8_t> EncodeProtobufPayload(const NatsCopyToBindData &bind_data
     if (!message->SerializeToString(&serialized)) {
         throw BinderException("COPY TO failed to serialize protobuf message '%s'", bind_data.proto_descriptor->full_name());
     }
-    return vector<uint8_t>(serialized.begin(), serialized.end());
+    output.assign(serialized.begin(), serialized.end());
 }
 
 static void AppendFlexValue(flexbuffers::Builder &builder, const Value &value);
@@ -759,22 +759,24 @@ static void AppendFlexValue(flexbuffers::Builder &builder, const Value &value) {
     }
 }
 
-static vector<uint8_t> EncodeStructuredPayload(const NatsCopyToBindData &bind_data, const DataChunk &input,
-                                               idx_t row_idx) {
+static void EncodeStructuredPayload(const NatsCopyToBindData &bind_data, const DataChunk &input, idx_t row_idx,
+                                    vector<uint8_t> &output) {
     const auto &types = bind_data.column_types;
     if (bind_data.payload_format == NatsCopyToBindData::PayloadFormat::PROTOBUF) {
-        return EncodeProtobufPayload(bind_data, input, row_idx);
+        EncodeProtobufPayload(bind_data, input, row_idx, output);
+        return;
     }
     if (bind_data.payload_format == NatsCopyToBindData::PayloadFormat::JSON) {
-        string output = "{";
+        string json_output = "{";
         for (idx_t i = 0; i < bind_data.structured_column_indices.size(); i++) {
-            if (i) output += ",";
-            AppendJsonEscaped(output, bind_data.structured_column_names[i]);
-            output += ":";
-            AppendJsonValue(output, input.GetValue(bind_data.structured_column_indices[i], row_idx));
+            if (i) json_output += ",";
+            AppendJsonEscaped(json_output, bind_data.structured_column_names[i]);
+            json_output += ":";
+            AppendJsonValue(json_output, input.GetValue(bind_data.structured_column_indices[i], row_idx));
         }
-        output += "}";
-        return vector<uint8_t>(output.begin(), output.end());
+        json_output += "}";
+        output.assign(json_output.begin(), json_output.end());
+        return;
     }
     if (bind_data.payload_format == NatsCopyToBindData::PayloadFormat::FLEXBUFFERS) {
         flexbuffers::Builder builder;
@@ -787,10 +789,11 @@ static vector<uint8_t> EncodeStructuredPayload(const NatsCopyToBindData &bind_da
         builder.EndMap(start);
         builder.Finish();
         const auto &buffer = builder.GetBuffer();
-        return vector<uint8_t>(buffer.begin(), buffer.end());
+        output.assign(buffer.begin(), buffer.end());
+        return;
     }
 
-    vector<uint8_t> output;
+    output.clear();
     bool cbor = bind_data.payload_format == NatsCopyToBindData::PayloadFormat::CBOR;
     auto count = bind_data.structured_column_indices.size();
     AppendStructuredCount(output, count, cbor, true);
@@ -800,7 +803,6 @@ static vector<uint8_t> EncodeStructuredPayload(const NatsCopyToBindData &bind_da
         auto column = bind_data.structured_column_indices[i];
         AppendStructuredValue(output, input.GetValue(column, row_idx), cbor);
     }
-    return output;
 }
 
 static unique_ptr<FunctionData> NatsCopyToBind(ClientContext &context, CopyFunctionBindInput &input,
@@ -985,6 +987,10 @@ static void NatsCopyToSink(ExecutionContext &, FunctionData &bind_data, GlobalFu
         subjects = UnifiedVectorFormat::GetData<string_t>(subject_format);
     }
 
+    vector<uint8_t> encoded_payload;
+    if (bdata.payload_format != NatsCopyToBindData::PayloadFormat::RAW) {
+        encoded_payload.reserve(1024);
+    }
     for (idx_t row_idx = 0; row_idx < input.size(); row_idx++) {
         idx_t subject_idx = bdata.constant_subject ? 0 : subject_format.sel->get_index(row_idx);
         if (!bdata.constant_subject && !subject_format.validity.RowIsValid(subject_idx)) {
@@ -995,7 +1001,6 @@ static void NatsCopyToSink(ExecutionContext &, FunctionData &bind_data, GlobalFu
 
         const void *payload_data = nullptr;
         int payload_len = 0;
-        vector<uint8_t> encoded_payload;
         if (bdata.payload_format == NatsCopyToBindData::PayloadFormat::RAW) {
             idx_t out_idx = raw_payload_format.sel->get_index(row_idx);
             if (!raw_payload_format.validity.RowIsValid(out_idx)) {
@@ -1005,7 +1010,7 @@ static void NatsCopyToSink(ExecutionContext &, FunctionData &bind_data, GlobalFu
             payload_data = payload.GetData();
             payload_len = static_cast<int>(payload.GetSize());
         } else {
-            encoded_payload = EncodeStructuredPayload(bdata, input, row_idx);
+            EncodeStructuredPayload(bdata, input, row_idx, encoded_payload);
             payload_data = encoded_payload.data();
             payload_len = static_cast<int>(encoded_payload.size());
         }
