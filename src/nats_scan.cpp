@@ -841,8 +841,89 @@ static void SetProtobufOutputField(google::protobuf::Message &message,
     }
 }
 
+static bool SetProtobufOutputVectorScalar(google::protobuf::Message &message,
+                                          const vector<const FieldDescriptor *> &field_path,
+                                          const UnifiedVectorFormat &format, idx_t row_idx, LogicalTypeId source_type) {
+    if (field_path.size() != 1 || field_path[0]->is_repeated() || field_path[0]->is_map() ||
+        field_path[0]->type() == FieldDescriptor::TYPE_MESSAGE) {
+        return false;
+    }
+    auto value_idx = format.sel->get_index(row_idx);
+    if (!format.validity.RowIsValid(value_idx)) {
+        return true;
+    }
+    auto *field = field_path[0];
+    auto *reflection = message.GetReflection();
+    auto signed_value = [&](int64_t &result) {
+        switch (source_type) {
+        case LogicalTypeId::TINYINT: result = UnifiedVectorFormat::GetData<int8_t>(format)[value_idx]; return true;
+        case LogicalTypeId::SMALLINT: result = UnifiedVectorFormat::GetData<int16_t>(format)[value_idx]; return true;
+        case LogicalTypeId::INTEGER: result = UnifiedVectorFormat::GetData<int32_t>(format)[value_idx]; return true;
+        case LogicalTypeId::BIGINT: result = UnifiedVectorFormat::GetData<int64_t>(format)[value_idx]; return true;
+        default: return false;
+        }
+    };
+    auto unsigned_value = [&](uint64_t &result) {
+        switch (source_type) {
+        case LogicalTypeId::UTINYINT: result = UnifiedVectorFormat::GetData<uint8_t>(format)[value_idx]; return true;
+        case LogicalTypeId::USMALLINT: result = UnifiedVectorFormat::GetData<uint16_t>(format)[value_idx]; return true;
+        case LogicalTypeId::UINTEGER: result = UnifiedVectorFormat::GetData<uint32_t>(format)[value_idx]; return true;
+        case LogicalTypeId::UBIGINT: result = UnifiedVectorFormat::GetData<uint64_t>(format)[value_idx]; return true;
+        default: return false;
+        }
+    };
+    switch (field->type()) {
+    case FieldDescriptor::TYPE_STRING:
+    case FieldDescriptor::TYPE_BYTES: {
+        if (source_type != LogicalTypeId::VARCHAR && source_type != LogicalTypeId::BLOB) return false;
+        auto value = UnifiedVectorFormat::GetData<string_t>(format)[value_idx];
+        reflection->SetString(&message, field, string(value.GetData(), value.GetSize()));
+        return true;
+    }
+    case FieldDescriptor::TYPE_BOOL:
+        if (source_type != LogicalTypeId::BOOLEAN) return false;
+        reflection->SetBool(&message, field, UnifiedVectorFormat::GetData<bool>(format)[value_idx]);
+        return true;
+    case FieldDescriptor::TYPE_INT32:
+    case FieldDescriptor::TYPE_SINT32:
+    case FieldDescriptor::TYPE_SFIXED32:
+    case FieldDescriptor::TYPE_INT64:
+    case FieldDescriptor::TYPE_SINT64:
+    case FieldDescriptor::TYPE_SFIXED64: {
+        int64_t value;
+        if (!signed_value(value)) return false;
+        if (field->type() == FieldDescriptor::TYPE_INT32 || field->type() == FieldDescriptor::TYPE_SINT32 ||
+            field->type() == FieldDescriptor::TYPE_SFIXED32) reflection->SetInt32(&message, field, value);
+        else reflection->SetInt64(&message, field, value);
+        return true;
+    }
+    case FieldDescriptor::TYPE_UINT32:
+    case FieldDescriptor::TYPE_FIXED32:
+    case FieldDescriptor::TYPE_UINT64:
+    case FieldDescriptor::TYPE_FIXED64: {
+        uint64_t value;
+        if (!unsigned_value(value)) return false;
+        if (field->type() == FieldDescriptor::TYPE_UINT32 || field->type() == FieldDescriptor::TYPE_FIXED32)
+            reflection->SetUInt32(&message, field, value);
+        else reflection->SetUInt64(&message, field, value);
+        return true;
+    }
+    case FieldDescriptor::TYPE_FLOAT:
+        if (source_type == LogicalTypeId::FLOAT) reflection->SetFloat(&message, field, UnifiedVectorFormat::GetData<float>(format)[value_idx]);
+        else return false;
+        return true;
+    case FieldDescriptor::TYPE_DOUBLE:
+        if (source_type == LogicalTypeId::DOUBLE) reflection->SetDouble(&message, field, UnifiedVectorFormat::GetData<double>(format)[value_idx]);
+        else if (source_type == LogicalTypeId::FLOAT) reflection->SetDouble(&message, field, UnifiedVectorFormat::GetData<float>(format)[value_idx]);
+        else return false;
+        return true;
+    default:
+        return false;
+    }
+}
+
 static void EncodeProtobufPayload(const NatsCopyToBindData &bind_data, const DataChunk &input, idx_t row_idx,
-                                  vector<uint8_t> &output) {
+                                  const vector<UnifiedVectorFormat> &structured_formats, vector<uint8_t> &output) {
     DynamicMessageFactory factory;
     const auto *prototype = factory.GetPrototype(bind_data.proto_descriptor);
     if (!prototype) {
@@ -851,7 +932,10 @@ static void EncodeProtobufPayload(const NatsCopyToBindData &bind_data, const Dat
     auto message = unique_ptr<Message>(prototype->New());
     for (idx_t i = 0; i < bind_data.structured_column_indices.size(); i++) {
         auto column = bind_data.structured_column_indices[i];
-        SetProtobufOutputField(*message, bind_data.proto_field_paths[i], input.GetValue(column, row_idx));
+        if (!SetProtobufOutputVectorScalar(*message, bind_data.proto_field_paths[i], structured_formats[i], row_idx,
+                                           bind_data.column_types[column].id())) {
+            SetProtobufOutputField(*message, bind_data.proto_field_paths[i], input.GetValue(column, row_idx));
+        }
     }
     string serialized;
     if (!message->SerializeToString(&serialized)) {
@@ -974,7 +1058,7 @@ static void EncodeStructuredPayload(const NatsCopyToBindData &bind_data, const D
                                     const vector<UnifiedVectorFormat> &structured_formats, vector<uint8_t> &output) {
     const auto &types = bind_data.column_types;
     if (bind_data.payload_format == NatsCopyToBindData::PayloadFormat::PROTOBUF) {
-        EncodeProtobufPayload(bind_data, input, row_idx, output);
+        EncodeProtobufPayload(bind_data, input, row_idx, structured_formats, output);
         return;
     }
     if (bind_data.payload_format == NatsCopyToBindData::PayloadFormat::JSON) {
