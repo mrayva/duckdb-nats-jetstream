@@ -22,6 +22,7 @@
 #include <chrono>
 #include <thread>
 #include <cstring>
+#include <charconv>
 
 // Windows defines GetMessage as a macro (GetMessageA/GetMessageW)
 // This conflicts with protobuf's Reflection::GetMessage() method
@@ -443,6 +444,62 @@ static void AppendJsonValue(string &output, const Value &value) {
     }
 }
 
+static bool AppendJsonVectorScalar(string &output, const UnifiedVectorFormat &format, idx_t row_idx,
+                                   LogicalTypeId type) {
+    auto value_idx = format.sel->get_index(row_idx);
+    if (!format.validity.RowIsValid(value_idx)) {
+        output += "null";
+        return true;
+    }
+    switch (type) {
+    case LogicalTypeId::VARCHAR:
+    case LogicalTypeId::BLOB: {
+        auto value = UnifiedVectorFormat::GetData<string_t>(format)[value_idx];
+        AppendJsonEscaped(output, string(value.GetData(), value.GetSize()));
+        return true;
+    }
+    case LogicalTypeId::BOOLEAN:
+        output += UnifiedVectorFormat::GetData<bool>(format)[value_idx] ? "true" : "false";
+        return true;
+    case LogicalTypeId::TINYINT:
+        output += std::to_string(UnifiedVectorFormat::GetData<int8_t>(format)[value_idx]);
+        return true;
+    case LogicalTypeId::SMALLINT:
+        output += std::to_string(UnifiedVectorFormat::GetData<int16_t>(format)[value_idx]);
+        return true;
+    case LogicalTypeId::INTEGER:
+        output += std::to_string(UnifiedVectorFormat::GetData<int32_t>(format)[value_idx]);
+        return true;
+    case LogicalTypeId::BIGINT:
+        output += std::to_string(UnifiedVectorFormat::GetData<int64_t>(format)[value_idx]);
+        return true;
+    case LogicalTypeId::UTINYINT:
+        output += std::to_string(UnifiedVectorFormat::GetData<uint8_t>(format)[value_idx]);
+        return true;
+    case LogicalTypeId::USMALLINT:
+        output += std::to_string(UnifiedVectorFormat::GetData<uint16_t>(format)[value_idx]);
+        return true;
+    case LogicalTypeId::UINTEGER:
+        output += std::to_string(UnifiedVectorFormat::GetData<uint32_t>(format)[value_idx]);
+        return true;
+    case LogicalTypeId::UBIGINT:
+        output += std::to_string(UnifiedVectorFormat::GetData<uint64_t>(format)[value_idx]);
+        return true;
+    case LogicalTypeId::FLOAT:
+    case LogicalTypeId::DOUBLE: {
+        char buffer[64];
+        auto number = type == LogicalTypeId::FLOAT ? UnifiedVectorFormat::GetData<float>(format)[value_idx]
+                                                   : UnifiedVectorFormat::GetData<double>(format)[value_idx];
+        auto converted = std::to_chars(buffer, buffer + sizeof(buffer), number);
+        if (converted.ec != std::errc()) return false;
+        output.append(buffer, converted.ptr);
+        return true;
+    }
+    default:
+        return false;
+    }
+}
+
 static void AppendBigEndian(vector<uint8_t> &output, uint64_t value, idx_t width) {
     for (idx_t i = width; i > 0; i--) {
         output.push_back(static_cast<uint8_t>(value >> ((i - 1) * 8)));
@@ -504,6 +561,71 @@ static void AppendStructuredCount(vector<uint8_t> &output, idx_t count, bool cbo
     } else {
         if (count < 16) output.push_back(static_cast<uint8_t>(0x90 | count));
         else { output.push_back(0xdc); AppendBigEndian(output, count, 2); }
+    }
+}
+
+static bool AppendStructuredVectorScalar(vector<uint8_t> &output, const UnifiedVectorFormat &format, idx_t row_idx,
+                                          LogicalTypeId type, bool cbor) {
+    auto value_idx = format.sel->get_index(row_idx);
+    if (!format.validity.RowIsValid(value_idx)) {
+        output.push_back(0xc0);
+        return true;
+    }
+    auto append_signed = [&](int64_t number) {
+        if (cbor) {
+            if (number >= 0 && number < 24) output.push_back(static_cast<uint8_t>(number));
+            else if (number >= 0) { output.push_back(0x1b); AppendBigEndian(output, static_cast<uint64_t>(number), 8); }
+            else { output.push_back(0x3b); AppendBigEndian(output, static_cast<uint64_t>(-(number + 1)), 8); }
+        } else if (number >= -32 && number < 128) {
+            output.push_back(static_cast<uint8_t>(number));
+        } else {
+            output.push_back(0xd3);
+            AppendBigEndian(output, static_cast<uint64_t>(number), 8);
+        }
+    };
+    auto append_unsigned = [&](uint64_t number) {
+        if ((cbor || number < 128) && number < 24) output.push_back(static_cast<uint8_t>(number));
+        else if (!cbor && number < 128) output.push_back(static_cast<uint8_t>(number));
+        else { output.push_back(cbor ? 0x1b : 0xcf); AppendBigEndian(output, number, 8); }
+    };
+    switch (type) {
+    case LogicalTypeId::VARCHAR:
+    case LogicalTypeId::BLOB: {
+        auto value = UnifiedVectorFormat::GetData<string_t>(format)[value_idx];
+        auto text = string(value.GetData(), value.GetSize());
+        cbor ? AppendCborString(output, text) : AppendMsgpackString(output, text);
+        return true;
+    }
+    case LogicalTypeId::BOOLEAN:
+        output.push_back(cbor ? (UnifiedVectorFormat::GetData<bool>(format)[value_idx] ? 0xf5 : 0xf4)
+                              : (UnifiedVectorFormat::GetData<bool>(format)[value_idx] ? 0xc3 : 0xc2));
+        return true;
+    case LogicalTypeId::TINYINT: append_signed(UnifiedVectorFormat::GetData<int8_t>(format)[value_idx]); return true;
+    case LogicalTypeId::SMALLINT: append_signed(UnifiedVectorFormat::GetData<int16_t>(format)[value_idx]); return true;
+    case LogicalTypeId::INTEGER: append_signed(UnifiedVectorFormat::GetData<int32_t>(format)[value_idx]); return true;
+    case LogicalTypeId::BIGINT: append_signed(UnifiedVectorFormat::GetData<int64_t>(format)[value_idx]); return true;
+    case LogicalTypeId::UTINYINT: append_unsigned(UnifiedVectorFormat::GetData<uint8_t>(format)[value_idx]); return true;
+    case LogicalTypeId::USMALLINT: append_unsigned(UnifiedVectorFormat::GetData<uint16_t>(format)[value_idx]); return true;
+    case LogicalTypeId::UINTEGER: append_unsigned(UnifiedVectorFormat::GetData<uint32_t>(format)[value_idx]); return true;
+    case LogicalTypeId::UBIGINT: append_unsigned(UnifiedVectorFormat::GetData<uint64_t>(format)[value_idx]); return true;
+    case LogicalTypeId::FLOAT: {
+        double number = UnifiedVectorFormat::GetData<float>(format)[value_idx];
+        uint64_t bits;
+        memcpy(&bits, &number, sizeof(bits));
+        output.push_back(cbor ? 0xfb : 0xcb);
+        AppendBigEndian(output, bits, 8);
+        return true;
+    }
+    case LogicalTypeId::DOUBLE: {
+        auto number = UnifiedVectorFormat::GetData<double>(format)[value_idx];
+        uint64_t bits;
+        memcpy(&bits, &number, sizeof(bits));
+        output.push_back(cbor ? 0xfb : 0xcb);
+        AppendBigEndian(output, bits, 8);
+        return true;
+    }
+    default:
+        return false;
     }
 }
 
@@ -816,7 +938,7 @@ static void AppendFlexValue(flexbuffers::Builder &builder, const Value &value) {
 }
 
 static void EncodeStructuredPayload(const NatsCopyToBindData &bind_data, const DataChunk &input, idx_t row_idx,
-                                    vector<uint8_t> &output) {
+                                    const vector<UnifiedVectorFormat> &structured_formats, vector<uint8_t> &output) {
     const auto &types = bind_data.column_types;
     if (bind_data.payload_format == NatsCopyToBindData::PayloadFormat::PROTOBUF) {
         EncodeProtobufPayload(bind_data, input, row_idx, output);
@@ -828,7 +950,10 @@ static void EncodeStructuredPayload(const NatsCopyToBindData &bind_data, const D
             if (i) json_output += ",";
             json_output += bind_data.structured_json_keys[i];
             json_output += ":";
-            AppendJsonValue(json_output, input.GetValue(bind_data.structured_column_indices[i], row_idx));
+            auto column = bind_data.structured_column_indices[i];
+            if (!AppendJsonVectorScalar(json_output, structured_formats[i], row_idx, types[column].id())) {
+                AppendJsonValue(json_output, input.GetValue(column, row_idx));
+            }
         }
         json_output += "}";
         output.assign(json_output.begin(), json_output.end());
@@ -857,7 +982,9 @@ static void EncodeStructuredPayload(const NatsCopyToBindData &bind_data, const D
         const auto &key = bind_data.structured_binary_keys[i];
         output.insert(output.end(), key.begin(), key.end());
         auto column = bind_data.structured_column_indices[i];
-        AppendStructuredValue(output, input.GetValue(column, row_idx), cbor);
+        if (!AppendStructuredVectorScalar(output, structured_formats[i], row_idx, types[column].id(), cbor)) {
+            AppendStructuredValue(output, input.GetValue(column, row_idx), cbor);
+        }
     }
 }
 
@@ -1060,8 +1187,13 @@ static void NatsCopyToSink(ExecutionContext &, FunctionData &bind_data, GlobalFu
     }
 
     vector<uint8_t> encoded_payload;
+    vector<UnifiedVectorFormat> structured_formats;
     if (bdata.payload_format != NatsCopyToBindData::PayloadFormat::RAW) {
         encoded_payload.reserve(1024);
+        structured_formats.resize(bdata.structured_column_indices.size());
+        for (idx_t i = 0; i < bdata.structured_column_indices.size(); i++) {
+            input.data[bdata.structured_column_indices[i]].ToUnifiedFormat(input.size(), structured_formats[i]);
+        }
     }
     for (idx_t row_idx = 0; row_idx < input.size(); row_idx++) {
         idx_t subject_idx = bdata.constant_subject ? 0 : subject_format.sel->get_index(row_idx);
@@ -1082,7 +1214,7 @@ static void NatsCopyToSink(ExecutionContext &, FunctionData &bind_data, GlobalFu
             payload_data = payload.GetData();
             payload_len = static_cast<int>(payload.GetSize());
         } else {
-            EncodeStructuredPayload(bdata, input, row_idx, encoded_payload);
+            EncodeStructuredPayload(bdata, input, row_idx, structured_formats, encoded_payload);
             payload_data = encoded_payload.data();
             payload_len = static_cast<int>(encoded_payload.size());
         }
