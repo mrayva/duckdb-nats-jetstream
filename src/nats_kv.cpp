@@ -1,11 +1,13 @@
 #include "nats_kv.hpp"
 #include "nats_connection.hpp"
 #include "nats_duckdb_compat.hpp"
+#include "nats_source.hpp"
 
 #include "duckdb/function/copy_function.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/parser/parsed_data/copy_info.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
+#include <cstring>
 #include <nats/nats.h>
 
 namespace duckdb {
@@ -190,6 +192,10 @@ void FillNatsKvRowsOutput(DataChunk &output, NatsKvRowsGlobalState &state, const
 struct NatsKvScanBindData : public TableFunctionData {
     string bucket;
     string key_filter;
+    // 0 = full snapshot (kvStore_Keys + Get per key). Otherwise, do an
+    // incremental read of the underlying KV_<bucket> stream starting right
+    // after this revision, so cost scales with what changed, not bucket size.
+    uint64_t since_revision = 0;
     NatsConnectionConfig connection;
 };
 
@@ -201,6 +207,12 @@ unique_ptr<FunctionData> NatsKvScanBind(ClientContext &, TableFunctionBindInput 
     for (auto &kv : input.named_parameters) {
         if (kv.first == "key_filter") {
             result->key_filter = StringValue::Get(kv.second);
+        } else if (kv.first == "since_revision") {
+            auto since_revision = BigIntValue::Get(kv.second);
+            if (since_revision < 0) {
+                throw std::runtime_error("since_revision must not be negative");
+            }
+            result->since_revision = static_cast<uint64_t>(since_revision);
         } else {
             ParseNatsConnectionParameter(result->connection, string(kv.first), kv.second);
         }
@@ -214,13 +226,10 @@ unique_ptr<FunctionData> NatsKvScanBind(ClientContext &, TableFunctionBindInput 
     return result;
 }
 
-unique_ptr<GlobalTableFunctionState> NatsKvScanInitGlobal(ClientContext &, TableFunctionInitInput &input) {
-    auto &bind_data = input.bind_data->Cast<NatsKvScanBindData>();
-    auto state = make_uniq<NatsKvRowsGlobalState>();
-
-    NatsKvHandle handle;
-    OpenKvStore(bind_data.connection, bind_data.bucket, handle);
-
+// Full snapshot: list every current key, then Get each one. Cost is O(number of
+// keys in the bucket) regardless of how many actually changed since the caller
+// last looked.
+vector<NatsKvRow> NatsKvScanFullSnapshot(const NatsKvScanBindData &bind_data, NatsKvHandle &handle) {
     // A filter that matches no keys (e.g. a NATS subject-wildcard pattern that
     // doesn't correspond to how these keys are actually structured) can otherwise
     // block indefinitely: kvStore_Keys/KeysWithFilters wait on a server-side
@@ -251,7 +260,8 @@ unique_ptr<GlobalTableFunctionState> NatsKvScanInitGlobal(ClientContext &, Table
         kvKeysList_Destroy(&keys_list);
     }
 
-    state->rows.reserve(keys.size());
+    vector<NatsKvRow> rows;
+    rows.reserve(keys.size());
     for (auto &key : keys) {
         kvEntry *entry = nullptr;
         auto get_status = kvStore_Get(&entry, handle.kv, key.c_str());
@@ -271,7 +281,138 @@ unique_ptr<GlobalTableFunctionState> NatsKvScanInitGlobal(ClientContext &, Table
         row.created_ns = kvEntry_Created(entry);
         row.operation = kvEntry_Operation(entry);
         kvEntry_Destroy(entry);
-        state->rows.push_back(std::move(row));
+        rows.push_back(std::move(row));
+    }
+    return rows;
+}
+
+constexpr uint64_t NATS_KV_INCREMENTAL_BATCH_SIZE = 256;
+constexpr int64_t NATS_KV_INCREMENTAL_FETCH_TIMEOUT_MS = 2000;
+
+// Incremental read: KV buckets are backed by a stream named "KV_<bucket>", one
+// message per put/delete/purge, with subject "$KV.<bucket>.<key>" and a
+// "KV-Operation: DEL"/"PURGE" header (absent for a plain put) with an empty
+// body. Reading that stream directly from since_revision+1 costs O(number of
+// changes), not O(bucket size) - this is the same mechanism kvStore_Watch uses
+// internally, just read as a bounded one-shot range instead of a live watcher.
+vector<NatsKvRow> NatsKvScanIncremental(const NatsKvScanBindData &bind_data) {
+    vector<NatsKvRow> rows;
+    string stream_name = "KV_" + bind_data.bucket;
+    string subject_prefix = "$KV." + bind_data.bucket + ".";
+
+    natsConnection *conn = nullptr;
+    jsCtx *js = nullptr;
+    natsSubscription *sub = nullptr;
+    jsStreamInfo *stream_info = nullptr;
+    try {
+        ConnectJetStream(bind_data.connection, &conn, &js);
+
+        auto info_status = js_GetStreamInfo(&stream_info, js, stream_name.c_str(), nullptr, nullptr);
+        if (info_status != NATS_OK) {
+            throw std::runtime_error("Failed to get stream info for bucket '" + bind_data.bucket +
+                                     "': " + natsStatus_GetText(info_status));
+        }
+        uint64_t last_seq = stream_info->State.LastSeq;
+        jsStreamInfo_Destroy(stream_info);
+        stream_info = nullptr;
+
+        uint64_t start_seq = bind_data.since_revision + 1;
+        if (start_seq > last_seq) {
+            // Nothing has changed since the caller's last scan.
+            natsConnection_Destroy(conn);
+            return rows;
+        }
+
+        string subscription_subject = bind_data.key_filter.empty() ? ">" : subject_prefix + bind_data.key_filter;
+
+        jsSubOptions sub_opts;
+        jsSubOptions_Init(&sub_opts);
+        sub_opts.Stream = stream_name.c_str();
+        sub_opts.Config.DeliverPolicy = js_DeliverByStartSequence;
+        sub_opts.Config.OptStartSeq = start_seq;
+        sub_opts.Config.AckPolicy = js_AckNone;
+        sub_opts.Config.ReplayPolicy = js_ReplayInstant;
+
+        jsErrCode js_err = static_cast<jsErrCode>(0);
+        auto sub_status = js_PullSubscribe(&sub, js, subscription_subject.c_str(), nullptr, nullptr, &sub_opts, &js_err);
+        if (sub_status != NATS_OK) {
+            throw std::runtime_error("Failed to create JetStream pull subscription for bucket '" + bind_data.bucket +
+                                     "': " + natsStatus_GetText(sub_status));
+        }
+
+        NatsJetStreamBatchSource message_source(sub, conn);
+        natsMsg *msg = nullptr;
+        while (message_source.Next(&msg, NATS_KV_INCREMENTAL_BATCH_SIZE, NATS_KV_INCREMENTAL_FETCH_TIMEOUT_MS,
+                                   stream_name)) {
+            if (!msg) {
+                continue;
+            }
+            NatsMessageEnvelope envelope(msg);
+            if (envelope.Sequence() > last_seq) {
+                // A concurrent write landed after we captured last_seq; stop here so the
+                // caller gets a well-defined "as of last_seq" result to use as their next
+                // since_revision, rather than a partially-observed later state.
+                natsMsg_Destroy(msg);
+                break;
+            }
+
+            NatsKvRow row;
+            const char *subject = envelope.Subject();
+            if (subject != nullptr && strncmp(subject, subject_prefix.c_str(), subject_prefix.size()) == 0) {
+                row.key = string(subject + subject_prefix.size());
+            } else if (subject != nullptr) {
+                row.key = string(subject);
+            }
+            row.revision = envelope.Sequence();
+            row.created_ns = envelope.TimestampNs();
+
+            const char *op_value = nullptr;
+            auto header_status = natsMsgHeader_Get(msg, "KV-Operation", &op_value);
+            if (header_status == NATS_OK && op_value != nullptr && strcmp(op_value, "DEL") == 0) {
+                row.operation = kvOp_Delete;
+            } else if (header_status == NATS_OK && op_value != nullptr && strcmp(op_value, "PURGE") == 0) {
+                row.operation = kvOp_Purge;
+            } else {
+                row.operation = kvOp_Put;
+                row.value.assign(envelope.Data(), static_cast<size_t>(envelope.DataLength()));
+            }
+
+            natsMsg_Destroy(msg);
+            rows.push_back(std::move(row));
+
+            if (row.revision >= last_seq) {
+                break;
+            }
+        }
+
+        natsSubscription_Destroy(sub);
+        natsConnection_Destroy(conn);
+    } catch (...) {
+        if (stream_info != nullptr) {
+            jsStreamInfo_Destroy(stream_info);
+        }
+        if (sub != nullptr) {
+            natsSubscription_Destroy(sub);
+        }
+        if (conn != nullptr) {
+            natsConnection_Destroy(conn);
+        }
+        throw;
+    }
+
+    return rows;
+}
+
+unique_ptr<GlobalTableFunctionState> NatsKvScanInitGlobal(ClientContext &, TableFunctionInitInput &input) {
+    auto &bind_data = input.bind_data->Cast<NatsKvScanBindData>();
+    auto state = make_uniq<NatsKvRowsGlobalState>();
+
+    if (bind_data.since_revision == 0) {
+        NatsKvHandle handle;
+        OpenKvStore(bind_data.connection, bind_data.bucket, handle);
+        state->rows = NatsKvScanFullSnapshot(bind_data, handle);
+    } else {
+        state->rows = NatsKvScanIncremental(bind_data);
     }
 
     return std::move(state);
@@ -936,6 +1077,7 @@ void NatsKvFunction::Register(ExtensionLoader &loader) {
                           NatsKvScanBind, NatsKvScanInitGlobal);
     RegisterNatsConnectionParameters(scan_fn);
     scan_fn.named_parameters["key_filter"] = LogicalType(LogicalTypeId::VARCHAR);
+    scan_fn.named_parameters["since_revision"] = LogicalType(LogicalTypeId::BIGINT);
     loader.RegisterFunction(scan_fn);
 
     TableFunction history_fn("nats_kv_history",
