@@ -131,8 +131,9 @@ void ConnectNats(const NatsConnectionConfig &config, natsConnection **connection
     throw std::runtime_error(string("Failed to connect to NATS: ") + natsStatus_GetText(last_status));
 }
 
-void ConnectJetStream(const NatsConnectionConfig &config, natsConnection **connection, jsCtx **jetstream) {
-    ConnectNats(config, connection);
+void ConnectJetStream(const NatsConnectionConfig &config, natsConnection **connection, jsCtx **jetstream,
+                      idx_t max_attempts, const NatsConnectionCallbacks *callbacks) {
+    ConnectNats(config, connection, max_attempts, callbacks);
     auto status = natsConnection_JetStream(jetstream, *connection, nullptr);
     if (status != NATS_OK) {
         natsConnection_Destroy(*connection);

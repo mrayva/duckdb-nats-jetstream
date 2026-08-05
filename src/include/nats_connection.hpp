@@ -30,6 +30,7 @@ void ConfigureNatsOptions(natsOptions *options, const NatsConnectionConfig &conf
                           const NatsConnectionCallbacks *callbacks = nullptr);
 void ConnectNats(const NatsConnectionConfig &config, natsConnection **connection, idx_t max_attempts = 1,
                  const NatsConnectionCallbacks *callbacks = nullptr);
-void ConnectJetStream(const NatsConnectionConfig &config, natsConnection **connection, jsCtx **jetstream);
+void ConnectJetStream(const NatsConnectionConfig &config, natsConnection **connection, jsCtx **jetstream,
+                      idx_t max_attempts = 1, const NatsConnectionCallbacks *callbacks = nullptr);
 
 } // namespace duckdb
