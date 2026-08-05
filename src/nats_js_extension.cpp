@@ -1,5 +1,6 @@
 #include "nats_js_extension.hpp"
 #include "nats_ingest.hpp"
+#include "nats_kv.hpp"
 #include "nats_subscribe.hpp"
 #include "nats_scan.hpp"
 #include <nats/nats.h>
@@ -13,6 +14,7 @@ void NatsJsExtension::Load(ExtensionLoader &loader) {
     NatsCopyFunction::Register(loader);
     NatsIngestFunction::Register(loader);
     NatsSubscribeFunction::Register(loader);
+    NatsKvFunction::Register(loader);
 }
 
 std::string NatsJsExtension::Name() {
