@@ -85,7 +85,9 @@ NatsSubscribeJobState::~NatsSubscribeJobState() {
             progress.stop_requested = true;
             cv.notify_all();
         }
-        worker.join();
+        if (worker.get_id() != std::this_thread::get_id()) {
+            worker.join();
+        }
     }
     if (sub != nullptr) {
         natsSubscription_Destroy(sub);
@@ -105,10 +107,21 @@ NatsSubscribeManager &NatsSubscribeManager::Get() {
 shared_ptr<NatsSubscribeJobState> NatsSubscribeManager::CreateJob(NatsSubscribeConfig config) {
     auto job = make_shared_ptr<NatsSubscribeJobState>(std::move(config));
     lock_guard<std::mutex> guard(mutex_);
-    auto insert_result = jobs_.emplace(job->config.job_name, job);
-    if (!insert_result.second) {
-        throw BinderException("subscribe job '%s' already exists", job->config.job_name);
+    auto it = jobs_.find(job->config.job_name);
+    if (it != jobs_.end()) {
+        bool existing_running;
+        {
+            lock_guard<std::mutex> job_guard(it->second->mutex);
+            existing_running = it->second->progress.running;
+        }
+        if (existing_running) {
+            throw BinderException("subscribe job '%s' already exists", job->config.job_name);
+        }
+        // A previous job under this name has already stopped or failed: drop it so its
+        // connection/subscription/thread are released and the name can be reused.
+        jobs_.erase(it);
     }
+    jobs_.emplace(job->config.job_name, job);
     return job;
 }
 
@@ -168,7 +181,18 @@ bool NatsSubscribeManager::StopJob(const string &job_name) {
 
 bool NatsSubscribeManager::RemoveJob(const string &job_name) {
     lock_guard<std::mutex> guard(mutex_);
-    return jobs_.erase(job_name) > 0;
+    auto it = jobs_.find(job_name);
+    if (it == jobs_.end()) {
+        return false;
+    }
+    {
+        lock_guard<std::mutex> job_guard(it->second->mutex);
+        if (it->second->progress.running) {
+            throw std::runtime_error("Subscribe job '" + job_name + "' is still running; stop it before removing");
+        }
+    }
+    jobs_.erase(it);
+    return true;
 }
 
 struct NatsSubscribeSnapshot {
@@ -645,7 +669,6 @@ static void SubscribeDisconnected(natsConnection *, void *closure) {
     lock_guard<std::mutex> guard(job->mutex);
     job->progress.connected = false;
     job->progress.reconnecting = true;
-    job->progress.resubscribe_requested = true;
     job->cv.notify_all();
 }
 
@@ -712,13 +735,17 @@ static void CreateSubscribeSubscription(const shared_ptr<NatsSubscribeJobState> 
     {
         lock_guard<std::mutex> guard(job->mutex);
         job->sub = sub;
-        job->progress.resubscribe_requested = false;
     }
 }
 
 static void RunSubscribeWorker(const shared_ptr<NatsSubscribeJobState> &job) {
     try {
-        Connection conn(*job->db);
+        auto db_instance = job->db.lock();
+        if (!db_instance) {
+            throw std::runtime_error("Subscribe job '" + job->config.job_name +
+                                     "' database instance is no longer available");
+        }
+        Connection conn(*db_instance);
         shared_ptr<DiskSourceTree> proto_source_tree;
         shared_ptr<SubscribeProtobufErrorCollector> proto_error_collector;
         shared_ptr<Importer> proto_importer;
@@ -759,13 +786,11 @@ static void RunSubscribeWorker(const shared_ptr<NatsSubscribeJobState> &job) {
         natsStatus s = NATS_OK;
 
         while (true) {
-            bool resubscribe_requested = false;
             {
                 unique_lock<std::mutex> lock(job->mutex);
                 if (job->progress.stop_requested) {
                     break;
                 }
-                resubscribe_requested = job->progress.resubscribe_requested;
                 if (job->progress.paused) {
                     lock.unlock();
                     RefreshSubscribeMetrics(job);
@@ -780,20 +805,6 @@ static void RunSubscribeWorker(const shared_ptr<NatsSubscribeJobState> &job) {
                         continue;
                     }
                 }
-            }
-
-            if (resubscribe_requested) {
-                natsSubscription *old_sub = nullptr;
-                {
-                    lock_guard<std::mutex> guard(job->mutex);
-                    old_sub = job->sub;
-                    job->sub = nullptr;
-                }
-                if (old_sub != nullptr) {
-                    natsSubscription_Destroy(old_sub);
-                }
-                CreateSubscribeSubscription(job);
-                continue;
             }
 
             natsMsg *msg = nullptr;
@@ -938,6 +949,50 @@ static unique_ptr<GlobalTableFunctionState> NatsSubscribeStopInitGlobal(ClientCo
 }
 
 static void NatsSubscribeStopExecute(ClientContext &, TableFunctionInput &data_p, DataChunk &output) {
+    auto &state = data_p.global_state->Cast<NatsSubscribeControlGlobalState>();
+    if (state.done) {
+        output.SetCardinality(0);
+        return;
+    }
+    auto snapshot = SnapshotJob(state.jobs[0]);
+    FillSubscribeSnapshotColumns(output, 0, snapshot);
+    output.SetCardinality(1);
+    state.done = true;
+}
+
+static unique_ptr<FunctionData> NatsSubscribeRemoveBind(ClientContext &, TableFunctionBindInput &input,
+                                                        vector<LogicalType> &return_types, vector<string> &names) {
+    string job_name;
+    bool has_job_name = false;
+    for (auto &kv : input.named_parameters) {
+        if (kv.first == "job_name") {
+            job_name = StringValue::Get(kv.second);
+            has_job_name = true;
+        }
+    }
+    if (!has_job_name) {
+        throw std::runtime_error("job_name parameter is required");
+    }
+    AddSubscribeSnapshotColumns(return_types, names);
+    auto bind_data = make_uniq<NatsSubscribeJobNameBindData>();
+    bind_data->job_name = std::move(job_name);
+    return bind_data;
+}
+
+static unique_ptr<GlobalTableFunctionState> NatsSubscribeRemoveInitGlobal(ClientContext &,
+                                                                          TableFunctionInitInput &input) {
+    auto &bind_data = input.bind_data->Cast<NatsSubscribeJobNameBindData>();
+    auto job = NatsSubscribeManager::Get().GetJob(bind_data.job_name);
+    if (!job) {
+        throw std::runtime_error("Subscribe job '" + bind_data.job_name + "' does not exist");
+    }
+    auto state = make_uniq<NatsSubscribeControlGlobalState>();
+    state->jobs.push_back(job);
+    NatsSubscribeManager::Get().RemoveJob(bind_data.job_name);
+    return state;
+}
+
+static void NatsSubscribeRemoveExecute(ClientContext &, TableFunctionInput &data_p, DataChunk &output) {
     auto &state = data_p.global_state->Cast<NatsSubscribeControlGlobalState>();
     if (state.done) {
         output.SetCardinality(0);
@@ -1165,6 +1220,11 @@ void NatsSubscribeFunction::Register(ExtensionLoader &loader) {
                           NatsSubscribeStopInitGlobal);
     stop_fn.named_parameters["job_name"] = LogicalType(LogicalTypeId::VARCHAR);
     loader.RegisterFunction(stop_fn);
+
+    TableFunction remove_fn("nats_remove_subscribe", {}, NatsSubscribeRemoveExecute, NatsSubscribeRemoveBind,
+                            NatsSubscribeRemoveInitGlobal);
+    remove_fn.named_parameters["job_name"] = LogicalType(LogicalTypeId::VARCHAR);
+    loader.RegisterFunction(remove_fn);
 
     TableFunction status_fn("nats_subscribe_status", {}, NatsSubscribeStatusExecute, NatsSubscribeStatusBind,
                             NatsSubscribeStatusInitGlobal);

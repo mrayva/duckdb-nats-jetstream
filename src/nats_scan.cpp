@@ -187,36 +187,36 @@ static yyjson_val *FindJsonFieldPath(yyjson_val *root, const string &field_path)
     return nullptr;
 }
 
-static std::optional<string> GetCopyOptionString(const case_insensitive_map_t<vector<Value>> &options,
+static std::optional<string> GetCopyOptionString(const NatsCopyOptionsMap &options,
                                                  const string &name) {
-    auto it = options.find(name);
+    auto it = NatsFindCopyOption(options, name);
     if (it == options.end() || it->second.empty()) {
         return std::nullopt;
     }
     return StringValue::Get(it->second.front());
 }
 
-static uint64_t GetCopyOptionUBigInt(const case_insensitive_map_t<vector<Value>> &options, const string &name,
+static uint64_t GetCopyOptionUBigInt(const NatsCopyOptionsMap &options, const string &name,
                                      uint64_t default_value) {
-    auto it = options.find(name);
+    auto it = NatsFindCopyOption(options, name);
     if (it == options.end() || it->second.empty()) {
         return default_value;
     }
     return UBigIntValue::Get(it->second.front());
 }
 
-static int64_t GetCopyOptionBigInt(const case_insensitive_map_t<vector<Value>> &options, const string &name,
+static int64_t GetCopyOptionBigInt(const NatsCopyOptionsMap &options, const string &name,
                                    int64_t default_value) {
-    auto it = options.find(name);
+    auto it = NatsFindCopyOption(options, name);
     if (it == options.end() || it->second.empty()) {
         return default_value;
     }
     return BigIntValue::Get(it->second.front());
 }
 
-static vector<string> GetCopyOptionStringList(const case_insensitive_map_t<vector<Value>> &options, const string &name) {
+static vector<string> GetCopyOptionStringList(const NatsCopyOptionsMap &options, const string &name) {
     vector<string> result;
-    auto it = options.find(name);
+    auto it = NatsFindCopyOption(options, name);
     if (it == options.end()) {
         return result;
     }
@@ -299,7 +299,7 @@ static string ResolveNatsCopyStreamName(const string &file_path, const char *cop
     return file_path;
 }
 
-static string ResolveNatsCopyUrl(const case_insensitive_map_t<vector<Value>> &options, const char *copy_mode,
+static string ResolveNatsCopyUrl(const NatsCopyOptionsMap &options, const char *copy_mode,
                                  const string *default_url) {
     auto url = GetCopyOptionString(options, "url");
     if (url.has_value() && !url->empty()) {
@@ -1145,7 +1145,7 @@ static unique_ptr<FunctionData> NatsCopyToBind(ClientContext &context, CopyFunct
     result->connection.url = ResolveNatsCopyUrl(input.info.options, "COPY TO", nullptr);
     for (const auto &option : input.info.options) {
         if (!option.second.empty()) {
-            ParseNatsConnectionParameter(result->connection, option.first, option.second.front());
+            ParseNatsConnectionParameter(result->connection, string(option.first), option.second.front());
         }
     }
     ValidateNatsConnectionConfig(result->connection);
@@ -1846,7 +1846,7 @@ static unique_ptr<GlobalTableFunctionState> NatsScanInitGlobal(ClientContext &co
                                bind_data.stream_name + "': " + natsStatus_GetText(s));
     }
 
-    state->message_source = make_uniq<NatsJetStreamBatchSource>(state->sub);
+    state->message_source = make_uniq<NatsJetStreamBatchSource>(state->sub, state->conn);
 
     return state;
 }
@@ -2464,7 +2464,7 @@ static unique_ptr<FunctionData> NatsCopyFromBind(ClientContext &context, CopyFro
     connection.url = ResolveNatsCopyUrl(input.info.options, "COPY FROM", &DEFAULT_NATS_URL);
     for (const auto &option : input.info.options) {
         if (!option.second.empty()) {
-            ParseNatsConnectionParameter(connection, option.first, option.second.front());
+            ParseNatsConnectionParameter(connection, string(option.first), option.second.front());
         }
     }
     ValidateNatsConnectionConfig(connection);

@@ -129,13 +129,13 @@ private:
             uint8_t value_tag;
             if (!ReadByte(value_tag)) return false;
             if (matched == DConstants::INVALID_INDEX) {
-                if (!SkipValueAfterTag(value_tag)) return false;
+                if (!SkipValueAfterTag(value_tag, 0)) return false;
             } else if (depth + 1 == field_paths[matched].size()) {
                 auto &vector = chunk.data[output_columns[matched]];
-                if (!ReadScalarToVector(value_tag, vector, row_idx) && !SkipValueAfterTag(value_tag)) return false;
+                if (!ReadScalarToVector(value_tag, vector, row_idx) && !SkipValueAfterTag(value_tag, 0)) return false;
             } else if ((value_tag & 0xf0) == 0x80 || value_tag == 0xde || value_tag == 0xdf) {
                 if (!DecodeMap(value_tag, depth + 1, chunk, row_idx, output_columns, field_paths)) return false;
-            } else if (!SkipValueAfterTag(value_tag)) {
+            } else if (!SkipValueAfterTag(value_tag, 0)) {
                 return false;
             }
         }
@@ -176,26 +176,27 @@ private:
         return true;
     }
 
-    bool SkipValue() {
+    bool SkipValue(idx_t depth) {
         uint8_t tag;
         if (!ReadByte(tag)) return false;
-        return SkipValueAfterTag(tag);
+        return SkipValueAfterTag(tag, depth);
     }
 
-    bool SkipValueAfterTag(uint8_t tag) {
+    bool SkipValueAfterTag(uint8_t tag, idx_t depth) {
+        if (depth > MAX_DECODE_DEPTH) return false;
         if (tag <= 0x7f || tag >= 0xe0) return true;
         if ((tag & 0xe0) == 0xa0) {
             return remaining >= (tag & 0x1f) ? (data += (tag & 0x1f), remaining -= (tag & 0x1f), true) : false;
         }
         if ((tag & 0xf0) == 0x90) {
-            for (uint32_t i = 0; i < (tag & 0x0f); i++) if (!SkipValue()) return false;
+            for (uint32_t i = 0; i < (tag & 0x0f); i++) if (!SkipValue(depth + 1)) return false;
             return true;
         }
         uint32_t count;
         uint64_t number;
         if ((tag & 0xf0) == 0x80 || tag == 0xde || tag == 0xdf) {
             if (!ReadMapCount(tag, count)) return false;
-            for (uint32_t i = 0; i < count; i++) if (!SkipValue() || !SkipValue()) return false;
+            for (uint32_t i = 0; i < count; i++) if (!SkipValue(depth + 1) || !SkipValue(depth + 1)) return false;
             return true;
         }
         idx_t bytes = 0;
@@ -208,12 +209,14 @@ private:
         case 0xd9: case 0xc4: if (!ReadUnsigned(1, number)) return false; bytes = number; break;
         case 0xda: case 0xc5: if (!ReadUnsigned(2, number)) return false; bytes = number; break;
         case 0xdb: case 0xc6: if (!ReadUnsigned(4, number)) return false; bytes = number; break;
-        case 0xdc: if (!ReadUnsigned(2, number)) return false; for (uint32_t i = 0; i < number; i++) if (!SkipValue()) return false; return true;
-        case 0xdd: if (!ReadUnsigned(4, number)) return false; for (uint32_t i = 0; i < number; i++) if (!SkipValue()) return false; return true;
+        case 0xdc: if (!ReadUnsigned(2, number)) return false; for (uint32_t i = 0; i < number; i++) if (!SkipValue(depth + 1)) return false; return true;
+        case 0xdd: if (!ReadUnsigned(4, number)) return false; for (uint32_t i = 0; i < number; i++) if (!SkipValue(depth + 1)) return false; return true;
         default: return false;
         }
         return bytes <= remaining ? (data += bytes, remaining -= bytes, true) : false;
     }
+
+    static constexpr idx_t MAX_DECODE_DEPTH = 256;
 
     const uint8_t *data;
     idx_t remaining;
@@ -467,17 +470,18 @@ private:
             uint8_t major = value_tag >> 5;
             if (matched != DConstants::INVALID_INDEX && depth + 1 == field_paths[matched].size()) {
                 auto &vector = chunk.data[output_columns[matched]];
-                if (!SetScalar(major, value_tag & 0x1f, vector, row_idx) && !Skip(value_tag)) return false;
+                if (!SetScalar(major, value_tag & 0x1f, vector, row_idx) && !Skip(value_tag, 0)) return false;
             } else if (matched != DConstants::INVALID_INDEX && major == 5) {
                 if (!DecodeMap(value_tag, depth + 1, chunk, row_idx, output_columns, field_paths)) return false;
-            } else if (!Skip(value_tag)) {
+            } else if (!Skip(value_tag, 0)) {
                 return false;
             }
         }
         return true;
     }
 
-    bool Skip(uint8_t tag) {
+    bool Skip(uint8_t tag, idx_t depth) {
+        if (depth > MAX_DECODE_DEPTH) return false;
         uint8_t major = tag >> 5;
         uint8_t additional = tag & 0x1f;
         uint64_t count;
@@ -490,17 +494,19 @@ private:
             uint64_t elements = major == 5 ? count * 2 : count;
             for (uint64_t i = 0; i < elements; i++) {
                 uint8_t child;
-                if (!ReadByte(child) || !Skip(child)) return false;
+                if (!ReadByte(child) || !Skip(child, depth + 1)) return false;
             }
             return true;
         }
         if (major == 6) {
-            return ReadArgument(additional, count) && ReadByte(additional) && Skip(additional);
+            return ReadArgument(additional, count) && ReadByte(additional) && Skip(additional, depth + 1);
         }
         if (additional < 24) return true;
         return additional == 24 ? ReadUnsigned(1, count) : additional == 25 ? ReadUnsigned(2, count) :
                additional == 26 ? ReadUnsigned(4, count) : additional == 27 ? ReadUnsigned(8, count) : false;
     }
+
+    static constexpr idx_t MAX_DECODE_DEPTH = 256;
 
     const uint8_t *data;
     idx_t remaining;

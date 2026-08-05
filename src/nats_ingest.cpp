@@ -81,6 +81,10 @@ struct NatsIngestStopBindData : public TableFunctionData {
     string job_name;
 };
 
+struct NatsIngestRemoveBindData : public TableFunctionData {
+    string job_name;
+};
+
 struct NatsIngestPauseBindData : public TableFunctionData {
     string job_name;
 };
@@ -417,13 +421,8 @@ static void ClaimIngestLease(Connection &conn, const shared_ptr<NatsIngestJobSta
             << "lease_until = " << now_sql << " + INTERVAL '" << NATS_INGEST_LEASE_SECONDS
             << " seconds', updated_at = " << now_sql << " WHERE stream_name = "
             << SqlStringLiteral(job->config.stream_name) << " AND durable_name = "
-            << SqlStringLiteral(job->config.durable_name) << " AND (";
-        if (job->lease_fd >= 0) {
-            sql << "TRUE";
-        } else {
-            sql << "lease_until <= " << now_sql << " OR owner_id = " << SqlStringLiteral(job->lease_owner_id);
-        }
-        sql << ")";
+            << SqlStringLiteral(job->config.durable_name) << " AND ("
+            << "lease_until <= " << now_sql << " OR owner_id = " << SqlStringLiteral(job->lease_owner_id) << ")";
         ExecuteOrThrow(conn, sql.str(), "Failed to update ingest lease claim");
 
         auto result = conn.Query("SELECT owner_id, fencing_token FROM " + string(NATS_INGEST_LEASE_TABLE) +
@@ -466,11 +465,12 @@ static void FenceIngestCommit(Connection &conn, const shared_ptr<NatsIngestJobSt
 }
 
 static void ReleaseIngestLease(const shared_ptr<NatsIngestJobState> &job) {
-    if (!job->db || job->lease_owner_id.empty() || job->fencing_token == 0) {
+    auto db_instance = job->db.lock();
+    if (!db_instance || job->lease_owner_id.empty() || job->fencing_token == 0) {
         return;
     }
     try {
-        Connection conn(*job->db);
+        Connection conn(*db_instance);
         EnsureActiveTransaction(conn);
         MarkTransactionWrite(conn);
         ExecuteOrThrow(conn, "DELETE FROM " + string(NATS_INGEST_LEASE_TABLE) + " WHERE stream_name = " +
@@ -929,18 +929,20 @@ static unique_ptr<PreparedStatement> PrepareCheckpointStatement(Connection &conn
     return statement;
 }
 
-static void AckMessages(const std::vector<natsMsg *> &messages, const string &stream_name) {
-    for (auto *msg : messages) {
+static void AckMessages(std::vector<natsMsg *> &messages, const string &stream_name) {
+    for (auto *&msg : messages) {
         if (!msg) {
             continue;
         }
         auto status = natsMsg_Ack(msg, nullptr);
         if (status != NATS_OK) {
             natsMsg_Destroy(msg);
+            msg = nullptr;
             throw std::runtime_error(std::string("Failed to ack JetStream message from '") + stream_name + "': " +
                                      natsStatus_GetText(status));
         }
         natsMsg_Destroy(msg);
+        msg = nullptr;
     }
 }
 
@@ -1424,7 +1426,11 @@ static void IngestClosed(natsConnection *, void *closure) {
 
 static void InitializeIngestResources(const shared_ptr<NatsIngestJobState> &job) {
     auto &config = job->config;
-    Connection db_connection(*job->db);
+    auto db_instance = job->db.lock();
+    if (!db_instance) {
+        throw std::runtime_error("Ingest job '" + job->config.job_name + "' database instance is no longer available");
+    }
+    Connection db_connection(*db_instance);
     EnsureCheckpointTable(db_connection);
 
     if (!config.proto_fields.empty() && config.proto_field_paths.empty()) {
@@ -1567,8 +1573,12 @@ static shared_ptr<NatsIngestJobState> LaunchIngestJob(const NatsIngestConfig &co
         } else {
             throw std::runtime_error("Missing database context for ingest job launch");
         }
+        auto db_instance = job->db.lock();
+        if (!db_instance) {
+            throw std::runtime_error("Ingest job '" + job->config.job_name + "' database instance is no longer available");
+        }
         {
-            Connection db_connection(*job->db);
+            Connection db_connection(*db_instance);
             EnsureRegistryTable(db_connection);
             AcquireIngestProcessLock(job);
             ClaimIngestLease(db_connection, job);
@@ -1578,7 +1588,7 @@ static shared_ptr<NatsIngestJobState> LaunchIngestJob(const NatsIngestConfig &co
             RestoreJobProgress(job, *restore_snapshot);
         }
         {
-            Connection db_connection(*job->db);
+            Connection db_connection(*db_instance);
             EnsureRegistryTable(db_connection);
             PersistRegistry(db_connection, job);
         }
@@ -1899,7 +1909,11 @@ static void RunIngestWorker(const shared_ptr<NatsIngestJobState> &job) {
             config.batch_size <= 65536 / std::min<uint64_t>(transport_batch_multiplier, 65536)) {
             transport_batch_size = std::min<uint64_t>(65536, config.batch_size * transport_batch_multiplier);
         }
-        Connection db_connection(*job->db);
+        auto worker_db_instance = job->db.lock();
+        if (!worker_db_instance) {
+            throw std::runtime_error("Ingest job '" + job->config.job_name + "' database instance is no longer available");
+        }
+        Connection db_connection(*worker_db_instance);
         const char *fail_after_commit_env = std::getenv("NATS_INGEST_FAIL_AFTER_COMMIT");
         bool inject_fail_after_commit = fail_after_commit_env != nullptr && string(fail_after_commit_env) != "0";
         bool injected_fail_after_commit = false;
@@ -2365,8 +2379,9 @@ static void RunIngestWorker(const shared_ptr<NatsIngestJobState> &job) {
             job->progress.last_error = ex.what();
         }
         job->cv.notify_all();
-        if (job->db) {
-            Connection db_connection(*job->db);
+        auto cleanup_db_instance = job->db.lock();
+        if (cleanup_db_instance) {
+            Connection db_connection(*cleanup_db_instance);
             try {
                 EnsureRegistryTable(db_connection);
                 PersistRegistry(db_connection, job);
@@ -2386,8 +2401,9 @@ static void RunIngestWorker(const shared_ptr<NatsIngestJobState> &job) {
             job->progress.last_error = "Unknown ingest worker failure";
         }
         job->cv.notify_all();
-        if (job->db) {
-            Connection db_connection(*job->db);
+        auto cleanup_db_instance = job->db.lock();
+        if (cleanup_db_instance) {
+            Connection db_connection(*cleanup_db_instance);
             try {
                 EnsureRegistryTable(db_connection);
                 PersistRegistry(db_connection, job);
@@ -2436,10 +2452,21 @@ NatsIngestManager &NatsIngestManager::Get() {
 shared_ptr<NatsIngestJobState> NatsIngestManager::CreateJob(NatsIngestConfig config) {
     auto job = make_shared_ptr<NatsIngestJobState>(std::move(config));
     lock_guard<std::mutex> guard(mutex_);
-    auto [it, inserted] = jobs_.emplace(job->config.job_name, job);
-    if (!inserted) {
-        throw std::runtime_error("Ingest job '" + job->config.job_name + "' already exists");
+    auto it = jobs_.find(job->config.job_name);
+    if (it != jobs_.end()) {
+        bool existing_running;
+        {
+            lock_guard<std::mutex> job_guard(it->second->job_mutex);
+            existing_running = it->second->progress.running;
+        }
+        if (existing_running) {
+            throw std::runtime_error("Ingest job '" + job->config.job_name + "' already exists");
+        }
+        // A previous job under this name has already stopped or failed: drop it so its
+        // connection/subscription/thread are released and the name can be reused.
+        jobs_.erase(it);
     }
+    jobs_.emplace(job->config.job_name, job);
     return job;
 }
 
@@ -2503,7 +2530,18 @@ bool NatsIngestManager::StopJob(const string &job_name) {
 
 bool NatsIngestManager::RemoveJob(const string &job_name) {
     lock_guard<std::mutex> guard(mutex_);
-    return jobs_.erase(job_name) > 0;
+    auto it = jobs_.find(job_name);
+    if (it == jobs_.end()) {
+        return false;
+    }
+    {
+        lock_guard<std::mutex> job_guard(it->second->job_mutex);
+        if (it->second->progress.running) {
+            throw std::runtime_error("Ingest job '" + job_name + "' is still running; stop it before removing");
+        }
+    }
+    jobs_.erase(it);
+    return true;
 }
 
 static unique_ptr<FunctionData> NatsIngestStartBind(ClientContext &context, TableFunctionBindInput &input,
@@ -2724,6 +2762,50 @@ static void NatsIngestStopExecute(ClientContext &context, TableFunctionInput &da
     state.done = true;
 }
 
+static unique_ptr<FunctionData> NatsIngestRemoveBind(ClientContext &context, TableFunctionBindInput &input,
+                                                     vector<LogicalType> &return_types, vector<string> &names) {
+    string job_name;
+    bool has_job_name = false;
+    for (auto &kv : input.named_parameters) {
+        if (kv.first == "job_name") {
+            job_name = StringValue::Get(kv.second);
+            has_job_name = true;
+        }
+    }
+    if (!has_job_name) {
+        throw std::runtime_error("job_name parameter is required");
+    }
+    AddSnapshotColumns(return_types, names);
+    auto bind_data = make_uniq<NatsIngestRemoveBindData>();
+    bind_data->job_name = std::move(job_name);
+    return bind_data;
+}
+
+static unique_ptr<GlobalTableFunctionState> NatsIngestRemoveInitGlobal(ClientContext &context,
+                                                                       TableFunctionInitInput &input) {
+    auto &bind_data = input.bind_data->Cast<NatsIngestRemoveBindData>();
+    auto job = NatsIngestManager::Get().GetJob(bind_data.job_name);
+    if (!job) {
+        throw std::runtime_error("Ingest job '" + bind_data.job_name + "' does not exist");
+    }
+    auto state = make_uniq<NatsIngestControlGlobalState>();
+    state->jobs.push_back(job);
+    NatsIngestManager::Get().RemoveJob(bind_data.job_name);
+    return state;
+}
+
+static void NatsIngestRemoveExecute(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
+    auto &state = data_p.global_state->Cast<NatsIngestControlGlobalState>();
+    if (state.done) {
+        output.SetCardinality(0);
+        return;
+    }
+    auto snapshot = SnapshotJob(state.jobs[0]);
+    FillSnapshotColumns(output, 0, snapshot);
+    output.SetCardinality(1);
+    state.done = true;
+}
+
 static unique_ptr<FunctionData> NatsIngestStatusBind(ClientContext &context, TableFunctionBindInput &input,
                                                      vector<LogicalType> &return_types, vector<string> &names) {
     string job_name;
@@ -2846,6 +2928,11 @@ void NatsIngestFunction::Register(ExtensionLoader &loader) {
     TableFunction stop_fn("nats_stop_ingest", {}, NatsIngestStopExecute, NatsIngestStopBind, NatsIngestStopInitGlobal);
     stop_fn.named_parameters["job_name"] = LogicalType(LogicalTypeId::VARCHAR);
     loader.RegisterFunction(stop_fn);
+
+    TableFunction remove_fn("nats_remove_ingest", {}, NatsIngestRemoveExecute, NatsIngestRemoveBind,
+                            NatsIngestRemoveInitGlobal);
+    remove_fn.named_parameters["job_name"] = LogicalType(LogicalTypeId::VARCHAR);
+    loader.RegisterFunction(remove_fn);
 
     TableFunction pause_fn("nats_pause_ingest", {}, NatsIngestPauseExecute, NatsIngestPauseBind, NatsIngestPauseInitGlobal);
     pause_fn.named_parameters["job_name"] = LogicalType(LogicalTypeId::VARCHAR);

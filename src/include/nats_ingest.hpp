@@ -81,7 +81,11 @@ struct NatsIngestJobState {
 
     NatsIngestConfig config;
     NatsIngestProgress progress;
-    shared_ptr<DatabaseInstance> db;
+    // Weak: this job can outlive the DatabaseInstance's normal owner (e.g. it sits
+    // stopped-but-not-removed in NatsIngestManager's static map). Holding a strong
+    // ref here would make this job the last owner, deferring ~DatabaseInstance() to
+    // static teardown at process exit, which crashes. Lock and null-check on use.
+    weak_ptr<DatabaseInstance> db;
     std::mutex job_mutex;
     std::condition_variable cv;
     std::thread worker;

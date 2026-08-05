@@ -54,7 +54,6 @@ struct NatsSubscribeProgress {
     bool pause_requested = false;
     bool stop_requested = false;
     bool failed = false;
-    bool resubscribe_requested = false;
     uint64_t rows_inserted = 0;
     uint64_t batches_committed = 0;
     uint64_t pending_messages = 0;
@@ -80,7 +79,11 @@ struct NatsSubscribeJobState {
 
     NatsSubscribeConfig config;
     NatsSubscribeProgress progress;
-    shared_ptr<DatabaseInstance> db;
+    // Weak: this job can outlive the DatabaseInstance's normal owner (e.g. it sits
+    // stopped-but-not-removed in NatsSubscribeManager's static map). Holding a strong
+    // ref here would make this job the last owner, deferring ~DatabaseInstance() to
+    // static teardown at process exit, which crashes. Lock and null-check on use.
+    weak_ptr<DatabaseInstance> db;
 
     std::mutex mutex;
     std::condition_variable cv;
