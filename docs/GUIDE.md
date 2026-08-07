@@ -1,6 +1,6 @@
 # DuckDB NATS JetStream Extension - Full Guide
 
-A DuckDB extension that enables SQL queries over NATS JetStream message streams. This extension allows DuckDB to read messages directly from JetStream streams as table data, supporting sequence and timestamp-based range queries with JSON and Protocol Buffers payload extraction.
+A DuckDB extension that enables SQL queries over NATS JetStream message streams and KV buckets. It supports sequence- and timestamp-based range scans over JetStream streams with JSON, MessagePack, CBOR, FlexBuffers, and Protocol Buffers payload extraction; durable-consumer ingest and core NATS live subscriptions that batch messages into DuckDB tables; and point CRUD, bulk access, and live watch jobs over JetStream KV buckets.
 
 ## Installation
 
@@ -13,35 +13,21 @@ INSTALL nats_js FROM community;
 LOAD nats_js;
 ```
 
-This method automatically downloads the pre-built extension binary for your platform. No compilation required.
-
-**Note**: This extension requires the NATS C client library and Protocol Buffers library to be installed on your system:
-
-```bash
-# macOS
-brew install cnats protobuf
-
-# Ubuntu/Debian
-sudo apt-get install libnats-dev libprotobuf-dev
-
-# Fedora/RHEL
-sudo dnf install cnats-devel protobuf-devel
-```
+This method automatically downloads the pre-built extension binary for your platform. No compilation required, and no separate NATS C client, Protocol Buffers, or libsodium/OpenSSL install is needed — the CI-built binary links its native dependencies statically (vcpkg's default triplet builds `cnats`, `protobuf`, `flatbuffers`, and their own transitive dependencies as static libraries bundled into the single `.duckdb_extension` file).
 
 ### Building from Source
 
 For development or if you need to build from source:
 
 **Prerequisites:**
-- DuckDB v1.4.1
-- NATS C client library (v3.11.0 or later)
-- Protocol Buffers library (v3.0 or later)
+- DuckDB v1.5.5 (the pinned `duckdb/` submodule; DuckDB 1.5.x/main "tip" APIs are also supported, see `src/include/nats_duckdb_compat.hpp`)
 - CMake 3.15 or later
 - C++17 compatible compiler
+- [vcpkg](https://vcpkg.io) (recommended — see below) or system installs of the NATS C client (cnats), Protocol Buffers, and FlatBuffers
 
 **Build steps:**
 
-Clone the repository and initialize submodules:
+Clone the repository and initialize submodules (this also pulls the vendored `vcpkg/` submodule):
 
 ```bash
 git clone https://github.com/brannn/duckdb-nats-jetstream
@@ -49,19 +35,43 @@ cd duckdb-nats-jetstream
 git submodule update --init --recursive
 ```
 
-Install the required libraries. On macOS with Homebrew:
+**Recommended: build via vcpkg.** This repo vendors vcpkg as a submodule, already
+pinned to the commit its `vcpkg.json` manifest requires, and ships a prebuilt
+`vcpkg/vcpkg` binary — no bootstrap step needed. The extension's actual native
+dependency is just `cnats` (`vcpkg.json`), but `cnats` itself pulls in
+`libsodium`, `openssl`, and `protobuf-c` transitively (for NATS TLS and
+NKey/JWT auth), plus `protobuf` and `flatbuffers` are direct dependencies of
+this extension. vcpkg builds all of them from source into a local,
+user-writable prefix — no system package manager or root access required,
+as long as a compiler toolchain (perl, autoconf/automake/libtool for the
+autotools-based `libsodium` port, etc.) is already on `PATH`.
 
 ```bash
-brew install cnats protobuf
+export VCPKG_TOOLCHAIN_PATH="$(pwd)/vcpkg/scripts/buildsystems/vcpkg.cmake"
+make debug    # or: make release
 ```
 
-On Ubuntu/Debian:
+The first build compiles OpenSSL, libsodium, Protobuf, FlatBuffers, and cnats
+from source alongside DuckDB itself, so expect it to take significantly
+longer than an incremental build. This is also the path CI uses
+(`.github/workflows/MainDistributionPipeline.yml`), so it's the most
+reliable way to reproduce a CI build locally.
+
+**Alternative: system-installed libraries.** If you'd rather not use vcpkg,
+you need `cnats`, `protobuf`, and `flatbuffers` discoverable via CMake's
+`find_package(... CONFIG REQUIRED)`, which most distro packages do not
+provide out of the box (Homebrew's `cnats`/`protobuf` formulas are closer,
+but package availability varies by platform and version). Without
+`VCPKG_TOOLCHAIN_PATH` set, `make debug`/`make release` falls back to this
+path:
 
 ```bash
+# macOS
+brew install cnats protobuf
+
+# Ubuntu/Debian (package availability varies; may not satisfy CMake CONFIG lookups)
 sudo apt-get install libnats-dev libprotobuf-dev protobuf-compiler
 ```
-
-Build the extension:
 
 ```bash
 make build
@@ -389,29 +399,37 @@ LIMIT 5;
 
 Understanding the extension's implementation approach helps explain its performance characteristics and operational behavior.
 
-### Direct Get API
+### Batched Pull Consumers For Message Retrieval
 
-The extension uses NATS JetStream's Direct Get API for message retrieval. This API allows fetching individual messages by sequence number without establishing a consumer. Direct Get provides low-latency access to historical messages and avoids the overhead of consumer management for ad-hoc queries.
+`nats_scan` retrieves the bulk message range through an ephemeral JetStream
+pull consumer (`js_PullSubscribe`), fetching messages in batches
+(`jsFetchRequest`, sized by `batch_size` and bounded by `fetch_timeout_ms`)
+rather than issuing one request per row. This amortizes round-trip overhead
+across large scans and is the primary retrieval path for both sequence-range
+and subject-filtered queries.
 
-The extension does not create durable or ephemeral consumers for typical query operations. Each message fetch is an independent operation that retrieves a single message by sequence number. This approach is optimal for bounded historical queries where the query range is known in advance.
+JetStream's Direct Get API (`js_DirectGetMsg`) is used narrowly for resolving
+a single message by sequence number without the overhead of standing up a
+consumer — specifically as the building block for the binary search
+described below, not as the general scan mechanism.
 
 ### Binary Search for Timestamp Resolution
 
 When queries specify timestamp ranges using `start_time` or `end_time` parameters, the extension must resolve these timestamps to sequence numbers. The implementation uses binary search over the stream's sequence range to find the first message at or after the target timestamp.
 
-The binary search algorithm uses Direct Get to fetch messages at the midpoint of the current search range, compares their timestamps to the target, and narrows the range accordingly. This provides O(log n) performance for timestamp resolution, where n is the number of messages in the stream. For a stream with one million messages, timestamp resolution requires approximately 20 message fetches.
+The binary search algorithm uses Direct Get to fetch the single message at the midpoint of the current search range, compares its timestamp to the target, and narrows the range accordingly. This provides O(log n) performance for timestamp resolution, where n is the number of messages in the stream. For a stream with one million messages, timestamp resolution requires approximately 20 message fetches.
 
-After resolving timestamps to sequences, the extension uses the same Direct Get approach to retrieve messages in the resolved sequence range. Subject filtering, when specified, is applied during message iteration rather than during timestamp resolution.
+After resolving timestamps to sequences, the extension switches to the batched pull-consumer path described above to retrieve messages in the resolved sequence range. Subject filtering, when specified, is applied during message iteration rather than during timestamp resolution.
 
 ### Resource Management
 
-The extension manages NATS connections and JetStream contexts using RAII patterns. Connections are established during the table function's initialization phase and cleaned up automatically when the query completes. Connection timeouts are set to 5 seconds to prevent indefinite blocking on unreachable servers.
+The extension manages NATS connections and JetStream contexts using RAII patterns. Connections are established during the table function's initialization phase and cleaned up automatically when the query completes. Connection timeouts are set to 5 seconds to prevent indefinite blocking on unreachable servers. On transient disconnects mid-scan, `nats_scan`'s batch fetch retries automatically rather than failing the query outright.
 
 The extension uses the NATS C client library (cnats) for all NATS protocol operations and yyjson for JSON parsing. Both libraries are production-tested and provide the necessary performance for analytical workloads.
 
 ### Execution Model
 
-The extension executes in a single-threaded model. Each query establishes one connection to the NATS server and fetches messages sequentially. Messages are returned to DuckDB in batches of up to 2048 rows (STANDARD_VECTOR_SIZE), allowing DuckDB to process results incrementally.
+`nats_scan` executes as a single-threaded table function: each query establishes one connection to the NATS server and pulls message batches sequentially. Messages are returned to DuckDB in batches of up to `STANDARD_VECTOR_SIZE` rows (2048 by default), allowing DuckDB to process results incrementally. Ingest and live-subscribe jobs (`nats_start_ingest`, `nats_start_subscribe`, `nats_start_kv_watch`) run as separate background worker threads independent of query execution — see their sections below.
 
 ### Performance Behavior
 
@@ -471,7 +489,7 @@ NATS instance when comparing runs.
 
 ## API Reference
 
-The `nats_scan` table function accepts the following parameters:
+### `nats_scan`
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
@@ -484,46 +502,159 @@ The `nats_scan` table function accepts the following parameters:
 | `end_seq` | UBIGINT | No | Last message | Ending sequence number (inclusive) |
 | `start_time` | TIMESTAMP | No | - | Starting timestamp (inclusive) |
 | `end_time` | TIMESTAMP | No | - | Ending timestamp (inclusive) |
-| `json_extract` | LIST(VARCHAR) | No | - | List of JSON field names to extract |
+| `batch_size` | UBIGINT | No | - | Pull-consumer fetch batch size |
+| `fetch_timeout_ms` | BIGINT | No | 1000 | Max wait per batch fetch, in milliseconds |
+| `json_extract` | LIST(VARCHAR) | No | - | JSON field paths to extract (dot notation for nested fields) |
+| `msgpack_extract` | LIST(VARCHAR) | No | - | MessagePack map field paths to extract |
+| `cbor_extract` | LIST(VARCHAR) | No | - | CBOR map field paths to extract |
+| `flexbuffers_extract` | LIST(VARCHAR) | No | - | FlexBuffers map field paths to extract |
 | `proto_file` | VARCHAR | No | - | Path to .proto schema file |
 | `proto_message` | VARCHAR | No | - | Protobuf message type name |
-| `proto_extract` | LIST(VARCHAR) | No | - | List of protobuf field paths to extract (supports dot notation for nested fields) |
+| `proto_extract` | LIST(VARCHAR) | No | - | Protobuf field paths to extract (dot notation for nested fields) |
+| `credentials_file` | VARCHAR | No | - | Path to a NATS `.creds` file (JWT + NKey seed) |
+| `tls_ca_file` | VARCHAR | No | - | Path to a TLS CA certificate |
+| `tls_cert_file` | VARCHAR | No | - | Path to a TLS client certificate (requires `tls_key_file`) |
+| `tls_key_file` | VARCHAR | No | - | Path to a TLS client private key (requires `tls_cert_file`) |
+| `tls_server_name` | VARCHAR | No | - | Expected TLS server hostname |
+| `tls_skip_verify` | BOOLEAN | No | false | Disable server certificate verification (local testing only) |
 
 ### Parameter Constraints
 
 Sequence-based parameters (`start_seq`, `end_seq`) cannot be combined with timestamp-based parameters (`start_time`, `end_time`) in the same query. The extension will return an error if both parameter types are specified.
 
-The `json_extract` and `proto_extract` parameters are mutually exclusive. Use `json_extract` for JSON-encoded messages or `proto_extract` for protobuf-encoded messages, but not both in the same query.
+The extraction parameters (`json_extract`, `msgpack_extract`, `cbor_extract`, `flexbuffers_extract`, `proto_extract`) are mutually exclusive — use exactly one, matching your payload's encoding.
 
 When using `proto_extract`, both `proto_file` and `proto_message` parameters are required. The `proto_file` parameter specifies the path to the .proto schema file, and `proto_message` specifies the message type name within that file.
 
-Extracted fields (JSON or protobuf) are appended as additional columns after the five base columns (`stream`, `subject`, `seq`, `ts_nats`, `payload`). Column names for nested protobuf fields use underscores instead of dots (e.g., `location.zone` becomes `location_zone`).
+Extracted fields are appended as additional columns after the five base columns (`stream`, `subject`, `seq`, `ts_nats`, `payload`). Column names for nested protobuf fields use underscores instead of dots (e.g., `location.zone` becomes `location_zone`).
+
+### JetStream Ingest (`nats_start_ingest` and friends)
+
+`nats_start_ingest` launches a background job that batch-inserts JetStream
+messages into a DuckDB table via a durable pull consumer, with checkpointing
+and exactly-once delivery across restarts. It accepts the same connection,
+subject-filter, and payload-extraction parameters as `nats_scan` (`url`,
+`credentials_file`, `tls_*`, `nats_subject`, `subject_contains`,
+`json_extract`/`msgpack_extract`/`cbor_extract`/`flexbuffers_extract`/
+`proto_extract` + `proto_file`/`proto_message`), plus:
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `job_name` | VARCHAR | Yes | - | Unique name identifying this ingest job |
+| `stream_name` | VARCHAR | Yes | - | JetStream stream to consume |
+| `target_table` | VARCHAR | Yes | - | Destination DuckDB table |
+| `durable_name` | VARCHAR | No | - | Durable consumer name (enables checkpointed resume) |
+| `create_target_table` | BOOLEAN | No | false | Create `target_table` if it doesn't exist |
+| `start_seq` | UBIGINT | No | 1 | Starting sequence for a first run (ignored on resume) |
+| `batch_size` | UBIGINT | No | - | Pull-consumer fetch batch size |
+| `fetch_timeout_ms` | BIGINT | No | - | Max wait per batch fetch, in milliseconds |
+| `poll_ms` | BIGINT | No | - | Worker poll interval between fetch attempts |
+
+Control and status functions: `nats_stop_ingest(job_name := ...)`,
+`nats_pause_ingest(...)`, `nats_resume_ingest(...)`, `nats_remove_ingest(...)`
+(stops and forgets the job, freeing the name for reuse), `nats_ingest_status(...)`,
+and `nats_ingest_jobs()` (lists all jobs). Ingest jobs also claim a
+fencing-token-backed ownership lease keyed by `(stream_name, durable_name)` so
+a second process can't write concurrently against the same durable consumer.
+
+### Core NATS Live Subscribe (`nats_start_subscribe` and friends)
+
+`nats_start_subscribe` batches messages from a core NATS subject (no
+JetStream replay, no durable resume) into a target table. It accepts the same
+connection and payload-extraction parameters as `nats_scan`, plus:
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `job_name` | VARCHAR | Yes | - | Unique name identifying this subscribe job |
+| `target_table` | VARCHAR | Yes | - | Destination DuckDB table |
+| `subject` | VARCHAR | Yes | - | Core NATS subject to subscribe to |
+| `queue_group` | VARCHAR | No | - | NATS queue group for load-balanced delivery |
+| `create_target_table` | BOOLEAN | No | false | Create `target_table` if it doesn't exist |
+| `batch_size` | UBIGINT | No | - | Rows batched per insert |
+| `poll_ms` | BIGINT | No | - | Worker poll interval |
+| `subject_column` / `payload_column` | VARCHAR | No | - | Override default column names for subject/payload |
+| `pending_message_limit` | BIGINT | No | 65536 | Client-side pending queue limit (messages); `-1` for unbounded |
+| `pending_bytes_limit` | BIGINT | No | 67108864 | Client-side pending queue limit (bytes); `-1` for unbounded |
+
+Control and status functions: `nats_stop_subscribe(job_name := ...)`,
+`nats_pause_subscribe(...)`, `nats_resume_subscribe(...)`,
+`nats_remove_subscribe(...)`, `nats_subscribe_status(...)` (reports
+`connected`, `reconnecting`, `messages_delivered`, `messages_dropped`, and
+pending-queue depth), and `nats_subscribe_jobs()`. Core NATS delivery is
+lossy under sustained overload — use JetStream ingest when no-loss delivery
+is required.
+
+### JetStream KV Store
+
+Point operations, each accepting the standard connection parameters
+(`url`, `credentials_file`, `tls_*`):
+
+| Function | Positional Args | Notes |
+|----------|------------------|-------|
+| `nats_kv_get(bucket, key)` | bucket VARCHAR, key VARCHAR | Returns `bucket, key, value, revision, created, operation` |
+| `nats_kv_put(bucket, key, value)` | + value VARCHAR | Unconditional write; returns `bucket, key, revision` |
+| `nats_kv_create(bucket, key, value)` | + value VARCHAR | Fails if the key already exists |
+| `nats_kv_update(bucket, key, value, revision)` | + expected revision BIGINT | Optimistic-concurrency write; fails if the key moved past `revision` |
+| `nats_kv_delete(bucket, key)` | + `purge := true/false` named param | Returns `bucket, key, deleted`; `purge` removes history instead of tombstoning |
+| `nats_kv_status(bucket)` | bucket VARCHAR | Returns `bucket, values, history, ttl_seconds, replicas, bytes` |
+| `nats_kv_create_bucket(bucket)` | + `history`, `ttl_seconds`, `max_bytes`, `replicas` named params | Returns `bucket, created` |
+| `nats_kv_delete_bucket(bucket)` | bucket VARCHAR | Returns `bucket, deleted` |
+
+Bulk access:
+
+| Function | Args | Notes |
+|----------|------|-------|
+| `nats_kv_scan(bucket, key_filter := ..., since_revision := ...)` | bucket VARCHAR | Returns all matching keys; `since_revision` enables incremental re-scans |
+| `nats_kv_history(bucket, key)` | bucket VARCHAR, key VARCHAR | Full revision history for one key |
+
+`COPY <table> TO '<bucket>' (FORMAT nats_kv, key_column '...', value_column '...')`
+publishes rows as KV entries, accepting the same connection options plus
+`key_column`/`value_column` to select the source columns.
+
+### Live KV Watch (`nats_start_kv_watch` and friends)
+
+`nats_start_kv_watch` batches KV bucket change notifications into a target
+table, the same job-lifecycle pattern as `nats_start_subscribe`:
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `job_name` | VARCHAR | Yes | - | Unique name identifying this watch job |
+| `target_table` | VARCHAR | Yes | - | Destination DuckDB table |
+| `bucket` | VARCHAR | Yes | - | KV bucket to watch |
+| `key_filter` | VARCHAR | No | - | Restrict the watch to matching keys |
+| `batch_size` | UBIGINT | No | - | Rows batched per insert |
+| `poll_ms` | BIGINT | No | - | Worker poll interval |
+| `updates_only` | BOOLEAN | No | false | Skip the initial full-bucket snapshot, deliver only subsequent changes |
+| `ignore_deletes` | BOOLEAN | No | false | Don't emit rows for delete/purge operations |
+| `create_target_table` | BOOLEAN | No | false | Create `target_table` if it doesn't exist |
+| `key_column` / `value_column` | VARCHAR | No | - | Override default output column names |
+
+Control and status functions: `nats_stop_kv_watch(job_name := ...)`,
+`nats_pause_kv_watch(...)`, `nats_resume_kv_watch(...)`,
+`nats_remove_kv_watch(...)`, `nats_kv_watch_status(...)`, and
+`nats_kv_watch_jobs()`.
 
 ## Roadmap
 
-### Current Capabilities (MVP)
+### Current Capabilities
 
-- Bounded historical queries using Direct Get API
-- Sequence-based range queries (`start_seq`, `end_seq`)
-- Timestamp-based range queries with binary search (`start_time`, `end_time`)
-- Subject filtering (exact match)
-- JSON payload extraction with field mapping
-- Process-wide, modification-aware caching of parsed protobuf schemas
-- Protocol Buffers support:
-  - Runtime .proto schema parsing
-  - All primitive types (string, bytes, integers, floats, bool, enum)
-  - Nested message navigation with dot notation
-  - Automatic type mapping to DuckDB types
+- Bounded historical queries via batched JetStream pull consumers, plus Direct-Get-backed binary search for timestamp resolution
+- Sequence-based range queries (`start_seq`, `end_seq`) and timestamp-based range queries (`start_time`, `end_time`)
+- Server-side subject filtering (`nats_subject`, including wildcards) and client-side substring filtering (`subject_contains`)
+- Stream metadata helpers (`nats_stream_stats`/`nats_stream_info`, `nats_stream_range_stats`) for resume bounds and gap checks without a full scan
+- Payload extraction for JSON, MessagePack, CBOR, FlexBuffers, and Protocol Buffers (runtime .proto schema parsing, primitive types, nested message navigation with dot notation, automatic DuckDB type mapping), with process-wide caching of parsed protobuf schemas
+- `COPY FROM`/`COPY TO ... (FORMAT nats_js)` for reading into and publishing from tables, including structured (JSON/MessagePack/CBOR/FlexBuffers/protobuf) `COPY TO` payload serialization
+- Durable-consumer JetStream ingest (`nats_start_ingest`) with checkpointed resume, exactly-once delivery across redelivery/restart, pause/resume control, and a fencing-token-backed ownership lease for cross-process safety
+- Core NATS live subscriptions (`nats_start_subscribe`) with bounded backpressure, automatic reconnect handling, and pause/resume control (live-only — no JetStream replay or durable resume)
+- JetStream KV store: point CRUD (`nats_kv_get`/`put`/`create`/`update`/`delete`), optimistic-concurrency updates, bulk scan/history, bucket lifecycle management, and `COPY TO ... (FORMAT nats_kv)`
+- Live KV watch jobs (`nats_start_kv_watch`) batching bucket change notifications into a target table
+- File-based authentication and TLS (`credentials_file`, `tls_ca_file`, `tls_cert_file`, `tls_key_file`, `tls_server_name`, `tls_skip_verify`) across all connection-taking functions
+- Multi-platform builds: Linux, macOS, Windows, WebAssembly
 
 ### Planned Features
 
-#### Stateful Consumption
-- **Durable consumers** - Message acknowledgement for reliable ETL workflows
-- **Checkpoint management** - Resumable processing with state persistence
-- **Consumer groups** - Distributed processing across multiple workers
-
 #### Advanced Protocol Buffers
-- **Repeated fields** - Array support with proper DuckDB LIST type mapping
+- **Repeated fields** - Array support with proper DuckDB LIST type mapping (currently serialized as JSON arrays)
 - **Map fields** - Key-value map support with DuckDB MAP type
 - **Oneof fields** - Union type handling
 - **Any types** - Dynamic type resolution
@@ -532,27 +663,6 @@ Extracted fields (JSON or protobuf) are appended as additional columns after the
 
 #### Additional Data Formats
 - **Apache Avro** - Schema registry integration and binary encoding support
-- **MessagePack** - Compact binary JSON alternative
-- **CBOR** - Concise Binary Object Representation
-
-#### Live Streaming
-- **Tail function** - Unbounded reads for real-time data processing
-- **Backpressure management** - Flow control for high-throughput streams
-- **Push-based delivery** - Event-driven message consumption
-
-#### Core NATS Subscriptions
-- **Live subscription jobs** - `nats_start_subscribe` batches messages from a
-  core NATS subject into DuckDB.
-- **Operational controls** - `nats_pause_subscribe`, `nats_resume_subscribe`,
-  and `nats_stop_subscribe` manage the job lifecycle.
-- **Live-only semantics** - No JetStream replay, no durable resume, and no
-  server-side checkpointing.
-- **Status fields** - `nats_subscribe_status` reports pause state, row counts,
-  batch counts, and recent activity timestamps.
-- **Validation harness** - `scripts/run-subscribe-pause-resume-harness.sh`
-  exercises the pause/resume controls against local NATS.
-- **Benchmarking** - `scripts/benchmark-subscribe.sh` measures live subscribe
-  throughput and batch latency against the seeded `live.subscribe` subject.
 
 #### Performance Enhancements
 - **Parallel scanning** - Multi-threaded message retrieval for multi-subject streams
@@ -560,18 +670,10 @@ Extracted fields (JSON or protobuf) are appended as additional columns after the
 - **Connection pooling** - Reduce connection overhead for repeated queries
 
 #### Configuration & Usability
-- **Connection profiles** - Named connection configurations
-- **Credential management** - Support for NATS authentication (tokens, JWT, NKeys)
-- **TLS support** - Encrypted connections to NATS servers
-- **Stream discovery** - Automatic stream and subject enumeration
+- **Connection profiles** - Named, reusable connection configurations
+- **Stream discovery** - Automatic stream and subject enumeration (current stats functions require a known stream name)
 
-### Development Resources
-
-Detailed planning documentation is available in the `planning/` directory, including:
-- Complete development roadmap with milestones
-- Implementation specifications
-- Technical architecture decisions
-- Performance benchmarks and optimization strategies
+See [CHANGELOG.md](../CHANGELOG.md) for what shipped in each release.
 
 ## Development
 
@@ -593,7 +695,11 @@ Clean build artifacts:
 make clean
 ```
 
-Additional documentation for contributors is available in the `planning/` directory, including implementation plans, technical architecture, and development roadmap.
+See [CHANGELOG.md](../CHANGELOG.md) for release history and the Roadmap
+section above for planned work. The `scripts/` directory has deterministic
+regression harnesses and benchmarks for ingest, subscribe, KV, copy, and
+reconnect behavior — see the harness/benchmark references throughout this
+guide and [README.md](../README.md) for which one covers a given code path.
 
 ## License
 

@@ -4,6 +4,29 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.2.2] - 2026-08-05
+
+### Added
+- JetStream KV store support: point CRUD (`nats_kv_get`/`put`/`create`/`update`/`delete`),
+  optimistic-concurrency updates, bulk `nats_kv_scan`/`nats_kv_history`, bucket lifecycle
+  (`nats_kv_create_bucket`/`delete_bucket`, `nats_kv_status`), and `COPY TO ... (FORMAT nats_kv)`
+- Incremental `since_revision` mode for `nats_kv_scan`
+- Live KV watch job subsystem (`nats_start_kv_watch`, pause/resume/stop/status/jobs)
+- CBOR and FlexBuffers payload extraction for `nats_scan`, ingest, and subscribe
+- Structured `COPY TO` payload serialization for JSON, MessagePack, CBOR, FlexBuffers, and
+  Protocol Buffers, including nested, repeated, and protobuf map fields
+- `COPY FROM` ingest format
+- Process-wide, modification-aware caching of parsed protobuf schemas
+
+### Changed
+- Upgrade to DuckDB v1.5.5, with compatibility support for both the pinned checkout and
+  DuckDB "tip" APIs (`src/include/nats_duckdb_compat.hpp`)
+- Vectorized scalar serialization paths for structured COPY TO, FlexBuffers, and protobuf output
+- Reduced per-message payload copies and vectorized batch writes on the core NATS subscription path
+
+### Fixed
+- Various ingest and subscribe crash and correctness bugs
+
 ## [0.2.1] - 2026-03-30
 
 ### Added

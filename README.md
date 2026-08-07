@@ -1,7 +1,7 @@
 # DuckDB NATS JetStream Extension
 
 [![CI](https://github.com/brannn/duckdb-nats-jetstream/actions/workflows/MainDistributionPipeline.yml/badge.svg)](https://github.com/brannn/duckdb-nats-jetstream/actions/workflows/MainDistributionPipeline.yml)
-[![Version](https://img.shields.io/badge/Version-v0.2.1-orange)](https://github.com/brannn/duckdb-nats-jetstream/releases/tag/v0.2.1)
+[![Version](https://img.shields.io/badge/Version-v0.2.2-orange)](https://github.com/brannn/duckdb-nats-jetstream/releases/tag/v0.2.2)
 [![DuckDB Version](https://img.shields.io/badge/DuckDB-v1.5.5-blue)](https://github.com/duckdb/duckdb/releases/tag/v1.5.5)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/Platform-Linux%20%7C%20macOS%20%7C%20Windows%20%7C%20WebAssembly-lightgrey)](https://github.com/brannn/duckdb-nats-jetstream/actions)
@@ -101,6 +101,7 @@ ORDER BY seq;
 - **Protocol Buffers** - Native type support (VARCHAR, DOUBLE, BOOLEAN, INTEGER, etc.)
 - **Nested fields** - Access nested protobuf fields with dot notation
 - **Sequence ranges** - Query by message sequence numbers
+- **JetStream KV store** - Point CRUD, bulk scan/history, and live watch jobs for JetStream KV buckets
 - **Multi-platform** - Linux, macOS, Windows, WebAssembly
 
 ---
@@ -273,6 +274,41 @@ Ingest jobs also claim a lease keyed by stream and durable name. A fencing token
 is refreshed and checked in the same transaction as each target commit, so a
 second DuckDB process cannot write concurrently with an active owner. Run
 `scripts/run-ingest-ownership-harness.sh` to exercise cross-process contention.
+
+## JetStream KV Store
+
+Point CRUD and bulk access to JetStream KV buckets are available alongside the
+stream-scanning APIs:
+
+```sql
+-- Point operations
+SELECT * FROM nats_kv_put('config', 'feature.enabled', 'true');
+SELECT * FROM nats_kv_get('config', 'feature.enabled');
+SELECT * FROM nats_kv_delete('config', 'feature.enabled');
+
+-- Bulk scan and history
+SELECT bucket, key, value, revision, created, operation
+FROM nats_kv_scan('config', key_filter := 'feature.*');
+
+SELECT * FROM nats_kv_history('config', 'feature.enabled');
+```
+
+`nats_kv_create` and `nats_kv_update` provide optimistic-concurrency writes
+(`nats_kv_update` takes an expected `revision` and fails if the key has moved
+on). `nats_kv_scan` supports incremental reads via `since_revision`.
+`nats_kv_create_bucket` / `nats_kv_delete_bucket` manage bucket lifecycle, and
+`nats_kv_status` reports bucket metadata (`values`, `history`, `ttl_seconds`,
+`replicas`, `bytes`). A `COPY TO ... (FORMAT nats_kv)` writer publishes rows
+into a bucket using `key_column`/`value_column` options.
+
+For live change notification instead of point-in-time reads, use the KV watch
+job API: `nats_start_kv_watch(...)`, `nats_kv_watch_status(...)`,
+`nats_pause_kv_watch(...)`, `nats_resume_kv_watch(...)`, and
+`nats_stop_kv_watch(...)`. It batches KV updates into a target table the same
+way `nats_start_subscribe` batches core NATS messages, with `updates_only` and
+`ignore_deletes` options to control which KV operations are captured. See
+[docs/GUIDE.md](docs/GUIDE.md) for the full parameter reference and
+[docs/EXAMPLES.md](docs/EXAMPLES.md) for worked examples.
 
 ## Authentication And TLS
 

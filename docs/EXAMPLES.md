@@ -128,6 +128,114 @@ SELECT * FROM nats_pause_subscribe(job_name := 'live_subscribe_probe');
 SELECT * FROM nats_resume_subscribe(job_name := 'live_subscribe_probe');
 ```
 
+## JetStream KV Store
+
+### Point Reads and Writes
+
+```sql
+SELECT * FROM nats_kv_create_bucket('config', history := 5);
+
+SELECT * FROM nats_kv_put('config', 'feature.enabled', 'true');
+SELECT * FROM nats_kv_put('config', 'feature.rollout_pct', '25');
+
+SELECT bucket, key, value, revision, created, operation
+FROM nats_kv_get('config', 'feature.enabled');
+```
+
+`value` is returned as BLOB; cast to VARCHAR when the stored value is text:
+
+```sql
+SELECT key, CAST(value AS VARCHAR) AS value_text, revision
+FROM nats_kv_get('config', 'feature.enabled');
+```
+
+### Optimistic-Concurrency Updates
+
+`nats_kv_update` takes the revision you last read and fails if the key has
+moved on since, so concurrent writers don't silently clobber each other:
+
+```sql
+WITH current AS (
+    SELECT revision FROM nats_kv_get('config', 'feature.rollout_pct')
+)
+SELECT * FROM nats_kv_update(
+    'config', 'feature.rollout_pct', '50',
+    (SELECT revision FROM current)
+);
+```
+
+### Bulk Scan and History
+
+```sql
+-- All keys matching a prefix pattern
+SELECT bucket, key, value, revision, created, operation
+FROM nats_kv_scan('config', key_filter := 'feature.*');
+
+-- Incremental re-scan: only entries changed since a prior revision
+SELECT bucket, key, value, revision
+FROM nats_kv_scan('config', since_revision := 42);
+
+-- Full revision history for one key
+SELECT key, revision, created, operation
+FROM nats_kv_history('config', 'feature.enabled')
+ORDER BY revision;
+```
+
+### Bucket Lifecycle and Status
+
+```sql
+SELECT * FROM nats_kv_create_bucket(
+    'sessions', history := 1, ttl_seconds := 3600, replicas := 1
+);
+
+SELECT bucket, values, history, ttl_seconds, replicas, bytes
+FROM nats_kv_status('sessions');
+
+SELECT * FROM nats_kv_delete('config', 'feature.rollout_pct');       -- tombstone
+SELECT * FROM nats_kv_delete('config', 'feature.enabled', purge := true); -- remove history too
+
+SELECT * FROM nats_kv_delete_bucket('sessions');
+```
+
+### Publishing Rows Into a Bucket
+
+```sql
+CREATE TABLE kv_export(k VARCHAR, v VARCHAR);
+INSERT INTO kv_export VALUES ('device.pm5560-001.zone', 'dc1'), ('device.pm5560-002.zone', 'dc1');
+
+COPY kv_export
+TO 'config'
+(FORMAT nats_kv, url 'nats://127.0.0.1:4222', key_column 'k', value_column 'v');
+```
+
+## Live KV Watch
+
+Batch KV bucket changes into a target table instead of polling with repeated
+`nats_kv_scan` calls:
+
+```sql
+SELECT * FROM nats_start_kv_watch(
+    job_name := 'config_watch',
+    target_table := 'config_changes',
+    bucket := 'config',
+    key_filter := 'feature.*',
+    batch_size := 10,
+    poll_ms := 100,
+    create_target_table := true
+);
+
+SELECT rows_inserted, batches_committed, paused
+FROM nats_kv_watch_status(job_name := 'config_watch');
+
+SELECT * FROM nats_pause_kv_watch(job_name := 'config_watch');
+SELECT * FROM nats_resume_kv_watch(job_name := 'config_watch');
+SELECT * FROM nats_stop_kv_watch(job_name := 'config_watch');
+```
+
+Pass `updates_only := true` to skip the initial full-bucket snapshot and only
+receive changes going forward, and `ignore_deletes := true` to omit
+delete/purge operations from the target table.
+
 ## Copying Back To JetStream
 
 Export a query back into a JetStream stream with `COPY TO`:
