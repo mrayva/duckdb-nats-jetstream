@@ -23,6 +23,11 @@ build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
 
 # Find dependencies via vcpkg
+# OpenSSL and libsodium are transitive dependencies of cnats (TLS and NKey/JWT
+# auth). This extension doesn't call either library directly, but cnats'
+# exported CMake config does not call find_dependency() for them itself, so
+# the consuming project (us) must find_package() them before find_package
+# (cnats) or CMake can't resolve cnats::nats_static's link interface.
 find_package(OpenSSL REQUIRED)
 find_package(unofficial-sodium CONFIG REQUIRED)
 find_package(cnats CONFIG REQUIRED)
