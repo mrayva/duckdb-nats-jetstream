@@ -1,4 +1,5 @@
 #include "nats_subscribe.hpp"
+#include "nats_job_lifecycle.hpp"
 #include "nats_duckdb_compat.hpp"
 #include "nats_proto_schema.hpp"
 
@@ -132,12 +133,10 @@ shared_ptr<NatsSubscribeJobState> NatsSubscribeManager::CreateJob(NatsSubscribeC
                 if (!existing->progress.stop_requested && !existing->progress.failed) {
                     throw BinderException("subscribe job '%s' is still starting", job->config.job_name);
                 }
-                if (!existing->cv.wait_for(job_guard, std::chrono::seconds(30), [&]() {
-                        return existing->worker_finished;
-                    })) {
+                WaitForNatsJobWorker(job_guard, *existing, [&]() {
                     throw BinderException("Timed out waiting for subscribe job '%s' to finish cleanup",
                                           job->config.job_name);
-                }
+                });
             }
         }
 
@@ -152,9 +151,7 @@ shared_ptr<NatsSubscribeJobState> NatsSubscribeManager::CreateJob(NatsSubscribeC
                 continue;
             }
         }
-        if (existing->worker.joinable()) {
-            existing->worker.join();
-        }
+        JoinNatsJobWorker(*existing);
         jobs_.erase(it);
         {
             lock_guard<std::mutex> job_guard(job->mutex);
@@ -236,9 +233,10 @@ bool NatsSubscribeManager::RemoveJob(const string &job_name) {
             if (!job->progress.stop_requested && !job->progress.failed) {
                 throw std::runtime_error("Subscribe job '" + job_name + "' is still starting");
             }
-            if (!job->cv.wait_for(job_guard, std::chrono::seconds(30), [&]() { return job->worker_finished; })) {
-                throw std::runtime_error("Timed out waiting for subscribe job '" + job_name + "' to finish cleanup");
-            }
+            WaitForNatsJobWorker(job_guard, *job, [&]() {
+                throw std::runtime_error("Timed out waiting for subscribe job '" + job_name +
+                                         "' to finish cleanup");
+            });
         }
     }
 
@@ -253,9 +251,7 @@ bool NatsSubscribeManager::RemoveJob(const string &job_name) {
             throw std::runtime_error("Subscribe job '" + job_name + "' has not finished cleanup");
         }
     }
-    if (job->worker.joinable()) {
-        job->worker.join();
-    }
+    JoinNatsJobWorker(*job);
     jobs_.erase(it);
     return true;
 }
@@ -316,62 +312,63 @@ struct NatsSubscribeControlGlobalState : public GlobalTableFunctionState {
     }
 };
 
-static void AddSubscribeSnapshotColumns(vector<LogicalType> &return_types, NatsBindColumnNames &names) {
-    return_types = {LogicalType(LogicalTypeId::VARCHAR),  LogicalType(LogicalTypeId::VARCHAR),
-                    LogicalType(LogicalTypeId::VARCHAR),  LogicalType(LogicalTypeId::VARCHAR),
-                    LogicalType(LogicalTypeId::VARCHAR),  LogicalType(LogicalTypeId::BOOLEAN),
-                    LogicalType(LogicalTypeId::BOOLEAN),   LogicalType(LogicalTypeId::BOOLEAN),
-                    LogicalType(LogicalTypeId::BOOLEAN),   LogicalType(LogicalTypeId::BOOLEAN),
-                    LogicalType(LogicalTypeId::UBIGINT),    LogicalType(LogicalTypeId::UBIGINT),
-                    LogicalType(LogicalTypeId::UBIGINT),    LogicalType(LogicalTypeId::UBIGINT),
-                    LogicalType(LogicalTypeId::UBIGINT),    LogicalType(LogicalTypeId::UBIGINT),
-                    LogicalType(LogicalTypeId::UBIGINT),    LogicalType(LogicalTypeId::UBIGINT),
-                    LogicalType(LogicalTypeId::TIMESTAMP),  LogicalType(LogicalTypeId::TIMESTAMP),
-                    LogicalType(LogicalTypeId::TIMESTAMP),  LogicalType(LogicalTypeId::TIMESTAMP),
-                    LogicalType(LogicalTypeId::VARCHAR),    LogicalType(LogicalTypeId::BOOLEAN),
-                    LogicalType(LogicalTypeId::BOOLEAN),     LogicalType(LogicalTypeId::UBIGINT),
-                    LogicalType(LogicalTypeId::TIMESTAMP)};
-    names = {"job_name",         "target_table",     "nats_url",        "subject",       "queue_group",
-             "running",          "paused",           "pause_requested", "stop_requested", "failed",
-             "rows_inserted",    "batches_committed", "pending_messages", "pending_bytes",
-             "max_pending_messages", "max_pending_bytes", "messages_delivered", "messages_dropped",
-             "last_start_time", "last_commit_time", "last_error_time", "last_message_time", "last_error",
-             "connected", "reconnecting", "reconnect_count", "last_reconnect_time"};
-}
+#define NATS_SUBSCRIBE_SNAPSHOT_COLUMNS(X)                                                                              \
+	X("job_name", VARCHAR, job_name, VALUE)                                                                              \
+	X("target_table", VARCHAR, target_table, VALUE)                                                                      \
+	X("nats_url", VARCHAR, nats_url, VALUE)                                                                              \
+	X("subject", VARCHAR, subject, VALUE)                                                                                \
+	X("queue_group", VARCHAR, queue_group, VALUE)                                                                        \
+	X("running", BOOLEAN, running, VALUE)                                                                                \
+	X("paused", BOOLEAN, paused, VALUE)                                                                                  \
+	X("pause_requested", BOOLEAN, pause_requested, VALUE)                                                               \
+	X("stop_requested", BOOLEAN, stop_requested, VALUE)                                                                  \
+	X("failed", BOOLEAN, failed, VALUE)                                                                                  \
+	X("rows_inserted", UBIGINT, rows_inserted, UBIGINT)                                                                  \
+	X("batches_committed", UBIGINT, batches_committed, UBIGINT)                                                          \
+	X("pending_messages", UBIGINT, pending_messages, UBIGINT)                                                            \
+	X("pending_bytes", UBIGINT, pending_bytes, UBIGINT)                                                                  \
+	X("max_pending_messages", UBIGINT, max_pending_messages, UBIGINT)                                                    \
+	X("max_pending_bytes", UBIGINT, max_pending_bytes, UBIGINT)                                                          \
+	X("messages_delivered", UBIGINT, messages_delivered, UBIGINT)                                                        \
+	X("messages_dropped", UBIGINT, messages_dropped, UBIGINT)                                                            \
+	X("last_start_time", TIMESTAMP, last_start_time, TIMESTAMP)                                                          \
+	X("last_commit_time", TIMESTAMP, last_commit_time, TIMESTAMP)                                                        \
+	X("last_error_time", TIMESTAMP, last_error_time, TIMESTAMP)                                                          \
+	X("last_message_time", TIMESTAMP, last_message_time, TIMESTAMP)                                                      \
+	X("last_error", VARCHAR, last_error, VALUE)                                                                          \
+	X("connected", BOOLEAN, connected, VALUE)                                                                            \
+	X("reconnecting", BOOLEAN, reconnecting, VALUE)                                                                      \
+	X("reconnect_count", UBIGINT, reconnect_count, UBIGINT)                                                              \
+	X("last_reconnect_time", TIMESTAMP, last_reconnect_time, NULLABLE_TIMESTAMP)
 
 static void FillSubscribeSnapshotColumns(DataChunk &output, idx_t row, const NatsSubscribeSnapshot &snapshot) {
-    output.SetValue(0, row, Value(snapshot.job_name));
-    output.SetValue(1, row, Value(snapshot.target_table));
-    output.SetValue(2, row, Value(snapshot.nats_url));
-    output.SetValue(3, row, Value(snapshot.subject));
-    output.SetValue(4, row, Value(snapshot.queue_group));
-    output.SetValue(5, row, Value(snapshot.running));
-    output.SetValue(6, row, Value(snapshot.paused));
-    output.SetValue(7, row, Value(snapshot.pause_requested));
-    output.SetValue(8, row, Value(snapshot.stop_requested));
-    output.SetValue(9, row, Value(snapshot.failed));
-    output.SetValue(10, row, Value::UBIGINT(snapshot.rows_inserted));
-    output.SetValue(11, row, Value::UBIGINT(snapshot.batches_committed));
-    output.SetValue(12, row, Value::UBIGINT(snapshot.pending_messages));
-    output.SetValue(13, row, Value::UBIGINT(snapshot.pending_bytes));
-    output.SetValue(14, row, Value::UBIGINT(snapshot.max_pending_messages));
-    output.SetValue(15, row, Value::UBIGINT(snapshot.max_pending_bytes));
-    output.SetValue(16, row, Value::UBIGINT(snapshot.messages_delivered));
-    output.SetValue(17, row, Value::UBIGINT(snapshot.messages_dropped));
-    output.SetValue(18, row, Value::TIMESTAMP(snapshot.last_start_time));
-    output.SetValue(19, row, Value::TIMESTAMP(snapshot.last_commit_time));
-    output.SetValue(20, row, Value::TIMESTAMP(snapshot.last_error_time));
-    output.SetValue(21, row, Value::TIMESTAMP(snapshot.last_message_time));
-    output.SetValue(22, row, Value(snapshot.last_error));
-    output.SetValue(23, row, Value(snapshot.connected));
-    output.SetValue(24, row, Value(snapshot.reconnecting));
-    output.SetValue(25, row, Value::UBIGINT(snapshot.reconnect_count));
-    if (snapshot.last_reconnect_time.value == 0) {
-        FlatVector::SetNull(output.data[26], row, true);
-    } else {
-        output.SetValue(26, row, Value::TIMESTAMP(snapshot.last_reconnect_time));
-    }
+	idx_t column = 0;
+#define NATS_SUBSCRIBE_WRITE_VALUE(field) output.SetValue(column++, row, Value(snapshot.field));
+#define NATS_SUBSCRIBE_WRITE_UBIGINT(field) output.SetValue(column++, row, Value::UBIGINT(snapshot.field));
+#define NATS_SUBSCRIBE_WRITE_TIMESTAMP(field) output.SetValue(column++, row, Value::TIMESTAMP(snapshot.field));
+#define NATS_SUBSCRIBE_WRITE_NULLABLE_TIMESTAMP(field)                                                                  \
+	if (snapshot.field.value == 0) {                                                                                     \
+		FlatVector::SetNull(output.data[column++], row, true);                                                             \
+	} else {                                                                                                              \
+		output.SetValue(column++, row, Value::TIMESTAMP(snapshot.field));                                                   \
+	}
+#define NATS_SUBSCRIBE_WRITE_COLUMN(name, type, field, writer) NATS_SUBSCRIBE_WRITE_##writer(field)
+	NATS_SUBSCRIBE_SNAPSHOT_COLUMNS(NATS_SUBSCRIBE_WRITE_COLUMN)
+#undef NATS_SUBSCRIBE_WRITE_COLUMN
+#undef NATS_SUBSCRIBE_WRITE_NULLABLE_TIMESTAMP
+#undef NATS_SUBSCRIBE_WRITE_TIMESTAMP
+#undef NATS_SUBSCRIBE_WRITE_UBIGINT
+#undef NATS_SUBSCRIBE_WRITE_VALUE
 }
+
+static void AddSubscribeSnapshotColumns(vector<LogicalType> &return_types, NatsBindColumnNames &names) {
+#define NATS_SUBSCRIBE_ADD_COLUMN(name, type, field, writer)                                                            \
+	names.emplace_back(name);                                                                                             \
+	return_types.emplace_back(LogicalType(LogicalTypeId::type));
+	NATS_SUBSCRIBE_SNAPSHOT_COLUMNS(NATS_SUBSCRIBE_ADD_COLUMN)
+#undef NATS_SUBSCRIBE_ADD_COLUMN
+}
+#undef NATS_SUBSCRIBE_SNAPSHOT_COLUMNS
 
 static NatsSubscribeSnapshot SnapshotJob(const shared_ptr<NatsSubscribeJobState> &job) {
     lock_guard<std::mutex> guard(job->mutex);

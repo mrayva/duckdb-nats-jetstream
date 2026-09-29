@@ -1,4 +1,5 @@
 #include "nats_ingest.hpp"
+#include "nats_job_lifecycle.hpp"
 #include "nats_duckdb_compat.hpp"
 #include "nats_message_decode.hpp"
 #include "nats_proto_schema.hpp"
@@ -1291,123 +1292,69 @@ static void RestoreJobProgress(const shared_ptr<NatsIngestJobState> &job, const 
     job->progress.last_error = snapshot.last_error;
 }
 
+#define NATS_INGEST_SNAPSHOT_COLUMNS(X)                                                                                 \
+	X("job_name", VARCHAR, job_name, VALUE)                                                                              \
+	X("stream_name", VARCHAR, stream_name, VALUE)                                                                        \
+	X("target_table", VARCHAR, target_table, VALUE)                                                                      \
+	X("durable_name", VARCHAR, durable_name, VALUE)                                                                      \
+	X("running", BOOLEAN, running, VALUE)                                                                                \
+	X("stop_requested", BOOLEAN, stop_requested, VALUE)                                                                  \
+	X("stopped", BOOLEAN, stopped, VALUE)                                                                                \
+	X("failed", BOOLEAN, failed, VALUE)                                                                                  \
+	X("paused", BOOLEAN, paused, VALUE)                                                                                  \
+	X("pause_requested", BOOLEAN, pause_requested, VALUE)                                                               \
+	X("last_committed_seq", UBIGINT, last_committed_seq, UBIGINT)                                                        \
+	X("last_delivered_seq", UBIGINT, last_delivered_seq, UBIGINT)                                                        \
+	X("rows_inserted", UBIGINT, rows_inserted, UBIGINT)                                                                  \
+	X("batches_committed", UBIGINT, batches_committed, UBIGINT)                                                          \
+	X("fetches_completed", UBIGINT, fetches_completed, UBIGINT)                                                          \
+	X("last_batch_rows", UBIGINT, last_batch_rows, UBIGINT)                                                              \
+	X("sequence_lag", UBIGINT, sequence_lag, UBIGINT)                                                                    \
+	X("last_start_time", TIMESTAMP, last_start_time, NULLABLE_TIMESTAMP)                                                 \
+	X("last_fetch_time", TIMESTAMP, last_fetch_time, NULLABLE_TIMESTAMP)                                                 \
+	X("last_ack_time", TIMESTAMP, last_ack_time, NULLABLE_TIMESTAMP)                                                    \
+	X("last_commit_time", TIMESTAMP, last_commit_time, NULLABLE_TIMESTAMP)                                              \
+	X("last_error_time", TIMESTAMP, last_error_time, NULLABLE_TIMESTAMP)                                                \
+	X("last_error", VARCHAR, last_error, NULLABLE_STRING)                                                                \
+	X("connected", BOOLEAN, connected, VALUE)                                                                            \
+	X("reconnecting", BOOLEAN, reconnecting, VALUE)                                                                      \
+	X("reconnect_count", UBIGINT, reconnect_count, UBIGINT)                                                              \
+	X("last_reconnect_time", TIMESTAMP, last_reconnect_time, NULLABLE_TIMESTAMP)                                         \
+	X("duplicates_skipped", UBIGINT, duplicates_skipped, UBIGINT)
+
 static void FillSnapshotColumns(DataChunk &output, idx_t row, const NatsIngestSnapshot &snapshot) {
-    output.SetValue(0, row, Value(snapshot.job_name));
-    output.SetValue(1, row, Value(snapshot.stream_name));
-    output.SetValue(2, row, Value(snapshot.target_table));
-    output.SetValue(3, row, Value(snapshot.durable_name));
-    output.SetValue(4, row, Value::BOOLEAN(snapshot.running));
-    output.SetValue(5, row, Value::BOOLEAN(snapshot.stop_requested));
-    output.SetValue(6, row, Value::BOOLEAN(snapshot.stopped));
-    output.SetValue(7, row, Value::BOOLEAN(snapshot.failed));
-    output.SetValue(8, row, Value::BOOLEAN(snapshot.paused));
-    output.SetValue(9, row, Value::BOOLEAN(snapshot.pause_requested));
-    output.SetValue(10, row, Value::UBIGINT(snapshot.last_committed_seq));
-    output.SetValue(11, row, Value::UBIGINT(snapshot.last_delivered_seq));
-    output.SetValue(12, row, Value::UBIGINT(snapshot.rows_inserted));
-    output.SetValue(13, row, Value::UBIGINT(snapshot.batches_committed));
-    output.SetValue(14, row, Value::UBIGINT(snapshot.fetches_completed));
-    output.SetValue(15, row, Value::UBIGINT(snapshot.last_batch_rows));
-    output.SetValue(16, row, Value::UBIGINT(snapshot.sequence_lag));
-    if (snapshot.last_start_time.value == 0) {
-        FlatVector::SetNull(output.data[17], row, true);
-    } else {
-        output.SetValue(17, row, Value::TIMESTAMP(snapshot.last_start_time));
-    }
-    if (snapshot.last_fetch_time.value == 0) {
-        FlatVector::SetNull(output.data[18], row, true);
-    } else {
-        output.SetValue(18, row, Value::TIMESTAMP(snapshot.last_fetch_time));
-    }
-    if (snapshot.last_ack_time.value == 0) {
-        FlatVector::SetNull(output.data[19], row, true);
-    } else {
-        output.SetValue(19, row, Value::TIMESTAMP(snapshot.last_ack_time));
-    }
-    if (snapshot.last_commit_time.value == 0) {
-        FlatVector::SetNull(output.data[20], row, true);
-    } else {
-        output.SetValue(20, row, Value::TIMESTAMP(snapshot.last_commit_time));
-    }
-    if (snapshot.last_error_time.value == 0) {
-        FlatVector::SetNull(output.data[21], row, true);
-    } else {
-        output.SetValue(21, row, Value::TIMESTAMP(snapshot.last_error_time));
-    }
-    if (snapshot.last_error.empty()) {
-        FlatVector::SetNull(output.data[22], row, true);
-    } else {
-        output.SetValue(22, row, Value(snapshot.last_error));
-    }
-    output.SetValue(23, row, Value(snapshot.connected));
-    output.SetValue(24, row, Value(snapshot.reconnecting));
-    output.SetValue(25, row, Value::UBIGINT(snapshot.reconnect_count));
-    if (snapshot.last_reconnect_time.value == 0) {
-        FlatVector::SetNull(output.data[26], row, true);
-    } else {
-        output.SetValue(26, row, Value::TIMESTAMP(snapshot.last_reconnect_time));
-    }
-    output.SetValue(27, row, Value::UBIGINT(snapshot.duplicates_skipped));
+	idx_t column = 0;
+#define NATS_INGEST_WRITE_VALUE(field) output.SetValue(column++, row, Value(snapshot.field));
+#define NATS_INGEST_WRITE_UBIGINT(field) output.SetValue(column++, row, Value::UBIGINT(snapshot.field));
+#define NATS_INGEST_WRITE_NULLABLE_TIMESTAMP(field)                                                                     \
+	if (snapshot.field.value == 0) {                                                                                     \
+		FlatVector::SetNull(output.data[column++], row, true);                                                             \
+	} else {                                                                                                              \
+		output.SetValue(column++, row, Value::TIMESTAMP(snapshot.field));                                                   \
+	}
+#define NATS_INGEST_WRITE_NULLABLE_STRING(field)                                                                        \
+	if (snapshot.field.empty()) {                                                                                         \
+		FlatVector::SetNull(output.data[column++], row, true);                                                             \
+	} else {                                                                                                              \
+		output.SetValue(column++, row, Value(snapshot.field));                                                              \
+	}
+#define NATS_INGEST_WRITE_COLUMN(name, type, field, writer) NATS_INGEST_WRITE_##writer(field)
+	NATS_INGEST_SNAPSHOT_COLUMNS(NATS_INGEST_WRITE_COLUMN)
+#undef NATS_INGEST_WRITE_COLUMN
+#undef NATS_INGEST_WRITE_NULLABLE_STRING
+#undef NATS_INGEST_WRITE_NULLABLE_TIMESTAMP
+#undef NATS_INGEST_WRITE_UBIGINT
+#undef NATS_INGEST_WRITE_VALUE
 }
 
 static void AddSnapshotColumns(vector<LogicalType> &return_types, NatsBindColumnNames &names) {
-    names.emplace_back("job_name");
-    return_types.emplace_back(LogicalType(LogicalTypeId::VARCHAR));
-    names.emplace_back("stream_name");
-    return_types.emplace_back(LogicalType(LogicalTypeId::VARCHAR));
-    names.emplace_back("target_table");
-    return_types.emplace_back(LogicalType(LogicalTypeId::VARCHAR));
-    names.emplace_back("durable_name");
-    return_types.emplace_back(LogicalType(LogicalTypeId::VARCHAR));
-    names.emplace_back("running");
-    return_types.emplace_back(LogicalType(LogicalTypeId::BOOLEAN));
-    names.emplace_back("stop_requested");
-    return_types.emplace_back(LogicalType(LogicalTypeId::BOOLEAN));
-    names.emplace_back("stopped");
-    return_types.emplace_back(LogicalType(LogicalTypeId::BOOLEAN));
-    names.emplace_back("failed");
-    return_types.emplace_back(LogicalType(LogicalTypeId::BOOLEAN));
-    names.emplace_back("paused");
-    return_types.emplace_back(LogicalType(LogicalTypeId::BOOLEAN));
-    names.emplace_back("pause_requested");
-    return_types.emplace_back(LogicalType(LogicalTypeId::BOOLEAN));
-    names.emplace_back("last_committed_seq");
-    return_types.emplace_back(LogicalType(LogicalTypeId::UBIGINT));
-    names.emplace_back("last_delivered_seq");
-    return_types.emplace_back(LogicalType(LogicalTypeId::UBIGINT));
-    names.emplace_back("rows_inserted");
-    return_types.emplace_back(LogicalType(LogicalTypeId::UBIGINT));
-    names.emplace_back("batches_committed");
-    return_types.emplace_back(LogicalType(LogicalTypeId::UBIGINT));
-    names.emplace_back("fetches_completed");
-    return_types.emplace_back(LogicalType(LogicalTypeId::UBIGINT));
-    names.emplace_back("last_batch_rows");
-    return_types.emplace_back(LogicalType(LogicalTypeId::UBIGINT));
-    names.emplace_back("sequence_lag");
-    return_types.emplace_back(LogicalType(LogicalTypeId::UBIGINT));
-    names.emplace_back("last_start_time");
-    return_types.emplace_back(LogicalType(LogicalTypeId::TIMESTAMP));
-    names.emplace_back("last_fetch_time");
-    return_types.emplace_back(LogicalType(LogicalTypeId::TIMESTAMP));
-    names.emplace_back("last_ack_time");
-    return_types.emplace_back(LogicalType(LogicalTypeId::TIMESTAMP));
-    names.emplace_back("last_commit_time");
-    return_types.emplace_back(LogicalType(LogicalTypeId::TIMESTAMP));
-    names.emplace_back("last_error_time");
-    return_types.emplace_back(LogicalType(LogicalTypeId::TIMESTAMP));
-    names.emplace_back("last_error");
-    return_types.emplace_back(LogicalType(LogicalTypeId::VARCHAR));
-    names.emplace_back("connected");
-    return_types.emplace_back(LogicalType(LogicalTypeId::BOOLEAN));
-    names.emplace_back("reconnecting");
-    return_types.emplace_back(LogicalType(LogicalTypeId::BOOLEAN));
-    names.emplace_back("reconnect_count");
-    return_types.emplace_back(LogicalType(LogicalTypeId::UBIGINT));
-    names.emplace_back("last_reconnect_time");
-    return_types.emplace_back(LogicalType(LogicalTypeId::TIMESTAMP));
-    names.emplace_back("duplicates_skipped");
-    return_types.emplace_back(LogicalType(LogicalTypeId::UBIGINT));
+#define NATS_INGEST_ADD_COLUMN(name, type, field, writer)                                                               \
+	names.emplace_back(name);                                                                                             \
+	return_types.emplace_back(LogicalType(LogicalTypeId::type));
+	NATS_INGEST_SNAPSHOT_COLUMNS(NATS_INGEST_ADD_COLUMN)
+#undef NATS_INGEST_ADD_COLUMN
 }
+#undef NATS_INGEST_SNAPSHOT_COLUMNS
 
 static void InitializeJobStateFromConfig(const shared_ptr<NatsIngestJobState> &job, ClientContext &context) {
     job->db = context.db;
@@ -2544,12 +2491,10 @@ shared_ptr<NatsIngestJobState> NatsIngestManager::CreateJob(NatsIngestConfig con
                 if (!existing->progress.stop_requested && !existing->progress.stopped && !existing->progress.failed) {
                     throw std::runtime_error("Ingest job '" + job->config.job_name + "' is still starting");
                 }
-                if (!existing->cv.wait_for(job_guard, std::chrono::seconds(30), [&]() {
-                        return existing->worker_finished;
-                    })) {
+                WaitForNatsJobWorker(job_guard, *existing, [&]() {
                     throw std::runtime_error("Timed out waiting for ingest job '" + job->config.job_name +
                                              "' to finish cleanup");
-                }
+                });
             }
         }
 
@@ -2564,9 +2509,7 @@ shared_ptr<NatsIngestJobState> NatsIngestManager::CreateJob(NatsIngestConfig con
                 continue;
             }
         }
-        if (existing->worker.joinable()) {
-            existing->worker.join();
-        }
+        JoinNatsJobWorker(*existing);
         jobs_.erase(it);
         {
             lock_guard<std::mutex> job_guard(job->job_mutex);
@@ -2654,9 +2597,9 @@ bool NatsIngestManager::RemoveJob(const string &job_name) {
             if (!job->progress.stop_requested && !job->progress.stopped && !job->progress.failed) {
                 throw std::runtime_error("Ingest job '" + job_name + "' is still starting");
             }
-            if (!job->cv.wait_for(job_guard, std::chrono::seconds(30), [&]() { return job->worker_finished; })) {
+            WaitForNatsJobWorker(job_guard, *job, [&]() {
                 throw std::runtime_error("Timed out waiting for ingest job '" + job_name + "' to finish cleanup");
-            }
+            });
         }
     }
 
@@ -2671,9 +2614,7 @@ bool NatsIngestManager::RemoveJob(const string &job_name) {
             throw std::runtime_error("Ingest job '" + job_name + "' has not finished cleanup");
         }
     }
-    if (job->worker.joinable()) {
-        job->worker.join();
-    }
+    JoinNatsJobWorker(*job);
     jobs_.erase(it);
     return true;
 }
