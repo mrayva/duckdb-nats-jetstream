@@ -1,6 +1,7 @@
 #include "nats_proto_schema.hpp"
 
 #include <filesystem>
+#include <fstream>
 #include <mutex>
 #include <sstream>
 #include <unordered_map>
@@ -39,6 +40,13 @@ struct CacheEntry {
 
 std::mutex schema_cache_mutex;
 unordered_map<string, CacheEntry> schema_cache;
+
+std::filesystem::file_time_type SchemaModifiedTime(const string &path) {
+    std::error_code error;
+    auto modified = std::filesystem::last_write_time(path, error);
+    if (error) throw std::runtime_error("Failed to stat protobuf schema file: " + path);
+    return modified;
+}
 
 string CanonicalSchemaPath(const string &proto_file) {
     std::error_code error;
@@ -87,6 +95,60 @@ shared_ptr<NatsProtobufSchema> GetNatsProtobufSchema(const string &proto_file, c
     auto schema = make_shared_ptr<NatsProtobufSchema>();
     schema->source_tree = std::move(source_tree);
     schema->importer = std::move(importer);
+    schema->descriptor = descriptor;
+    schema_cache[key] = {schema, modified};
+    return schema;
+}
+
+shared_ptr<NatsProtobufSchema> GetNatsProtobufDescriptorSetSchema(const string &descriptor_set_file,
+                                                                  const string &proto_message) {
+    auto canonical_path = CanonicalSchemaPath(descriptor_set_file);
+    auto modified = SchemaModifiedTime(canonical_path);
+    auto key = "descriptor-set\n" + canonical_path + "\n" + proto_message;
+    lock_guard<std::mutex> guard(schema_cache_mutex);
+    auto cached = schema_cache.find(key);
+    if (cached != schema_cache.end() && cached->second.modified == modified) return cached->second.schema;
+
+    std::ifstream input(canonical_path, std::ios::binary);
+    FileDescriptorSet file_set;
+    if (!input || !file_set.ParseFromIstream(&input)) {
+        throw std::runtime_error("Failed to parse protobuf descriptor set: " + descriptor_set_file);
+    }
+
+    auto pool = make_shared_ptr<DescriptorPool>(DescriptorPool::generated_pool());
+    vector<bool> built(file_set.file_size(), false);
+    idx_t remaining = file_set.file_size();
+    while (remaining > 0) {
+        bool progress = false;
+        for (int i = 0; i < file_set.file_size(); i++) {
+            if (built[i]) continue;
+            const auto &file = file_set.file(i);
+            bool dependencies_ready = true;
+            for (const auto &dependency : file.dependency()) {
+                if (!pool->FindFileByName(dependency)) {
+                    dependencies_ready = false;
+                    break;
+                }
+            }
+            if (!dependencies_ready) continue;
+            if (!pool->BuildFile(file)) {
+                throw std::runtime_error("Failed to build protobuf descriptor from set: " + file.name());
+            }
+            built[i] = true;
+            remaining--;
+            progress = true;
+        }
+        if (!progress) {
+            throw std::runtime_error("Protobuf descriptor set has unresolved or cyclic file dependencies");
+        }
+    }
+
+    auto descriptor = pool->FindMessageTypeByName(proto_message);
+    if (!descriptor) {
+        throw std::runtime_error("Message type '" + proto_message + "' not found in descriptor set " + descriptor_set_file);
+    }
+    auto schema = make_shared_ptr<NatsProtobufSchema>();
+    schema->descriptor_pool = std::move(pool);
     schema->descriptor = descriptor;
     schema_cache[key] = {schema, modified};
     return schema;

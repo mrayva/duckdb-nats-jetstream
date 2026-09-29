@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/brannn/duckdb-nats-jetstream/actions/workflows/MainDistributionPipeline.yml/badge.svg)](https://github.com/brannn/duckdb-nats-jetstream/actions/workflows/MainDistributionPipeline.yml)
 [![Version](https://img.shields.io/badge/Version-v0.2.2-orange)](https://github.com/brannn/duckdb-nats-jetstream/releases/tag/v0.2.2)
-[![DuckDB Version](https://img.shields.io/badge/DuckDB-v1.5.5-blue)](https://github.com/duckdb/duckdb/releases/tag/v1.5.5)
+[![DuckDB Version](https://img.shields.io/badge/DuckDB-v1.5.6-blue)](https://github.com/duckdb/duckdb/releases/tag/v1.5.6)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/Platform-Linux%20%7C%20macOS%20%7C%20Windows%20%7C%20WebAssembly-lightgrey)](https://github.com/brannn/duckdb-nats-jetstream/actions)
 
@@ -112,6 +112,11 @@ Use `nats_subject` for server-side JetStream subject filtering. Use
 `subject_contains` for client-side substring filtering. The older `subject`
 parameter remains as a substring-compatible alias.
 
+Use `headers := true` to append a `headers` JSON column to the scan output.
+Application header keys map to arrays so repeated values are preserved;
+JetStream `Nats-*` system headers are excluded, and messages without application
+headers return `{}`. The column is omitted by default.
+
 ```sql
 SELECT seq, subject, device_id, kw
 FROM nats_scan(
@@ -120,6 +125,9 @@ FROM nats_scan(
     nats_subject := 'telemetry.dc1.power.>',
     json_extract := ['device_id', 'kw']
 );
+
+SELECT subject, headers
+FROM nats_scan('telemetry', headers := true, start_seq := 1, end_seq := 100);
 ```
 
 For whole-stream counts and resume bounds, use `nats_stream_stats` instead of
@@ -131,6 +139,21 @@ FROM nats_stream_stats('telemetry', url := 'nats://localhost:4222');
 ```
 
 `nats_stream_info` is an alias for the same table function.
+
+Discover streams with `nats_streams()`. For per-subject message counts within
+one stream, use `nats_stream_subjects`; its optional `subject` parameter is a
+server-side NATS subject filter. Both functions return metadata without reading
+message payloads:
+
+```sql
+SELECT stream, messages, first_seq, last_seq
+FROM nats_streams(url := 'nats://localhost:4222');
+
+SELECT subject, messages
+FROM nats_stream_subjects('telemetry', subject := 'telemetry.dc1.power.>',
+                          url := 'nats://localhost:4222')
+ORDER BY messages DESC;
+```
 
 Use `nats_stream_range_stats` to check whether a sequence range is fully
 available before scanning it:

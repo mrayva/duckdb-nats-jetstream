@@ -43,6 +43,7 @@ struct NatsSubscribeConfig {
     vector<string> flexbuffers_fields;
     vector<vector<string>> flexbuffers_field_paths;
     string proto_file;
+    string proto_descriptor_set;
     string proto_message;
     vector<string> proto_fields;
     vector<vector<const google::protobuf::FieldDescriptor *>> proto_field_paths;

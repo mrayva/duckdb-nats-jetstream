@@ -18,7 +18,6 @@
 #include "duckdb/common/types/vector.hpp"
 #include <algorithm>
 #include <chrono>
-#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -125,6 +124,7 @@ struct NatsIngestSnapshot {
     vector<string> cbor_fields;
     vector<string> flexbuffers_fields;
     string proto_file;
+    string proto_descriptor_set;
     string proto_message;
     vector<string> proto_fields;
     bool running = false;
@@ -314,6 +314,7 @@ static void EnsureRegistryTable(Connection &conn) {
         << "tls_server_name VARCHAR,"
         << "tls_skip_verify BOOLEAN NOT NULL DEFAULT FALSE,"
         << "duplicates_skipped UBIGINT NOT NULL DEFAULT 0,"
+        << "proto_descriptor_set VARCHAR,"
         << "updated_at TIMESTAMP NOT NULL"
         << ")";
     ExecuteOrThrow(conn, sql.str(), "Failed to create ingest registry table");
@@ -355,6 +356,10 @@ static void EnsureRegistryTable(Connection &conn) {
                    "ALTER TABLE " + string(NATS_INGEST_REGISTRY_TABLE) +
                        " ADD COLUMN IF NOT EXISTS flexbuffers_fields VARCHAR[]",
                    "Failed to migrate ingest FlexBuffers settings");
+    ExecuteOrThrow(conn,
+                   "ALTER TABLE " + string(NATS_INGEST_REGISTRY_TABLE) +
+                       " ADD COLUMN IF NOT EXISTS proto_descriptor_set VARCHAR",
+                   "Failed to migrate ingest protobuf descriptor-set setting");
     ExecuteOrThrow(conn,
                    "CREATE TABLE IF NOT EXISTS " + string(NATS_INGEST_LEASE_TABLE) + " ("
                    "stream_name VARCHAR NOT NULL,"
@@ -499,7 +504,7 @@ static void UpsertRegistry(Connection &conn, const NatsIngestSnapshot &snapshot)
            "last_committed_seq, last_delivered_seq, rows_inserted, batches_committed, fetches_completed, last_batch_rows, "
            "sequence_lag, last_start_time, last_fetch_time, last_ack_time, last_commit_time, last_error_time, last_error, "
            "credentials_file, tls_ca_file, tls_cert_file, tls_key_file, tls_server_name, tls_skip_verify, "
-           "duplicates_skipped, updated_at, msgpack_fields, cbor_fields, flexbuffers_fields) VALUES ("
+           "duplicates_skipped, updated_at, msgpack_fields, cbor_fields, flexbuffers_fields, proto_descriptor_set) VALUES ("
         << SqlStringLiteral(snapshot.job_name) << ", "
         << SqlStringLiteral(snapshot.stream_name) << ", "
         << SqlStringLiteral(snapshot.target_table) << ", "
@@ -546,7 +551,8 @@ static void UpsertRegistry(Connection &conn, const NatsIngestSnapshot &snapshot)
         << "CURRENT_TIMESTAMP, "
         << SqlListLiteral(snapshot.msgpack_fields) << ", "
         << SqlListLiteral(snapshot.cbor_fields) << ", "
-        << SqlListLiteral(snapshot.flexbuffers_fields)
+        << SqlListLiteral(snapshot.flexbuffers_fields) << ", "
+        << (snapshot.proto_descriptor_set.empty() ? "NULL" : SqlStringLiteral(snapshot.proto_descriptor_set))
         << ") ON CONFLICT(job_name) DO UPDATE SET "
         << "stream_name = excluded.stream_name, "
         << "target_table = excluded.target_table, "
@@ -593,6 +599,7 @@ static void UpsertRegistry(Connection &conn, const NatsIngestSnapshot &snapshot)
         << "msgpack_fields = excluded.msgpack_fields, "
         << "cbor_fields = excluded.cbor_fields, "
         << "flexbuffers_fields = excluded.flexbuffers_fields, "
+        << "proto_descriptor_set = excluded.proto_descriptor_set, "
         << "updated_at = excluded.updated_at";
     ExecuteOrThrow(conn, sql.str(), "Failed to update ingest registry");
 }
@@ -608,7 +615,7 @@ static bool LoadRegistrySnapshot(Connection &conn, const string &job_name, NatsI
            "proto_message, proto_fields, running, stop_requested, stopped, failed, paused, pause_requested, last_committed_seq, "
            "last_delivered_seq, rows_inserted, batches_committed, fetches_completed, last_batch_rows, sequence_lag, last_start_time, "
            "last_fetch_time, last_ack_time, last_commit_time, last_error_time, last_error, credentials_file, tls_ca_file, "
-           "tls_cert_file, tls_key_file, tls_server_name, tls_skip_verify, duplicates_skipped, msgpack_fields, cbor_fields, flexbuffers_fields "
+           "tls_cert_file, tls_key_file, tls_server_name, tls_skip_verify, duplicates_skipped, msgpack_fields, cbor_fields, flexbuffers_fields, proto_descriptor_set "
         << "FROM " << NATS_INGEST_REGISTRY_TABLE << " WHERE job_name = " << SqlStringLiteral(job_name);
 
     auto result = conn.Query(sql.str());
@@ -638,8 +645,9 @@ static bool LoadRegistrySnapshot(Connection &conn, const string &job_name, NatsI
     if (!chunk->GetValue(12, 0).IsNull()) {
         snapshot.nats_subject = chunk->GetValue(12, 0).GetValue<string>();
     }
-    if (!chunk->GetValue(13, 0).IsNull()) {
-        for (auto &entry : ListValue::GetChildren(chunk->GetValue(13, 0))) {
+    auto json_fields_value = chunk->GetValue(13, 0);
+    if (!json_fields_value.IsNull()) {
+        for (auto &entry : ListValue::GetChildren(json_fields_value)) {
             snapshot.json_fields.push_back(entry.GetValue<string>());
         }
     }
@@ -649,8 +657,9 @@ static bool LoadRegistrySnapshot(Connection &conn, const string &job_name, NatsI
     if (!chunk->GetValue(15, 0).IsNull()) {
         snapshot.proto_message = chunk->GetValue(15, 0).GetValue<string>();
     }
-    if (!chunk->GetValue(16, 0).IsNull()) {
-        for (auto &entry : ListValue::GetChildren(chunk->GetValue(16, 0))) {
+    auto proto_fields_value = chunk->GetValue(16, 0);
+    if (!proto_fields_value.IsNull()) {
+        for (auto &entry : ListValue::GetChildren(proto_fields_value)) {
             snapshot.proto_fields.push_back(entry.GetValue<string>());
         }
     }
@@ -702,21 +711,25 @@ static bool LoadRegistrySnapshot(Connection &conn, const string &job_name, NatsI
     }
     snapshot.tls_skip_verify = chunk->GetValue(41, 0).GetValue<bool>();
     snapshot.duplicates_skipped = chunk->GetValue(42, 0).GetValue<uint64_t>();
-    if (!chunk->GetValue(43, 0).IsNull()) {
-        for (auto &entry : ListValue::GetChildren(chunk->GetValue(43, 0))) {
+    auto msgpack_fields_value = chunk->GetValue(43, 0);
+    if (!msgpack_fields_value.IsNull()) {
+        for (auto &entry : ListValue::GetChildren(msgpack_fields_value)) {
             snapshot.msgpack_fields.push_back(entry.GetValue<string>());
         }
     }
-    if (!chunk->GetValue(44, 0).IsNull()) {
-        for (auto &entry : ListValue::GetChildren(chunk->GetValue(44, 0))) {
+    auto cbor_fields_value = chunk->GetValue(44, 0);
+    if (!cbor_fields_value.IsNull()) {
+        for (auto &entry : ListValue::GetChildren(cbor_fields_value)) {
             snapshot.cbor_fields.push_back(entry.GetValue<string>());
         }
     }
-    if (!chunk->GetValue(45, 0).IsNull()) {
-        for (auto &entry : ListValue::GetChildren(chunk->GetValue(45, 0))) {
+    auto flexbuffers_fields_value = chunk->GetValue(45, 0);
+    if (!flexbuffers_fields_value.IsNull()) {
+        for (auto &entry : ListValue::GetChildren(flexbuffers_fields_value)) {
             snapshot.flexbuffers_fields.push_back(entry.GetValue<string>());
         }
     }
+    if (!chunk->GetValue(46, 0).IsNull()) snapshot.proto_descriptor_set = chunk->GetValue(46, 0).GetValue<string>();
     return true;
 }
 
@@ -727,7 +740,7 @@ static vector<NatsIngestSnapshot> LoadRegistrySnapshots(Connection &conn) {
            "proto_message, proto_fields, running, stop_requested, stopped, failed, paused, pause_requested, last_committed_seq, "
            "last_delivered_seq, rows_inserted, batches_committed, fetches_completed, last_batch_rows, sequence_lag, last_start_time, "
            "last_fetch_time, last_ack_time, last_commit_time, last_error_time, last_error, credentials_file, tls_ca_file, "
-           "tls_cert_file, tls_key_file, tls_server_name, tls_skip_verify, duplicates_skipped, msgpack_fields, cbor_fields, flexbuffers_fields "
+           "tls_cert_file, tls_key_file, tls_server_name, tls_skip_verify, duplicates_skipped, msgpack_fields, cbor_fields, flexbuffers_fields, proto_descriptor_set "
         << "FROM " << NATS_INGEST_REGISTRY_TABLE << " ORDER BY job_name";
 
     auto result = conn.Query(sql.str());
@@ -756,8 +769,9 @@ static vector<NatsIngestSnapshot> LoadRegistrySnapshots(Connection &conn) {
             if (!chunk->GetValue(12, row).IsNull()) {
                 snapshot.nats_subject = chunk->GetValue(12, row).GetValue<string>();
             }
-            if (!chunk->GetValue(13, row).IsNull()) {
-                for (auto &entry : ListValue::GetChildren(chunk->GetValue(13, row))) {
+            auto json_fields_value = chunk->GetValue(13, row);
+            if (!json_fields_value.IsNull()) {
+                for (auto &entry : ListValue::GetChildren(json_fields_value)) {
                     snapshot.json_fields.push_back(entry.GetValue<string>());
                 }
             }
@@ -767,8 +781,9 @@ static vector<NatsIngestSnapshot> LoadRegistrySnapshots(Connection &conn) {
             if (!chunk->GetValue(15, row).IsNull()) {
                 snapshot.proto_message = chunk->GetValue(15, row).GetValue<string>();
             }
-            if (!chunk->GetValue(16, row).IsNull()) {
-                for (auto &entry : ListValue::GetChildren(chunk->GetValue(16, row))) {
+            auto proto_fields_value = chunk->GetValue(16, row);
+            if (!proto_fields_value.IsNull()) {
+                for (auto &entry : ListValue::GetChildren(proto_fields_value)) {
                     snapshot.proto_fields.push_back(entry.GetValue<string>());
                 }
             }
@@ -820,21 +835,25 @@ static vector<NatsIngestSnapshot> LoadRegistrySnapshots(Connection &conn) {
             }
             snapshot.tls_skip_verify = chunk->GetValue(41, row).GetValue<bool>();
             snapshot.duplicates_skipped = chunk->GetValue(42, row).GetValue<uint64_t>();
-            if (!chunk->GetValue(43, row).IsNull()) {
-                for (auto &entry : ListValue::GetChildren(chunk->GetValue(43, row))) {
+            auto msgpack_fields_value = chunk->GetValue(43, row);
+            if (!msgpack_fields_value.IsNull()) {
+                for (auto &entry : ListValue::GetChildren(msgpack_fields_value)) {
                     snapshot.msgpack_fields.push_back(entry.GetValue<string>());
                 }
             }
-            if (!chunk->GetValue(44, row).IsNull()) {
-                for (auto &entry : ListValue::GetChildren(chunk->GetValue(44, row))) {
+            auto cbor_fields_value = chunk->GetValue(44, row);
+            if (!cbor_fields_value.IsNull()) {
+                for (auto &entry : ListValue::GetChildren(cbor_fields_value)) {
                     snapshot.cbor_fields.push_back(entry.GetValue<string>());
                 }
             }
-            if (!chunk->GetValue(45, row).IsNull()) {
-                for (auto &entry : ListValue::GetChildren(chunk->GetValue(45, row))) {
+            auto flexbuffers_fields_value = chunk->GetValue(45, row);
+            if (!flexbuffers_fields_value.IsNull()) {
+                for (auto &entry : ListValue::GetChildren(flexbuffers_fields_value)) {
                     snapshot.flexbuffers_fields.push_back(entry.GetValue<string>());
                 }
             }
+            if (!chunk->GetValue(46, row).IsNull()) snapshot.proto_descriptor_set = chunk->GetValue(46, row).GetValue<string>();
             snapshots.push_back(std::move(snapshot));
         }
     }
@@ -1013,10 +1032,11 @@ static void DisconnectJetStream(natsConnection **conn, jsCtx **js) {
     }
 }
 
-static void ImportProtoSchema(const string &proto_file, const string &proto_message,
+static void ImportProtoSchema(const string &proto_file, const string &descriptor_set, const string &proto_message,
                               shared_ptr<DiskSourceTree> &source_tree, shared_ptr<ProtobufErrorCollector> &error_collector,
                               shared_ptr<Importer> &importer, const Descriptor *&descriptor) {
-    auto schema = GetNatsProtobufSchema(proto_file, proto_message);
+    auto schema = descriptor_set.empty() ? GetNatsProtobufSchema(proto_file, proto_message)
+                                         : GetNatsProtobufDescriptorSetSchema(descriptor_set, proto_message);
     source_tree = schema->source_tree;
     error_collector = make_shared_ptr<ProtobufErrorCollector>();
     importer = schema->importer;
@@ -1090,6 +1110,8 @@ static NatsIngestConfig ParseStartConfig(TableFunctionBindInput &input) {
             }
         } else if (kv.first == "proto_file") {
             config.proto_file = StringValue::Get(kv.second);
+        } else if (kv.first == "proto_descriptor_set") {
+            config.proto_descriptor_set = StringValue::Get(kv.second);
         } else if (kv.first == "proto_message") {
             config.proto_message = StringValue::Get(kv.second);
         } else if (kv.first == "proto_extract") {
@@ -1138,8 +1160,8 @@ static NatsIngestConfig ParseStartConfig(TableFunctionBindInput &input) {
     }
 
     if (!config.proto_fields.empty()) {
-        if (config.proto_file.empty()) {
-            throw std::runtime_error("proto_file parameter is required when using proto_extract");
+        if (config.proto_file.empty() == config.proto_descriptor_set.empty()) {
+            throw std::runtime_error("Exactly one of proto_file or proto_descriptor_set is required when using proto_extract");
         }
         if (config.proto_message.empty()) {
             throw std::runtime_error("proto_message parameter is required when using proto_extract");
@@ -1182,6 +1204,7 @@ static NatsIngestSnapshot SnapshotJob(const shared_ptr<NatsIngestJobState> &job)
     snapshot.cbor_fields = job->config.cbor_fields;
     snapshot.flexbuffers_fields = job->config.flexbuffers_fields;
     snapshot.proto_file = job->config.proto_file;
+    snapshot.proto_descriptor_set = job->config.proto_descriptor_set;
     snapshot.proto_message = job->config.proto_message;
     snapshot.proto_fields = job->config.proto_fields;
     snapshot.running = job->progress.running;
@@ -1242,6 +1265,7 @@ static NatsIngestConfig SnapshotToConfig(const NatsIngestSnapshot &snapshot) {
     config.flexbuffers_fields = snapshot.flexbuffers_fields;
     config.flexbuffers_field_paths = SplitMsgpackFieldPaths(config.flexbuffers_fields);
     config.proto_file = snapshot.proto_file;
+    config.proto_descriptor_set = snapshot.proto_descriptor_set;
     config.proto_message = snapshot.proto_message;
     config.proto_fields = snapshot.proto_fields;
     return config;
@@ -1326,7 +1350,7 @@ static void FillSnapshotColumns(DataChunk &output, idx_t row, const NatsIngestSn
     output.SetValue(27, row, Value::UBIGINT(snapshot.duplicates_skipped));
 }
 
-static void AddSnapshotColumns(vector<LogicalType> &return_types, vector<string> &names) {
+static void AddSnapshotColumns(vector<LogicalType> &return_types, NatsBindColumnNames &names) {
     names.emplace_back("job_name");
     return_types.emplace_back(LogicalType(LogicalTypeId::VARCHAR));
     names.emplace_back("stream_name");
@@ -1438,7 +1462,7 @@ static void InitializeIngestResources(const shared_ptr<NatsIngestJobState> &job)
         shared_ptr<ProtobufErrorCollector> error_collector;
         shared_ptr<Importer> importer;
         const Descriptor *descriptor = nullptr;
-        ImportProtoSchema(config.proto_file, config.proto_message, source_tree, error_collector, importer, descriptor);
+        ImportProtoSchema(config.proto_file, config.proto_descriptor_set, config.proto_message, source_tree, error_collector, importer, descriptor);
         ResolveProtoFieldPaths(descriptor, config.proto_fields, config.proto_field_paths);
     }
 
@@ -1917,6 +1941,11 @@ static void RunIngestWorker(const shared_ptr<NatsIngestJobState> &job) {
         const char *fail_after_commit_env = std::getenv("NATS_INGEST_FAIL_AFTER_COMMIT");
         bool inject_fail_after_commit = fail_after_commit_env != nullptr && string(fail_after_commit_env) != "0";
         bool injected_fail_after_commit = false;
+        const char *fail_after_fetch_env = std::getenv("NATS_INGEST_FAIL_AFTER_FETCH");
+        bool inject_fail_after_fetch = fail_after_fetch_env != nullptr && string(fail_after_fetch_env) != "0";
+        const char *fail_after_flush_env = std::getenv("NATS_INGEST_FAIL_AFTER_FLUSH");
+        bool inject_fail_after_flush = fail_after_flush_env != nullptr && string(fail_after_flush_env) != "0";
+        bool injected_fail_after_flush = false;
         uint64_t fail_after_append_rows = 0;
         const char *fail_after_append_env = std::getenv("NATS_INGEST_FAIL_AFTER_APPEND");
         if (fail_after_append_env != nullptr) {
@@ -1944,7 +1973,7 @@ static void RunIngestWorker(const shared_ptr<NatsIngestJobState> &job) {
         shared_ptr<DynamicMessageFactory> proto_factory;
 
         if (!config.proto_fields.empty()) {
-            ImportProtoSchema(config.proto_file, config.proto_message, source_tree, error_collector, importer, descriptor);
+            ImportProtoSchema(config.proto_file, config.proto_descriptor_set, config.proto_message, source_tree, error_collector, importer, descriptor);
             if (config.proto_field_paths.empty()) {
                 ResolveProtoFieldPaths(descriptor, config.proto_fields, config.proto_field_paths);
             }
@@ -2090,6 +2119,9 @@ static void RunIngestWorker(const shared_ptr<NatsIngestJobState> &job) {
                 lock_guard<std::mutex> guard(job->job_mutex);
                 job->progress.fetches_completed++;
                 job->progress.last_fetch_time = Timestamp::GetCurrentTimestamp();
+            }
+            if (fetched_from_transport && inject_fail_after_fetch) {
+                std::abort();
             }
 
             std::vector<natsMsg *> ack_msgs;
@@ -2240,6 +2272,10 @@ static void RunIngestWorker(const shared_ptr<NatsIngestJobState> &job) {
                                 .count());
                     } catch (const std::exception &ex) {
                         throw std::runtime_error(string("Failed to flush ingest appender: ") + ex.what());
+                    }
+                    if (inject_fail_after_flush && !injected_fail_after_flush) {
+                        injected_fail_after_flush = true;
+                        std::abort();
                     }
                 }
 
@@ -2545,7 +2581,7 @@ bool NatsIngestManager::RemoveJob(const string &job_name) {
 }
 
 static unique_ptr<FunctionData> NatsIngestStartBind(ClientContext &context, TableFunctionBindInput &input,
-                                                    vector<LogicalType> &return_types, vector<string> &names) {
+                                                    vector<LogicalType> &return_types, NatsBindColumnNames &names) {
     auto config = ParseStartConfig(input);
 
     if (!config.proto_fields.empty()) {
@@ -2553,7 +2589,7 @@ static unique_ptr<FunctionData> NatsIngestStartBind(ClientContext &context, Tabl
         shared_ptr<ProtobufErrorCollector> error_collector;
         shared_ptr<Importer> importer;
         const Descriptor *descriptor = nullptr;
-        ImportProtoSchema(config.proto_file, config.proto_message, source_tree, error_collector, importer, descriptor);
+        ImportProtoSchema(config.proto_file, config.proto_descriptor_set, config.proto_message, source_tree, error_collector, importer, descriptor);
         ResolveProtoFieldPaths(descriptor, config.proto_fields, config.proto_field_paths);
     }
 
@@ -2595,7 +2631,7 @@ static void NatsIngestStartExecute(ClientContext &context, TableFunctionInput &d
 }
 
 static unique_ptr<FunctionData> NatsIngestPauseBind(ClientContext &context, TableFunctionBindInput &input,
-                                                    vector<LogicalType> &return_types, vector<string> &names) {
+                                                    vector<LogicalType> &return_types, NatsBindColumnNames &names) {
     string job_name;
     bool has_job_name = false;
     for (auto &kv : input.named_parameters) {
@@ -2657,7 +2693,7 @@ static void NatsIngestPauseExecute(ClientContext &context, TableFunctionInput &d
 }
 
 static unique_ptr<FunctionData> NatsIngestResumeBind(ClientContext &context, TableFunctionBindInput &input,
-                                                     vector<LogicalType> &return_types, vector<string> &names) {
+                                                     vector<LogicalType> &return_types, NatsBindColumnNames &names) {
     string job_name;
     bool has_job_name = false;
     for (auto &kv : input.named_parameters) {
@@ -2719,7 +2755,7 @@ static void NatsIngestResumeExecute(ClientContext &context, TableFunctionInput &
 }
 
 static unique_ptr<FunctionData> NatsIngestStopBind(ClientContext &context, TableFunctionBindInput &input,
-                                                   vector<LogicalType> &return_types, vector<string> &names) {
+                                                   vector<LogicalType> &return_types, NatsBindColumnNames &names) {
     string job_name;
     bool has_job_name = false;
     for (auto &kv : input.named_parameters) {
@@ -2763,7 +2799,7 @@ static void NatsIngestStopExecute(ClientContext &context, TableFunctionInput &da
 }
 
 static unique_ptr<FunctionData> NatsIngestRemoveBind(ClientContext &context, TableFunctionBindInput &input,
-                                                     vector<LogicalType> &return_types, vector<string> &names) {
+                                                     vector<LogicalType> &return_types, NatsBindColumnNames &names) {
     string job_name;
     bool has_job_name = false;
     for (auto &kv : input.named_parameters) {
@@ -2807,7 +2843,7 @@ static void NatsIngestRemoveExecute(ClientContext &context, TableFunctionInput &
 }
 
 static unique_ptr<FunctionData> NatsIngestStatusBind(ClientContext &context, TableFunctionBindInput &input,
-                                                     vector<LogicalType> &return_types, vector<string> &names) {
+                                                     vector<LogicalType> &return_types, NatsBindColumnNames &names) {
     string job_name;
     bool has_job_name = false;
     for (auto &kv : input.named_parameters) {
@@ -2857,7 +2893,7 @@ static void NatsIngestStatusExecute(ClientContext &context, TableFunctionInput &
 }
 
 static unique_ptr<FunctionData> NatsIngestJobsBind(ClientContext &context, TableFunctionBindInput &input,
-                                                   vector<LogicalType> &return_types, vector<string> &names) {
+                                                   vector<LogicalType> &return_types, NatsBindColumnNames &names) {
     AddSnapshotColumns(return_types, names);
     return make_uniq<NatsIngestJobsBindData>();
 }
@@ -2921,6 +2957,7 @@ void NatsIngestFunction::Register(ExtensionLoader &loader) {
     start_fn.named_parameters["cbor_extract"] = LogicalType::LIST(LogicalType(LogicalTypeId::VARCHAR));
     start_fn.named_parameters["flexbuffers_extract"] = LogicalType::LIST(LogicalType(LogicalTypeId::VARCHAR));
     start_fn.named_parameters["proto_file"] = LogicalType(LogicalTypeId::VARCHAR);
+    start_fn.named_parameters["proto_descriptor_set"] = LogicalType(LogicalTypeId::VARCHAR);
     start_fn.named_parameters["proto_message"] = LogicalType(LogicalTypeId::VARCHAR);
     start_fn.named_parameters["proto_extract"] = LogicalType::LIST(LogicalType(LogicalTypeId::VARCHAR));
     loader.RegisterFunction(start_fn);

@@ -20,7 +20,7 @@ This method automatically downloads the pre-built extension binary for your plat
 For development or if you need to build from source:
 
 **Prerequisites:**
-- DuckDB v1.5.5 (the pinned `duckdb/` submodule; DuckDB 1.5.x/main "tip" APIs are also supported, see `src/include/nats_duckdb_compat.hpp`)
+- DuckDB v1.5.6 (the supported release; the `duckdb/` submodule tracks upstream `main`; see `src/include/nats_duckdb_compat.hpp` for API compatibility)
 - CMake 3.15 or later
 - C++17 compatible compiler
 - [vcpkg](https://vcpkg.io) (recommended — see below) or system installs of the NATS C client (cnats), Protocol Buffers, and FlatBuffers
@@ -119,7 +119,7 @@ FROM nats_scan('telemetry');
 └───────────┴──────────────────────────────────┴────────┴─────────────────────────┴──────────────────────────────────────┘
 ```
 
-The function returns five base columns: `stream` (VARCHAR), `subject` (VARCHAR), `seq` (UBIGINT), `ts_nats` (TIMESTAMP), and `payload` (BLOB by default, VARCHAR when using `json_extract`).
+The function returns five base columns: `stream` (VARCHAR), `subject` (VARCHAR), `seq` (UBIGINT), `ts_nats` (TIMESTAMP), and `payload` (BLOB by default, VARCHAR when using `json_extract`). Set `headers := true` to append an optional `headers` JSON column. Each application key maps to an array of values to preserve repeated headers; JetStream `Nats-*` system headers are omitted, and messages without application headers return `{}`.
 
 ### Sequence Range Queries
 
@@ -156,6 +156,22 @@ FROM nats_scan('telemetry', nats_subject := 'telemetry.dc1.power.pm5560-001');
 ```
 
 Use `nats_subject` for exact or wildcard NATS subject filters that can be pushed down to JetStream. Use `subject_contains` for client-side substring matching on message subjects. The legacy `subject` parameter is still accepted as a substring-compatible alias.
+
+### Stream Discovery and Subject Counts
+
+`nats_streams()` lists stream metadata for the connected JetStream server. Use
+`nats_stream_subjects(stream_name)` to get per-subject message counts without
+fetching payloads. Its optional `subject` parameter applies a server-side NATS
+subject filter (including `*` and `>` wildcards):
+
+```sql
+SELECT stream, messages, first_seq, last_seq
+FROM nats_streams(url := 'nats://localhost:4222');
+
+SELECT subject, messages
+FROM nats_stream_subjects('telemetry', subject := 'telemetry.dc1.power.>')
+ORDER BY messages DESC;
+```
 
 ### Combined Queries
 
@@ -244,7 +260,7 @@ The extension supports extracting fields from Protocol Buffers (protobuf) encode
 
 ### Extracting Protobuf Fields
 
-Use the `proto_extract` parameter along with `proto_file` and `proto_message` to specify fields to extract:
+Use the `proto_extract` parameter along with either `proto_file` or `proto_descriptor_set`, and `proto_message`, to specify fields to extract. Descriptor sets are binary `FileDescriptorSet` files produced by `protoc --descriptor_set_out=... --include_imports` and are useful when the `.proto` sources are unavailable at query time.
 
 ```sql
 SELECT device_id, timestamp, location_zone, metrics_kw, online
@@ -472,7 +488,9 @@ and `COPY TO` formats. `COPY FROM` reuses the same source schema as
 nats_js, url '...')` when the target table matches the scan output layout.
 `COPY TO` publishes rows into JetStream using a source query that provides
 `subject` and `payload` columns, or a constant `subject` option plus a
-`payload` column. The regression tests for those paths are
+`payload` column. For structured protobuf output, `payload_format 'protobuf'`
+accepts exactly one of `proto_file` or `proto_descriptor_set`, together with
+`proto_message` and optional `proto_fields`. The regression tests for those paths are
 [test/sql/test_copy_from.sql](/home/mrayva/duckdb-nats-jetstream/test/sql/test_copy_from.sql),
 [test/sql/test_copy_from_errors.sql](/home/mrayva/duckdb-nats-jetstream/test/sql/test_copy_from_errors.sql),
 [test/sql/test_copy_to.sql](/home/mrayva/duckdb-nats-jetstream/test/sql/test_copy_to.sql),
@@ -509,6 +527,7 @@ NATS instance when comparing runs.
 | `cbor_extract` | LIST(VARCHAR) | No | - | CBOR map field paths to extract |
 | `flexbuffers_extract` | LIST(VARCHAR) | No | - | FlexBuffers map field paths to extract |
 | `proto_file` | VARCHAR | No | - | Path to .proto schema file |
+| `proto_descriptor_set` | VARCHAR | No | - | Path to a binary protobuf `FileDescriptorSet`; use instead of `proto_file` |
 | `proto_message` | VARCHAR | No | - | Protobuf message type name |
 | `proto_extract` | LIST(VARCHAR) | No | - | Protobuf field paths to extract (dot notation for nested fields) |
 | `credentials_file` | VARCHAR | No | - | Path to a NATS `.creds` file (JWT + NKey seed) |
@@ -524,7 +543,7 @@ Sequence-based parameters (`start_seq`, `end_seq`) cannot be combined with times
 
 The extraction parameters (`json_extract`, `msgpack_extract`, `cbor_extract`, `flexbuffers_extract`, `proto_extract`) are mutually exclusive — use exactly one, matching your payload's encoding.
 
-When using `proto_extract`, both `proto_file` and `proto_message` parameters are required. The `proto_file` parameter specifies the path to the .proto schema file, and `proto_message` specifies the message type name within that file.
+When using `proto_extract`, specify exactly one of `proto_file` or `proto_descriptor_set`, plus `proto_message`. The message name is fully qualified when the descriptor declares a package (for example, `telemetry.Telemetry`). Descriptor sets should include imported files (`protoc --include_imports`) unless those dependencies are protobuf well-known types.
 
 Extracted fields are appended as additional columns after the five base columns (`stream`, `subject`, `seq`, `ts_nats`, `payload`). Column names for nested protobuf fields use underscores instead of dots (e.g., `location.zone` becomes `location_zone`).
 
@@ -536,7 +555,8 @@ and exactly-once delivery across restarts. It accepts the same connection,
 subject-filter, and payload-extraction parameters as `nats_scan` (`url`,
 `credentials_file`, `tls_*`, `nats_subject`, `subject_contains`,
 `json_extract`/`msgpack_extract`/`cbor_extract`/`flexbuffers_extract`/
-`proto_extract` + `proto_file`/`proto_message`), plus:
+`proto_extract` + exactly one of `proto_file` or `proto_descriptor_set`, and
+`proto_message`), plus:
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
@@ -561,7 +581,8 @@ a second process can't write concurrently against the same durable consumer.
 
 `nats_start_subscribe` batches messages from a core NATS subject (no
 JetStream replay, no durable resume) into a target table. It accepts the same
-connection and payload-extraction parameters as `nats_scan`, plus:
+connection and payload-extraction parameters as `nats_scan`, including either
+`proto_file` or `proto_descriptor_set` for protobuf decoding, plus:
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|

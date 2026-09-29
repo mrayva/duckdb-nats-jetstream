@@ -83,8 +83,10 @@ struct NatsScanBindData : public TableFunctionData {
     vector<string> cbor_fields;
     vector<vector<string>> cbor_field_paths;
     vector<string> flexbuffers_fields;
+    bool include_headers;
     vector<vector<string>> flexbuffers_field_paths;
     string proto_file;
+    string proto_descriptor_set;
     string proto_message;
     vector<string> proto_fields;
     vector<vector<const FieldDescriptor*>> proto_field_paths;
@@ -95,6 +97,7 @@ struct NatsScanBindData : public TableFunctionData {
     shared_ptr<DiskSourceTree> proto_source_tree;
     shared_ptr<ProtobufErrorCollector> proto_error_collector;
     shared_ptr<Importer> proto_importer;
+    shared_ptr<NatsProtobufSchema> proto_schema;
     const Descriptor* proto_descriptor = nullptr;
 
     NatsScanBindData(string stream, string subject_substr, string nats_subj, NatsConnectionConfig connection_p,
@@ -104,7 +107,8 @@ struct NatsScanBindData : public TableFunctionData {
                      vector<string> cbor_flds,
                      vector<string> flexbuffers_flds,
                      string proto_f, string proto_msg, vector<string> proto_flds,
-                     vector<vector<const FieldDescriptor*>> proto_paths, uint64_t batch_sz, int64_t fetch_timeout)
+                     vector<vector<const FieldDescriptor*>> proto_paths, uint64_t batch_sz, int64_t fetch_timeout,
+                     bool include_headers_p)
         : stream_name(std::move(stream))
         , subject_contains(std::move(subject_substr))
         , nats_subject(std::move(nats_subj))
@@ -117,6 +121,7 @@ struct NatsScanBindData : public TableFunctionData {
         , msgpack_fields(std::move(msgpack_flds))
         , cbor_fields(std::move(cbor_flds))
         , flexbuffers_fields(std::move(flexbuffers_flds))
+        , include_headers(include_headers_p)
         , proto_file(std::move(proto_f))
         , proto_message(std::move(proto_msg))
         , proto_fields(std::move(proto_flds))
@@ -157,6 +162,7 @@ struct NatsCopyToBindData : public TableFunctionData {
     shared_ptr<DiskSourceTree> proto_source_tree;
     shared_ptr<ProtobufErrorCollector> proto_error_collector;
     shared_ptr<Importer> proto_importer;
+    shared_ptr<NatsProtobufSchema> proto_schema;
     const Descriptor *proto_descriptor = nullptr;
 };
 
@@ -237,7 +243,7 @@ static NatsSourceSchema BuildNatsSourceSchema(const vector<string> &json_fields,
                                               const vector<string> &flexbuffers_fields,
                                               const string &proto_file,
                                               const string &proto_message, const vector<string> &proto_fields,
-                                              const Descriptor *descriptor) {
+                                              const Descriptor *descriptor, bool include_headers = false) {
     NatsSourceSchema schema;
     schema.names.emplace_back("stream");
     schema.return_types.emplace_back(LogicalType(LogicalTypeId::VARCHAR));
@@ -289,7 +295,83 @@ static NatsSourceSchema BuildNatsSourceSchema(const vector<string> &json_fields,
         }
     }
 
+    if (include_headers) {
+        schema.names.emplace_back("headers");
+        schema.return_types.emplace_back(LogicalType::JSON());
+    }
+
     return schema;
+}
+
+struct NatsHeaderArrayDeleter {
+    void operator()(const char **values) const {
+        std::free((void *)values);
+    }
+};
+
+static string SerializeNatsMessageHeaders(natsMsg *message) {
+    const char **raw_keys = nullptr;
+    int key_count = 0;
+    natsStatus status = natsMsgHeader_Keys(message, &raw_keys, &key_count);
+    std::unique_ptr<const char *, NatsHeaderArrayDeleter> keys(raw_keys);
+    if (status == NATS_NOT_FOUND || key_count == 0) {
+        return "{}";
+    }
+    if (status != NATS_OK) {
+        throw std::runtime_error(string("Failed to read NATS message header keys: ") + natsStatus_GetText(status));
+    }
+
+    vector<const char *> user_keys;
+    user_keys.reserve(key_count);
+    for (int i = 0; i < key_count; i++) {
+        const char *key = keys.get()[i];
+        if (key != nullptr && !(std::strlen(key) >= 5 && StringUtil::CIEquals(string(key, 5), "Nats-"))) {
+            user_keys.push_back(key);
+        }
+    }
+    if (user_keys.empty()) {
+        return "{}";
+    }
+
+    std::unique_ptr<yyjson_mut_doc, decltype(&yyjson_mut_doc_free)> doc(yyjson_mut_doc_new(nullptr),
+                                                                       yyjson_mut_doc_free);
+    if (!doc) {
+        throw std::runtime_error("Failed to allocate JSON document for NATS message headers");
+    }
+    auto *root = yyjson_mut_obj(doc.get());
+    if (root == nullptr) {
+        throw std::runtime_error("Failed to allocate JSON object for NATS message headers");
+    }
+    yyjson_mut_doc_set_root(doc.get(), root);
+
+    for (const auto *key : user_keys) {
+        const char **raw_values = nullptr;
+        int value_count = 0;
+        status = natsMsgHeader_Values(message, key, &raw_values, &value_count);
+        std::unique_ptr<const char *, NatsHeaderArrayDeleter> values(raw_values);
+        if (status != NATS_OK) {
+            throw std::runtime_error(string("Failed to read NATS message header '") + (key ? key : "") + "': " +
+                                     natsStatus_GetText(status));
+        }
+        auto *value_array = yyjson_mut_arr(doc.get());
+        if (value_array == nullptr) {
+            throw std::runtime_error("Failed to allocate JSON array for NATS message header values");
+        }
+        for (int value_idx = 0; value_idx < value_count; value_idx++) {
+            if (!yyjson_mut_arr_add_str(doc.get(), value_array, values.get()[value_idx] ? values.get()[value_idx] : "")) {
+                throw std::runtime_error("Failed to serialize NATS message header value");
+            }
+        }
+        if (!yyjson_mut_obj_add_val(doc.get(), root, key, value_array)) {
+            throw std::runtime_error("Failed to serialize NATS message header key");
+        }
+    }
+
+    std::unique_ptr<char, decltype(&std::free)> json(yyjson_mut_write(doc.get(), 0, nullptr), std::free);
+    if (!json) {
+        throw std::runtime_error("Failed to encode NATS message headers as JSON");
+    }
+    return string(json.get());
 }
 
 static string ResolveNatsCopyStreamName(const string &file_path, const char *copy_mode) {
@@ -353,6 +435,7 @@ static void NatsCopyListOptions(ClientContext &, CopyOptionsInput &input) {
     copy_options["cbor_extract"] = CopyOption(LogicalType::ANY, CopyOptionMode::READ_WRITE);
     copy_options["flexbuffers_extract"] = CopyOption(LogicalType::ANY, CopyOptionMode::READ_WRITE);
     copy_options["proto_file"] = CopyOption(LogicalType::VARCHAR, CopyOptionMode::READ_WRITE);
+    copy_options["proto_descriptor_set"] = CopyOption(LogicalType::VARCHAR, CopyOptionMode::READ_WRITE);
     copy_options["proto_message"] = CopyOption(LogicalType::VARCHAR, CopyOptionMode::READ_WRITE);
     copy_options["proto_extract"] = CopyOption(LogicalType::ANY, CopyOptionMode::READ_WRITE);
     copy_options["batch_size"] = CopyOption(LogicalType::UBIGINT, CopyOptionMode::READ_WRITE);
@@ -1239,9 +1322,10 @@ static unique_ptr<FunctionData> NatsCopyToBind(ClientContext &context, CopyFunct
 
         if (result->payload_format == NatsCopyToBindData::PayloadFormat::PROTOBUF) {
             auto proto_file = GetCopyOptionString(input.info.options, "proto_file").value_or("");
+            auto descriptor_set = GetCopyOptionString(input.info.options, "proto_descriptor_set").value_or("");
             auto proto_message = GetCopyOptionString(input.info.options, "proto_message").value_or("");
-            if (proto_file.empty() || proto_message.empty()) {
-                throw BinderException("COPY TO protobuf requires proto_file and proto_message");
+            if (proto_file.empty() == descriptor_set.empty() || proto_message.empty()) {
+                throw BinderException("COPY TO protobuf requires exactly one of proto_file or proto_descriptor_set, and proto_message");
             }
 
             auto proto_fields = GetCopyOptionStringList(input.info.options, "proto_fields");
@@ -1252,7 +1336,9 @@ static unique_ptr<FunctionData> NatsCopyToBind(ClientContext &context, CopyFunct
                 throw BinderException("COPY TO protobuf requires one proto_fields entry per payload column");
             }
 
-            auto proto_schema = GetNatsProtobufSchema(proto_file, proto_message);
+            auto proto_schema = descriptor_set.empty() ? GetNatsProtobufSchema(proto_file, proto_message)
+                                                       : GetNatsProtobufDescriptorSetSchema(descriptor_set, proto_message);
+            result->proto_schema = proto_schema;
             result->proto_source_tree = proto_schema->source_tree;
             result->proto_error_collector = make_shared_ptr<ProtobufErrorCollector>();
             result->proto_importer = proto_schema->importer;
@@ -1462,7 +1548,7 @@ struct ProjectedFieldColumn {
 };
 
 static unique_ptr<FunctionData> NatsScanBind(ClientContext &context, TableFunctionBindInput &input,
-                                              vector<LogicalType> &return_types, vector<string> &names) {
+                                              vector<LogicalType> &return_types, NatsBindColumnNames &names) {
     if (input.inputs.empty()) {
         throw std::runtime_error("nats_scan requires at least one argument: stream_name");
     }
@@ -1477,11 +1563,13 @@ static unique_ptr<FunctionData> NatsScanBind(ClientContext &context, TableFuncti
     uint64_t end_seq = UINT64_MAX;
     int64_t start_time = 0;
     int64_t end_time = 0;
+    bool include_headers = false;
     vector<string> json_fields;
     vector<string> msgpack_fields;
     vector<string> cbor_fields;
     vector<string> flexbuffers_fields;
     string proto_file = "";
+    string proto_descriptor_set = "";
     string proto_message = "";
     vector<string> proto_fields;
     uint64_t batch_size = 4096;
@@ -1527,6 +1615,8 @@ static unique_ptr<FunctionData> NatsScanBind(ClientContext &context, TableFuncti
             }
         } else if (kv.first == "proto_file") {
             proto_file = StringValue::Get(kv.second);
+        } else if (kv.first == "proto_descriptor_set") {
+            proto_descriptor_set = StringValue::Get(kv.second);
         } else if (kv.first == "proto_message") {
             proto_message = StringValue::Get(kv.second);
         } else if (kv.first == "proto_extract") {
@@ -1538,6 +1628,8 @@ static unique_ptr<FunctionData> NatsScanBind(ClientContext &context, TableFuncti
             batch_size = UBigIntValue::Get(kv.second);
         } else if (kv.first == "fetch_timeout_ms") {
             fetch_timeout_ms = BigIntValue::Get(kv.second);
+        } else if (kv.first == "headers") {
+            include_headers = BooleanValue::Get(kv.second);
         }
     }
 
@@ -1569,8 +1661,8 @@ static unique_ptr<FunctionData> NatsScanBind(ClientContext &context, TableFuncti
     }
 
     if (!proto_fields.empty()) {
-        if (proto_file.empty()) {
-            throw std::runtime_error("proto_file parameter is required when using proto_extract");
+        if (proto_file.empty() == proto_descriptor_set.empty()) {
+            throw std::runtime_error("Exactly one of proto_file or proto_descriptor_set is required when using proto_extract");
         }
         if (proto_message.empty()) {
             throw std::runtime_error("proto_message parameter is required when using proto_extract");
@@ -1585,29 +1677,35 @@ static unique_ptr<FunctionData> NatsScanBind(ClientContext &context, TableFuncti
     vector<vector<const FieldDescriptor*>> proto_field_paths;
 
     if (!proto_fields.empty()) {
-        auto proto_schema = GetNatsProtobufSchema(proto_file, proto_message);
+        auto proto_schema = proto_descriptor_set.empty() ? GetNatsProtobufSchema(proto_file, proto_message)
+                                                         : GetNatsProtobufDescriptorSetSchema(proto_descriptor_set, proto_message);
         source_tree = proto_schema->source_tree;
         error_collector = make_shared_ptr<ProtobufErrorCollector>();
         importer = proto_schema->importer;
         descriptor = proto_schema->descriptor;
 
-        // Resolve and validate requested fields once. The descriptor pointers
-        // remain valid while bind_data owns the protobuf importer.
+        // Resolve and validate requested fields once. The bind data retains the schema owner.
         for (const auto &field_path : proto_fields) {
             proto_field_paths.push_back(ResolveProtobufFieldPath(descriptor, field_path));
         }
     }
 
     auto schema = BuildNatsSourceSchema(json_fields, msgpack_fields, cbor_fields, flexbuffers_fields, proto_file,
-                                        proto_message, proto_fields, descriptor);
-    names = schema.names;
+                                        proto_message, proto_fields, descriptor, include_headers);
+    names.clear();
+    names.reserve(schema.names.size());
+    for (const auto &name : schema.names) {
+        names.emplace_back(name);
+    }
     return_types = schema.return_types;
 
     auto bind_data = make_uniq<NatsScanBindData>(stream_name, subject_contains, nats_subject, std::move(connection), start_seq, end_seq,
         start_time, end_time, json_fields, msgpack_fields, cbor_fields, flexbuffers_fields, proto_file, proto_message, proto_fields,
-                                                  std::move(proto_field_paths), batch_size, fetch_timeout_ms);
+                                                  std::move(proto_field_paths), batch_size, fetch_timeout_ms, include_headers);
 
     if (!proto_fields.empty()) {
+        bind_data->proto_schema = proto_descriptor_set.empty() ? GetNatsProtobufSchema(proto_file, proto_message)
+                                                               : GetNatsProtobufDescriptorSetSchema(proto_descriptor_set, proto_message);
         bind_data->proto_source_tree = source_tree;
         bind_data->proto_error_collector = error_collector;
         bind_data->proto_importer = importer;
@@ -1884,6 +1982,11 @@ static void NatsScanExecute(ClientContext &context, TableFunctionInput &data_p, 
     bool needs_cbor = false;
     bool needs_flexbuffers = false;
     bool needs_proto = false;
+    bool needs_headers = false;
+    idx_t headers_output_idx = DConstants::INVALID_INDEX;
+    const idx_t headers_column_id = 5 + bind_data.json_fields.size() + bind_data.msgpack_fields.size() +
+                                    bind_data.cbor_fields.size() + bind_data.flexbuffers_fields.size() +
+                                    bind_data.proto_fields.size();
     vector<ProjectedFieldColumn> json_columns;
     vector<ProjectedFieldColumn> msgpack_columns;
     vector<ProjectedFieldColumn> proto_columns;
@@ -1899,6 +2002,9 @@ static void NatsScanExecute(ClientContext &context, TableFunctionInput &data_p, 
             needs_ts = true;
         } else if (col_id == 4) {
             needs_payload = true;
+        } else if (bind_data.include_headers && col_id == headers_column_id) {
+            needs_headers = true;
+            headers_output_idx = out_idx;
         } else if (col_id >= 5 && col_id < 5 + bind_data.json_fields.size()) {
             needs_json = true;
             json_columns.push_back({out_idx, static_cast<idx_t>(col_id - 5)});
@@ -2110,6 +2216,13 @@ static void NatsScanExecute(ClientContext &context, TableFunctionInput &data_p, 
             }
         }
 
+        if (needs_headers) {
+            auto headers = SerializeNatsMessageHeaders(msg);
+            auto &headers_vector = output.data[headers_output_idx];
+            auto headers_data = GetNatsMutableVectorData<string_t>(headers_vector);
+            headers_data[count] = StringVector::AddString(headers_vector, headers.data(), headers.size());
+        }
+
         natsMsg_Destroy(msg);
 
         count++;
@@ -2155,8 +2268,247 @@ struct NatsStreamStatsGlobalState : public GlobalTableFunctionState {
     }
 };
 
+struct NatsStreamCatalogRow {
+    string stream;
+    int64_t created_ns = 0;
+    uint64_t messages = 0;
+    uint64_t bytes = 0;
+    uint64_t first_seq = 0;
+    int64_t first_time_ns = 0;
+    uint64_t last_seq = 0;
+    int64_t last_time_ns = 0;
+    uint64_t deleted_count = 0;
+    int64_t consumer_count = 0;
+    int64_t subject_count = 0;
+};
+
+struct NatsStreamCatalogGlobalState : public GlobalTableFunctionState {
+    vector<NatsStreamCatalogRow> rows;
+    idx_t row_idx = 0;
+
+    idx_t MaxThreads() const override {
+        return 1;
+    }
+};
+
+struct NatsStreamCatalogBindData : public TableFunctionData {
+    NatsConnectionConfig connection;
+
+    explicit NatsStreamCatalogBindData(NatsConnectionConfig connection_p) : connection(std::move(connection_p)) {
+    }
+};
+
+struct NatsStreamSubjectsBindData : public TableFunctionData {
+    string stream_name;
+    string subject_filter;
+    NatsConnectionConfig connection;
+
+    NatsStreamSubjectsBindData(string stream, string filter, NatsConnectionConfig connection_p)
+        : stream_name(std::move(stream)), subject_filter(std::move(filter)), connection(std::move(connection_p)) {
+    }
+};
+
+struct NatsStreamSubjectRow {
+    string subject;
+    uint64_t messages = 0;
+};
+
+struct NatsStreamSubjectsGlobalState : public GlobalTableFunctionState {
+    vector<NatsStreamSubjectRow> rows;
+    idx_t row_idx = 0;
+
+    idx_t MaxThreads() const override {
+        return 1;
+    }
+};
+
+static void AddNatsStreamCatalogColumns(vector<LogicalType> &return_types, NatsBindColumnNames &names) {
+    for (const auto &name : {"stream", "created", "messages", "bytes", "first_seq", "first_time", "last_seq",
+                             "last_time", "deleted_count", "consumer_count", "subject_count"}) {
+        names.emplace_back(name);
+    }
+    return_types.emplace_back(LogicalType(LogicalTypeId::VARCHAR));
+    return_types.emplace_back(LogicalType(LogicalTypeId::TIMESTAMP));
+    return_types.emplace_back(LogicalType(LogicalTypeId::UBIGINT));
+    return_types.emplace_back(LogicalType(LogicalTypeId::UBIGINT));
+    return_types.emplace_back(LogicalType(LogicalTypeId::UBIGINT));
+    return_types.emplace_back(LogicalType(LogicalTypeId::TIMESTAMP));
+    return_types.emplace_back(LogicalType(LogicalTypeId::UBIGINT));
+    return_types.emplace_back(LogicalType(LogicalTypeId::TIMESTAMP));
+    return_types.emplace_back(LogicalType(LogicalTypeId::UBIGINT));
+    return_types.emplace_back(LogicalType(LogicalTypeId::BIGINT));
+    return_types.emplace_back(LogicalType(LogicalTypeId::BIGINT));
+}
+
+static unique_ptr<FunctionData> NatsStreamCatalogBind(ClientContext &, TableFunctionBindInput &input,
+                                                       vector<LogicalType> &return_types, NatsBindColumnNames &names) {
+    NatsConnectionConfig connection;
+    for (auto &kv : input.named_parameters) {
+        ParseNatsConnectionParameter(connection, string(kv.first), kv.second);
+    }
+    ValidateNatsConnectionConfig(connection);
+    AddNatsStreamCatalogColumns(return_types, names);
+    return make_uniq<NatsStreamCatalogBindData>(std::move(connection));
+}
+
+static unique_ptr<GlobalTableFunctionState> NatsStreamCatalogInitGlobal(ClientContext &, TableFunctionInitInput &input) {
+    auto &bind_data = input.bind_data->Cast<NatsStreamCatalogBindData>();
+    auto state = make_uniq<NatsStreamCatalogGlobalState>();
+    natsConnection *conn = nullptr;
+    jsCtx *js = nullptr;
+    jsStreamInfoList *stream_list = nullptr;
+    try {
+        ConnectJetStream(bind_data.connection, &conn, &js);
+        natsStatus status = js_Streams(&stream_list, js, nullptr, nullptr);
+        if (status != NATS_OK) {
+            throw std::runtime_error(string("Failed to list JetStream streams: ") + natsStatus_GetText(status));
+        }
+        state->rows.reserve(stream_list->Count);
+        for (int i = 0; i < stream_list->Count; i++) {
+            auto *info = stream_list->List[i];
+            if (info == nullptr || info->Config == nullptr || info->Config->Name == nullptr) {
+                continue;
+            }
+            const auto &stream = info->State;
+            NatsStreamCatalogRow row;
+            row.stream = info->Config->Name;
+            row.created_ns = info->Created;
+            row.messages = stream.Msgs;
+            row.bytes = stream.Bytes;
+            row.first_seq = stream.FirstSeq;
+            row.first_time_ns = stream.FirstTime;
+            row.last_seq = stream.LastSeq;
+            row.last_time_ns = stream.LastTime;
+            row.deleted_count = stream.NumDeleted;
+            row.consumer_count = stream.Consumers;
+            row.subject_count = stream.NumSubjects;
+            state->rows.push_back(std::move(row));
+        }
+        jsStreamInfoList_Destroy(stream_list);
+        jsCtx_Destroy(js);
+        natsConnection_Destroy(conn);
+        return std::move(state);
+    } catch (...) {
+        if (stream_list != nullptr) {
+            jsStreamInfoList_Destroy(stream_list);
+        }
+        if (js != nullptr) {
+            jsCtx_Destroy(js);
+        }
+        if (conn != nullptr) {
+            natsConnection_Destroy(conn);
+        }
+        throw;
+    }
+}
+
+static unique_ptr<FunctionData> NatsStreamSubjectsBind(ClientContext &, TableFunctionBindInput &input,
+                                                        vector<LogicalType> &return_types, NatsBindColumnNames &names) {
+    if (input.inputs.empty()) {
+        throw BinderException("nats_stream_subjects requires one argument: stream_name");
+    }
+    auto stream_name = input.inputs[0].GetValue<string>();
+    string subject_filter;
+    NatsConnectionConfig connection;
+    for (auto &kv : input.named_parameters) {
+        if (kv.first == "subject") {
+            subject_filter = StringValue::Get(kv.second);
+        } else {
+            ParseNatsConnectionParameter(connection, string(kv.first), kv.second);
+        }
+    }
+    ValidateNatsConnectionConfig(connection);
+    names.emplace_back("stream");
+    names.emplace_back("subject");
+    names.emplace_back("messages");
+    return_types.emplace_back(LogicalType(LogicalTypeId::VARCHAR));
+    return_types.emplace_back(LogicalType(LogicalTypeId::VARCHAR));
+    return_types.emplace_back(LogicalType(LogicalTypeId::UBIGINT));
+    return make_uniq<NatsStreamSubjectsBindData>(std::move(stream_name), std::move(subject_filter),
+                                                  std::move(connection));
+}
+
+static unique_ptr<GlobalTableFunctionState> NatsStreamSubjectsInitGlobal(ClientContext &, TableFunctionInitInput &input) {
+    auto &bind_data = input.bind_data->Cast<NatsStreamSubjectsBindData>();
+    auto state = make_uniq<NatsStreamSubjectsGlobalState>();
+    natsConnection *conn = nullptr;
+    jsCtx *js = nullptr;
+    jsStreamInfo *stream_info = nullptr;
+    try {
+        ConnectJetStream(bind_data.connection, &conn, &js);
+        jsOptions options;
+        jsOptions_Init(&options);
+        options.Stream.Info.SubjectsFilter = bind_data.subject_filter.empty() ? ">" : bind_data.subject_filter.c_str();
+        natsStatus status = js_GetStreamInfo(&stream_info, js, bind_data.stream_name.c_str(), &options, nullptr);
+        if (status != NATS_OK) {
+            throw std::runtime_error(string("Failed to get subject counts for stream '") + bind_data.stream_name +
+                                     "': " + natsStatus_GetText(status));
+        }
+        auto *subjects = stream_info->State.Subjects;
+        if (subjects != nullptr) {
+            state->rows.reserve(subjects->Count);
+            for (int i = 0; i < subjects->Count; i++) {
+                state->rows.push_back({subjects->List[i].Subject ? subjects->List[i].Subject : "",
+                                       subjects->List[i].Msgs});
+            }
+        }
+        jsStreamInfo_Destroy(stream_info);
+        jsCtx_Destroy(js);
+        natsConnection_Destroy(conn);
+        return std::move(state);
+    } catch (...) {
+        if (stream_info != nullptr) {
+            jsStreamInfo_Destroy(stream_info);
+        }
+        if (js != nullptr) {
+            jsCtx_Destroy(js);
+        }
+        if (conn != nullptr) {
+            natsConnection_Destroy(conn);
+        }
+        throw;
+    }
+}
+
+static void SetTimestampNs(DataChunk &output, idx_t col_idx, idx_t row_idx, int64_t timestamp_ns);
+
+static void NatsStreamCatalogExecute(ClientContext &, TableFunctionInput &input, DataChunk &output) {
+    auto &state = input.global_state->Cast<NatsStreamCatalogGlobalState>();
+    idx_t row_idx = 0;
+    while (row_idx < STANDARD_VECTOR_SIZE && state.row_idx < state.rows.size()) {
+        const auto &row = state.rows[state.row_idx++];
+        output.SetValue(0, row_idx, Value(row.stream));
+        SetTimestampNs(output, 1, row_idx, row.created_ns);
+        output.SetValue(2, row_idx, Value::UBIGINT(row.messages));
+        output.SetValue(3, row_idx, Value::UBIGINT(row.bytes));
+        output.SetValue(4, row_idx, Value::UBIGINT(row.first_seq));
+        SetTimestampNs(output, 5, row_idx, row.first_time_ns);
+        output.SetValue(6, row_idx, Value::UBIGINT(row.last_seq));
+        SetTimestampNs(output, 7, row_idx, row.last_time_ns);
+        output.SetValue(8, row_idx, Value::UBIGINT(row.deleted_count));
+        output.SetValue(9, row_idx, Value::BIGINT(row.consumer_count));
+        output.SetValue(10, row_idx, Value::BIGINT(row.subject_count));
+        row_idx++;
+    }
+    output.SetCardinality(row_idx);
+}
+
+static void NatsStreamSubjectsExecute(ClientContext &, TableFunctionInput &input, DataChunk &output) {
+    auto &bind_data = input.bind_data->Cast<NatsStreamSubjectsBindData>();
+    auto &state = input.global_state->Cast<NatsStreamSubjectsGlobalState>();
+    idx_t row_idx = 0;
+    while (row_idx < STANDARD_VECTOR_SIZE && state.row_idx < state.rows.size()) {
+        const auto &row = state.rows[state.row_idx++];
+        output.SetValue(0, row_idx, Value(bind_data.stream_name));
+        output.SetValue(1, row_idx, Value(row.subject));
+        output.SetValue(2, row_idx, Value::UBIGINT(row.messages));
+        row_idx++;
+    }
+    output.SetCardinality(row_idx);
+}
+
 static unique_ptr<FunctionData> NatsStreamStatsBind(ClientContext &context, TableFunctionBindInput &input,
-                                                     vector<LogicalType> &return_types, vector<string> &names) {
+                                                     vector<LogicalType> &return_types, NatsBindColumnNames &names) {
     if (input.inputs.empty()) {
         throw std::runtime_error("nats_stream_stats requires one argument: stream_name");
     }
@@ -2194,7 +2546,7 @@ static unique_ptr<FunctionData> NatsStreamStatsBind(ClientContext &context, Tabl
 }
 
 static unique_ptr<FunctionData> NatsStreamRangeStatsBind(ClientContext &context, TableFunctionBindInput &input,
-                                                          vector<LogicalType> &return_types, vector<string> &names) {
+                                                          vector<LogicalType> &return_types, NatsBindColumnNames &names) {
     if (input.inputs.empty()) {
         throw std::runtime_error("nats_stream_range_stats requires one argument: stream_name");
     }
@@ -2444,7 +2796,9 @@ static TableFunction CreateNatsScanTableFunction() {
     nats_scan.named_parameters["msgpack_extract"] = LogicalType::LIST(LogicalType(LogicalTypeId::VARCHAR));
     nats_scan.named_parameters["cbor_extract"] = LogicalType::LIST(LogicalType(LogicalTypeId::VARCHAR));
     nats_scan.named_parameters["flexbuffers_extract"] = LogicalType::LIST(LogicalType(LogicalTypeId::VARCHAR));
+    nats_scan.named_parameters["headers"] = LogicalType(LogicalTypeId::BOOLEAN);
     nats_scan.named_parameters["proto_file"] = LogicalType(LogicalTypeId::VARCHAR);
+    nats_scan.named_parameters["proto_descriptor_set"] = LogicalType(LogicalTypeId::VARCHAR);
     nats_scan.named_parameters["proto_message"] = LogicalType(LogicalTypeId::VARCHAR);
     nats_scan.named_parameters["proto_extract"] = LogicalType::LIST(LogicalType(LogicalTypeId::VARCHAR));
     nats_scan.named_parameters["batch_size"] = LogicalType(LogicalTypeId::UBIGINT);
@@ -2454,7 +2808,7 @@ static TableFunction CreateNatsScanTableFunction() {
 }
 
 static unique_ptr<FunctionData> NatsCopyFromBind(ClientContext &context, CopyFromFunctionBindInput &input,
-                                                 vector<string> &expected_names, vector<LogicalType> &expected_types) {
+                                                 NatsCopyFromColumnNames &expected_names, vector<LogicalType> &expected_types) {
     auto stream_name = ResolveNatsCopyStreamName(input.info.file_path, "COPY FROM");
     string subject_legacy;
     auto subject_contains = GetCopyOptionString(input.info.options, "subject_contains").value_or("");
@@ -2477,6 +2831,7 @@ static unique_ptr<FunctionData> NatsCopyFromBind(ClientContext &context, CopyFro
     vector<string> cbor_fields = GetCopyOptionStringList(input.info.options, "cbor_extract");
     vector<string> flexbuffers_fields = GetCopyOptionStringList(input.info.options, "flexbuffers_extract");
     string proto_file = GetCopyOptionString(input.info.options, "proto_file").value_or("");
+    string proto_descriptor_set = GetCopyOptionString(input.info.options, "proto_descriptor_set").value_or("");
     string proto_message = GetCopyOptionString(input.info.options, "proto_message").value_or("");
     vector<string> proto_fields = GetCopyOptionStringList(input.info.options, "proto_extract");
     uint64_t batch_size = GetCopyOptionUBigInt(input.info.options, "batch_size", 4096);
@@ -2517,8 +2872,8 @@ static unique_ptr<FunctionData> NatsCopyFromBind(ClientContext &context, CopyFro
         throw std::runtime_error("Cannot combine JSON, MessagePack, CBOR, and protobuf extraction parameters");
     }
     if (!proto_fields.empty()) {
-        if (proto_file.empty()) {
-            throw std::runtime_error("proto_file parameter is required when using proto_extract");
+        if (proto_file.empty() == proto_descriptor_set.empty()) {
+            throw std::runtime_error("Exactly one of proto_file or proto_descriptor_set is required when using proto_extract");
         }
         if (proto_message.empty()) {
             throw std::runtime_error("proto_message parameter is required when using proto_extract");
@@ -2532,7 +2887,8 @@ static unique_ptr<FunctionData> NatsCopyFromBind(ClientContext &context, CopyFro
     vector<vector<const FieldDescriptor *>> proto_field_paths;
 
     if (!proto_fields.empty()) {
-        auto proto_schema = GetNatsProtobufSchema(proto_file, proto_message);
+        auto proto_schema = proto_descriptor_set.empty() ? GetNatsProtobufSchema(proto_file, proto_message)
+                                                         : GetNatsProtobufDescriptorSetSchema(proto_descriptor_set, proto_message);
         source_tree = proto_schema->source_tree;
         error_collector = make_shared_ptr<ProtobufErrorCollector>();
         importer = proto_schema->importer;
@@ -2545,13 +2901,21 @@ static unique_ptr<FunctionData> NatsCopyFromBind(ClientContext &context, CopyFro
 
     auto schema = BuildNatsSourceSchema(json_fields, msgpack_fields, cbor_fields, flexbuffers_fields, proto_file,
                                         proto_message, proto_fields, descriptor);
-    ValidateNatsCopyFromSchema(expected_names, expected_types, schema);
+    vector<string> expected_name_strings;
+    expected_name_strings.reserve(expected_names.size());
+    for (const auto &name : expected_names) {
+        expected_name_strings.emplace_back(name);
+    }
+    ValidateNatsCopyFromSchema(expected_name_strings, expected_types, schema);
 
     auto bind_data = make_uniq<NatsScanBindData>(stream_name, subject_contains, nats_subject, std::move(connection), start_seq, end_seq,
         start_time, end_time, json_fields, msgpack_fields, cbor_fields, flexbuffers_fields, proto_file, proto_message,
-                                                 proto_fields, std::move(proto_field_paths), batch_size, fetch_timeout_ms);
+                                                 proto_fields, std::move(proto_field_paths), batch_size, fetch_timeout_ms,
+                                                 false);
 
     if (!proto_fields.empty()) {
+        bind_data->proto_schema = proto_descriptor_set.empty() ? GetNatsProtobufSchema(proto_file, proto_message)
+                                                               : GetNatsProtobufDescriptorSetSchema(proto_descriptor_set, proto_message);
         bind_data->proto_source_tree = source_tree;
         bind_data->proto_error_collector = error_collector;
         bind_data->proto_importer = importer;
@@ -2568,6 +2932,18 @@ void NatsScanFunction::Register(ExtensionLoader &loader) {
 }
 
 void NatsStreamStatsFunction::Register(ExtensionLoader &loader) {
+    TableFunction nats_streams("nats_streams", {}, NatsStreamCatalogExecute, NatsStreamCatalogBind,
+                               NatsStreamCatalogInitGlobal);
+    RegisterNatsConnectionParameters(nats_streams);
+    loader.RegisterFunction(nats_streams);
+
+    TableFunction nats_stream_subjects("nats_stream_subjects", {LogicalType(LogicalTypeId::VARCHAR)},
+                                       NatsStreamSubjectsExecute, NatsStreamSubjectsBind,
+                                       NatsStreamSubjectsInitGlobal);
+    nats_stream_subjects.named_parameters["subject"] = LogicalType(LogicalTypeId::VARCHAR);
+    RegisterNatsConnectionParameters(nats_stream_subjects);
+    loader.RegisterFunction(nats_stream_subjects);
+
     for (const auto &function_name : {"nats_stream_stats", "nats_stream_info"}) {
         TableFunction nats_stream_stats(function_name, {LogicalType(LogicalTypeId::VARCHAR)}, NatsStreamStatsExecute,
                                         NatsStreamStatsBind, NatsStreamStatsInitGlobal);

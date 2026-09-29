@@ -5,14 +5,14 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$ROOT_DIR/scripts/duckdb_host_lib.sh"
 if [ -z "${DUCKDB_BIN:-}" ]; then
-  for candidate in "$HOME/duckdb" "$HOME/.duckdb/cli/1.5.5/duckdb"; do
+  for candidate in "$HOME/duckdb" "$HOME/.duckdb/cli/1.5.6/duckdb"; do
     if [ -x "$candidate" ]; then
       DUCKDB_BIN="$candidate"
       break
     fi
   done
 fi
-DUCKDB_BIN="${DUCKDB_BIN:-$HOME/.duckdb/cli/1.5.5/duckdb}"
+DUCKDB_BIN="${DUCKDB_BIN:-$HOME/.duckdb/cli/1.5.6/duckdb}"
 EXTENSION_PATH="${EXTENSION_PATH:-$ROOT_DIR/build/release/extension/nats_js/nats_js.duckdb_extension}"
 NATS_URL="${NATS_URL:-nats://127.0.0.1:4222}"
 NATS_CLI="${NATS_CLI:-$HOME/nats}"
@@ -49,6 +49,13 @@ if [ ! -x "$PYTHON_BIN" ]; then
   PYTHON_BIN="$(command -v python3)"
 fi
 
+echo "RUN protobuf descriptor-set unit tests"
+DUCKDB_LIB="$COPY_DUCKDB_LIB" "$PYTHON_BIN" "$ROOT_DIR/scripts/test-protobuf-descriptor-set.py" \
+  --duckdb-bin "$COPY_DUCKDB_BIN" \
+  --duckdb-lib "$COPY_DUCKDB_LIB" \
+  --extension "$COPY_EXTENSION_PATH"
+echo "PASS protobuf descriptor-set unit tests"
+
 run_sql_test() {
   local test_file="$1"
   local log_file="$2"
@@ -70,7 +77,12 @@ echo "Preparing JetStream streams"
 NATS_URL="$NATS_URL" NATS_CLI="$NATS_CLI" RESET_STREAMS="${RESET_STREAMS:-1}" "$ROOT_DIR/scripts/setup-streams.sh"
 
 echo "Generating fixtures"
+protoc -I "$ROOT_DIR/test/proto" --include_imports \
+  --descriptor_set_out=/tmp/nats-js-telemetry.protoset "$ROOT_DIR/test/proto/telemetry.proto"
 "$PYTHON_BIN" "$ROOT_DIR/scripts/generate-telemetry.py" --url "$NATS_URL" --hours "${FIXTURE_HOURS:-2}" --interval-seconds "${FIXTURE_INTERVAL_SECONDS:-60}"
+"$NATS_CLI" pub --server "$NATS_URL" --jetstream --quiet \
+  --header 'X-Trace-Id:trace-123' --header 'X-Tag:first' --header 'X-Tag:second' \
+  telemetry.dc1.power.header-test '{"fixture":"message-headers"}' >/dev/null
 "$PYTHON_BIN" "$ROOT_DIR/test/proto/generate_protobuf_data.py"
 
 success_tests=(
@@ -79,8 +91,10 @@ success_tests=(
   test/sql/test_sequence_ranges.sql
   test/sql/test_subject_filtering.sql
   test/sql/test_protobuf.sql
+  test/sql/test_protobuf_descriptor_set.sql
   test/sql/test_payload_blob.sql
   test/sql/test_stream_stats.sql
+  test/sql/test_message_headers.sql
   test/sql/test_connection_errors.sql
   test/sql/test_repeated_fields.sql
   test/sql/test_msgpack_extraction.sql
@@ -106,7 +120,7 @@ if run_sql_test "test/sql/test_protobuf_errors.sql" /tmp/test_protobuf_errors.sq
 fi
 
 for pattern in \
-  "proto_file parameter is required" \
+  "Exactly one of proto_file or proto_descriptor_set is required" \
   "proto_message parameter is required" \
   "Failed to stat protobuf schema file" \
   "Message type 'NonExistentMessage' not found" \
@@ -262,11 +276,23 @@ RESET_STREAMS=1 \
 "$ROOT_DIR/scripts/run-ingest-ownership-harness.sh"
 echo "PASS scripts/run-ingest-ownership-harness.sh"
 
+echo "RUN scripts/run-ingest-stale-lease-harness.sh"
+NATS_URL="$NATS_URL" \
+NATS_CLI="$NATS_CLI" \
+RESET_STREAMS=1 \
+"$ROOT_DIR/scripts/run-ingest-stale-lease-harness.sh"
+echo "PASS scripts/run-ingest-stale-lease-harness.sh"
+
 echo "RUN scripts/run-subscribe-harness.sh"
 NATS_URL="$NATS_URL" \
 NATS_CLI="$NATS_CLI" \
 "$ROOT_DIR/scripts/run-subscribe-harness.sh"
 echo "PASS scripts/run-subscribe-harness.sh"
+
+echo "RUN scripts/run-nats-restart-jobs-harness.sh"
+DUCKDB_BIN="$COPY_DUCKDB_BIN" DUCKDB_LIB="$COPY_DUCKDB_LIB" EXTENSION_PATH="$COPY_EXTENSION_PATH" \
+  NATS_CLI="$NATS_CLI" "$ROOT_DIR/scripts/run-nats-restart-jobs-harness.sh"
+echo "PASS scripts/run-nats-restart-jobs-harness.sh"
 
 echo "RUN scripts/run-subscribe-msgpack-harness.sh"
 DUCKDB_BIN="$DUCKDB_BIN" DUCKDB_LIB="$DUCKDB_LIB" EXTENSION_PATH="$EXTENSION_PATH" \

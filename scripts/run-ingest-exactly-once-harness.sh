@@ -84,13 +84,16 @@ SLEEP 2
 RUN bash -c '${NATS_SERVER} -js --addr 127.0.0.1 -p ${NATS_PORT} -sd ${server_dir} >${server_log} 2>&1 &'
 SLEEP 6
 RUN ${NATS_CLI} server check connection --server=${NATS_URL}
-POLL exactly_once=true/true 30
-SELECT 'exactly_once=' || (COUNT(*) = 4) || '/' || (MAX(duplicates_skipped) > 0) AS result
+POLL exactly_once=true/true/true 30
+SELECT 'exactly_once=' || (COUNT(*) = 4) || '/' || (MAX(duplicates_skipped) > 0) || '/' ||
+       (MAX(reconnect_count) > 0) AS result
 FROM ingest_out, (SELECT MAX(duplicates_skipped) AS duplicates_skipped
-                  FROM nats_ingest_status(job_name := 'exactly_once_ingest'));
+                  FROM nats_ingest_status(job_name := 'exactly_once_ingest')),
+     (SELECT MAX(reconnect_count) AS reconnect_count
+      FROM nats_ingest_status(job_name := 'exactly_once_ingest'));
 SELECT * FROM nats_stop_ingest(job_name := 'exactly_once_ingest');
 END
-EXPECT exactly_once=true/true 10
+EXPECT exactly_once=true/true/true 10
 QUIT
 SQL
 then

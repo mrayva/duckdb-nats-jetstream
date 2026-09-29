@@ -97,7 +97,7 @@ struct NatsKvGetBindData : public TableFunctionData {
 };
 
 unique_ptr<FunctionData> NatsKvGetBind(ClientContext &, TableFunctionBindInput &input,
-                                       vector<LogicalType> &return_types, vector<string> &names) {
+                                       vector<LogicalType> &return_types, NatsBindColumnNames &names) {
     auto result = make_uniq<NatsKvGetBindData>();
     result->bucket = input.inputs[0].GetValue<string>();
     result->key = input.inputs[1].GetValue<string>();
@@ -200,7 +200,7 @@ struct NatsKvScanBindData : public TableFunctionData {
 };
 
 unique_ptr<FunctionData> NatsKvScanBind(ClientContext &, TableFunctionBindInput &input,
-                                        vector<LogicalType> &return_types, vector<string> &names) {
+                                        vector<LogicalType> &return_types, NatsBindColumnNames &names) {
     auto result = make_uniq<NatsKvScanBindData>();
     result->bucket = input.inputs[0].GetValue<string>();
 
@@ -435,7 +435,7 @@ struct NatsKvHistoryBindData : public TableFunctionData {
 };
 
 unique_ptr<FunctionData> NatsKvHistoryBind(ClientContext &, TableFunctionBindInput &input,
-                                           vector<LogicalType> &return_types, vector<string> &names) {
+                                           vector<LogicalType> &return_types, NatsBindColumnNames &names) {
     auto result = make_uniq<NatsKvHistoryBindData>();
     result->bucket = input.inputs[0].GetValue<string>();
     result->key = input.inputs[1].GetValue<string>();
@@ -505,7 +505,7 @@ struct NatsKvWriteBindData : public TableFunctionData {
 };
 
 unique_ptr<FunctionData> NatsKvWriteBind(ClientContext &, TableFunctionBindInput &input,
-                                         vector<LogicalType> &return_types, vector<string> &names) {
+                                         vector<LogicalType> &return_types, NatsBindColumnNames &names) {
     auto result = make_uniq<NatsKvWriteBindData>();
     result->bucket = input.inputs[0].GetValue<string>();
     result->key = input.inputs[1].GetValue<string>();
@@ -582,7 +582,7 @@ struct NatsKvUpdateBindData : public TableFunctionData {
 };
 
 unique_ptr<FunctionData> NatsKvUpdateBind(ClientContext &, TableFunctionBindInput &input,
-                                          vector<LogicalType> &return_types, vector<string> &names) {
+                                          vector<LogicalType> &return_types, NatsBindColumnNames &names) {
     auto result = make_uniq<NatsKvUpdateBindData>();
     result->bucket = input.inputs[0].GetValue<string>();
     result->key = input.inputs[1].GetValue<string>();
@@ -640,7 +640,7 @@ struct NatsKvDeleteBindData : public TableFunctionData {
 };
 
 unique_ptr<FunctionData> NatsKvDeleteBind(ClientContext &, TableFunctionBindInput &input,
-                                          vector<LogicalType> &return_types, vector<string> &names) {
+                                          vector<LogicalType> &return_types, NatsBindColumnNames &names) {
     auto result = make_uniq<NatsKvDeleteBindData>();
     result->bucket = input.inputs[0].GetValue<string>();
     result->key = input.inputs[1].GetValue<string>();
@@ -699,7 +699,7 @@ struct NatsKvStatusBindData : public TableFunctionData {
 };
 
 unique_ptr<FunctionData> NatsKvStatusBind(ClientContext &, TableFunctionBindInput &input,
-                                          vector<LogicalType> &return_types, vector<string> &names) {
+                                          vector<LogicalType> &return_types, NatsBindColumnNames &names) {
     auto result = make_uniq<NatsKvStatusBindData>();
     result->bucket = input.inputs[0].GetValue<string>();
     result->connection = ParseKvConnectionParameters(input.named_parameters);
@@ -756,7 +756,7 @@ struct NatsKvCreateBucketBindData : public TableFunctionData {
 };
 
 unique_ptr<FunctionData> NatsKvCreateBucketBind(ClientContext &, TableFunctionBindInput &input,
-                                                vector<LogicalType> &return_types, vector<string> &names) {
+                                                vector<LogicalType> &return_types, NatsBindColumnNames &names) {
     auto result = make_uniq<NatsKvCreateBucketBindData>();
     result->bucket = input.inputs[0].GetValue<string>();
 
@@ -847,7 +847,7 @@ struct NatsKvDeleteBucketBindData : public TableFunctionData {
 };
 
 unique_ptr<FunctionData> NatsKvDeleteBucketBind(ClientContext &, TableFunctionBindInput &input,
-                                                vector<LogicalType> &return_types, vector<string> &names) {
+                                                vector<LogicalType> &return_types, NatsBindColumnNames &names) {
     auto result = make_uniq<NatsKvDeleteBucketBindData>();
     result->bucket = input.inputs[0].GetValue<string>();
     result->connection = ParseKvConnectionParameters(input.named_parameters);

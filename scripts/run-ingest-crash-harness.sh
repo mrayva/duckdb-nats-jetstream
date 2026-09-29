@@ -11,145 +11,112 @@ DUCKDB_LIB="${DUCKDB_LIB:-$(duckdb_host_lib_resolve)}"
 EXTENSION_PATH="${EXTENSION_PATH:-${TIP_EXTENSION_PATH:-$TIP_ROOT/build/nats_js-tip/extension/nats_js/nats_js.duckdb_extension}}"
 NATS_URL="${NATS_URL:-nats://localhost:4222}"
 NATS_CLI="${NATS_CLI:-$HOME/nats}"
+PYTHON_BIN="${PYTHON_BIN:-$ROOT_DIR/.venv/bin/python}"
 
-if [ ! -x "$DUCKDB_BIN" ]; then
-  echo "DuckDB binary not found: $DUCKDB_BIN" >&2
-  echo "Build first with: make release" >&2
+if [ ! -x "$DUCKDB_BIN" ] || [ ! -f "$EXTENSION_PATH" ]; then
+  echo "DuckDB binary or extension not found" >&2
   exit 1
 fi
-
-if [ ! -f "$EXTENSION_PATH" ]; then
-  echo "Extension not found: $EXTENSION_PATH" >&2
-  echo "Build tip extension first or set TIP_EXTENSION_PATH." >&2
-  exit 1
-fi
-
 if [ ! -x "$NATS_CLI" ]; then
   NATS_CLI="$(command -v nats || true)"
 fi
-
 if [ -z "$NATS_CLI" ]; then
-  echo "NATS CLI not found. Set NATS_CLI=/path/to/nats." >&2
+  echo "NATS CLI not found" >&2
   exit 1
+fi
+if [ ! -x "$PYTHON_BIN" ]; then
+  PYTHON_BIN="$(command -v python3)"
 fi
 
 echo "Checking NATS connection at $NATS_URL"
 "$NATS_CLI" server check connection --server "$NATS_URL"
+NATS_URL="$NATS_URL" NATS_CLI="$NATS_CLI" RESET_STREAMS="${RESET_STREAMS:-1}" \
+  "$ROOT_DIR/scripts/setup-streams.sh" >/dev/null
 
-echo "Preparing JetStream streams"
-NATS_URL="$NATS_URL" NATS_CLI="$NATS_CLI" RESET_STREAMS="${RESET_STREAMS:-1}" "$ROOT_DIR/scripts/setup-streams.sh"
+run_crash_case() {
+  local name="$1"
+  local failure_env="$2"
+  local expected_before="$3"
+  local expected_checkpoint="$4"
+  local db_file log_first log_probe log_recovery
+  db_file="$(mktemp "/tmp/nats_ingest_crash_${name}.XXXXXX.duckdb")"
+  log_first="$(mktemp "/tmp/nats_ingest_crash_${name}.first.XXXXXX.log")"
+  log_probe="$(mktemp "/tmp/nats_ingest_crash_${name}.probe.XXXXXX.log")"
+  log_recovery="$(mktemp "/tmp/nats_ingest_crash_${name}.recovery.XXXXXX.log")"
+  rm -f "$db_file"
 
-db_file="$(mktemp /tmp/nats_ingest_crash.XXXXXX.duckdb)"
-log_first="$(mktemp /tmp/nats_ingest_crash.first.XXXXXX.log)"
-log_second="$(mktemp /tmp/nats_ingest_crash.second.XXXXXX.log)"
-log_probe="$(mktemp /tmp/nats_ingest_crash.probe.XXXXXX.log)"
-rm -f "$db_file"
-trap 'rc=$?; rm -f "$log_first" "$log_second" "$log_probe" "$db_file"; exit $rc' EXIT
-
-run_duckdb_once() {
-  local sql="$1"
-  local log_file="$2"
-  local extra_env="${3:-}"
+  local env_status=0
   set +e
-  if [ -n "$extra_env" ]; then
-    env "$extra_env" NATS_INGEST_DISABLE_REHYDRATE=1 "$DUCKDB_BIN" -unsigned "$db_file" -c "$sql" >"$log_file" 2>&1
-  else
-    NATS_INGEST_DISABLE_REHYDRATE=1 "$DUCKDB_BIN" -unsigned "$db_file" -c "$sql" >"$log_file" 2>&1
-  fi
-  local duckdb_status=$?
-  set -e
-  return "$duckdb_status"
-}
-
-if DUCKDB_LIB="$DUCKDB_LIB" NATS_INGEST_FAIL_AFTER_COMMIT=1 NATS_INGEST_DISABLE_REHYDRATE=1 python3 "$ROOT_DIR/scripts/duckdb_session.py" --duckdb-bin "$DUCKDB_BIN" --db-file "$db_file" <<SQL >"$log_first" 2>&1
+  env "$failure_env" DUCKDB_LIB="$DUCKDB_LIB" NATS_INGEST_DISABLE_REHYDRATE=1 \
+    "$PYTHON_BIN" "$ROOT_DIR/scripts/duckdb_session.py" --duckdb-bin "$DUCKDB_BIN" --db-file "$db_file" \
+    >"$log_first" 2>&1 <<SQL
 SEND
 LOAD '${EXTENSION_PATH}';
-CREATE TABLE ingest_out(
-    stream_name VARCHAR,
-    subject VARCHAR,
-    sequence UBIGINT,
-    ts TIMESTAMP,
-    payload BLOB
-);
-SELECT 'start1=' || job_name || '|' || stream_name || '|' || target_table || '|' || durable_name AS start_result
-FROM nats_start_ingest(
-    job_name := 'ingest_crash_a',
-    stream_name := 'ingest_resume',
-    target_table := 'ingest_out',
-    durable_name := 'duckdb_ingest_crash',
-    url := 'nats://127.0.0.1:4222',
-    batch_size := 4,
-    poll_ms := 10000,
-    fetch_timeout_ms := 100,
-    start_seq := 1
+CREATE TABLE ingest_out(stream_name VARCHAR, subject VARCHAR, sequence UBIGINT, ts TIMESTAMP, payload BLOB);
+SELECT 'started=' || job_name AS marker FROM nats_start_ingest(
+    job_name := 'crash_${name}', stream_name := 'ingest_resume', target_table := 'ingest_out',
+    durable_name := 'duckdb_crash_${name}', url := '${NATS_URL}', batch_size := 4,
+    poll_ms := 10000, fetch_timeout_ms := 100, start_seq := 1
 );
 END
-EXPECT start1=ingest_crash_a|ingest_resume|ingest_out|duckdb_ingest_crash 10
+EXPECT started=crash_${name} 10
 QUIT
 SQL
-then
-  echo "Expected crash harness to fail, but DuckDB exited 0" >&2
-  cat "$log_first" >&2
-  exit 1
-fi
+  env_status=$?
+  set -e
+  if [ "$env_status" -eq 0 ]; then
+    cat "$log_first" >&2
+    echo "Expected injected crash at $name, but DuckDB exited 0" >&2
+    return 1
+  fi
 
-probe_sql=$(cat <<SQL
-LOAD '${EXTENSION_PATH}';
-SELECT 'count=' || COUNT(*) AS inserted_rows FROM ingest_out;
-SELECT 'checkpoint=' || last_committed_seq AS checkpoint_seq
-FROM duckdb_nats_ingest_checkpoints
-WHERE stream_name = 'ingest_resume' AND durable_name = 'duckdb_ingest_crash';
-SQL
-)
+  DUCKDB_LIB="$DUCKDB_LIB" NATS_INGEST_DISABLE_REHYDRATE=1 "$DUCKDB_BIN" -unsigned "$db_file" -c \
+    "LOAD '${EXTENSION_PATH}'; SELECT 'count=' || COUNT(*) FROM ingest_out; SELECT 'checkpoint=' || COALESCE(MAX(last_committed_seq), 0) FROM duckdb_nats_ingest_checkpoints WHERE stream_name = 'ingest_resume' AND durable_name = 'duckdb_crash_${name}';" \
+    >"$log_probe" 2>&1
+  if ! grep -Fq "count=${expected_before}" "$log_probe" || ! grep -Fq "checkpoint=${expected_checkpoint}" "$log_probe"; then
+    cat "$log_probe" >&2
+    echo "Unexpected durable state at crash point $name" >&2
+    return 1
+  fi
 
-run_duckdb_once "$probe_sql" "$log_probe"
+  # Abrupt process death leaves the persisted ownership lease until its 30s TTL.
+  sleep 32
 
-if ! grep -Fq "count=4" "$log_probe"; then
-  echo "Missing expected crash checkpoint row count" >&2
-  tail -n 80 "$log_probe" >&2
-  exit 1
-fi
-
-if ! grep -Fq "checkpoint=4" "$log_probe"; then
-  echo "Missing expected persisted checkpoint after crash" >&2
-  tail -n 80 "$log_probe" >&2
-  exit 1
-fi
-
-if ! DUCKDB_LIB="$DUCKDB_LIB" NATS_INGEST_DISABLE_REHYDRATE=1 python3 "$ROOT_DIR/scripts/duckdb_session.py" --duckdb-bin "$DUCKDB_BIN" --db-file "$db_file" <<SQL >"$log_second" 2>&1
+  if ! DUCKDB_LIB="$DUCKDB_LIB" NATS_INGEST_DISABLE_REHYDRATE=1 \
+    "$PYTHON_BIN" "$ROOT_DIR/scripts/duckdb_session.py" --duckdb-bin "$DUCKDB_BIN" --db-file "$db_file" \
+    >"$log_recovery" 2>&1 <<SQL
 SEND
 LOAD '${EXTENSION_PATH}';
-SELECT 'start2=' || job_name || '|' || stream_name || '|' || target_table || '|' || durable_name AS start_result
-FROM nats_start_ingest(
-    job_name := 'ingest_crash_b',
-    stream_name := 'ingest_resume',
-    target_table := 'ingest_out',
-    durable_name := 'duckdb_ingest_crash',
-    url := 'nats://127.0.0.1:4222',
-    batch_size := 4,
-    poll_ms := 10000,
-    fetch_timeout_ms := 100,
-    start_seq := 1
+SELECT 'restarted=' || job_name AS marker FROM nats_start_ingest(
+    job_name := 'recovered_${name}', stream_name := 'ingest_resume', target_table := 'ingest_out',
+    durable_name := 'duckdb_crash_${name}', url := '${NATS_URL}', batch_size := 4,
+    poll_ms := 100, fetch_timeout_ms := 100, start_seq := 1
 );
 END
-EXPECT start2=ingest_crash_b|ingest_resume|ingest_out|duckdb_ingest_crash 10
-SEND
-SELECT 'status2=' || rows_inserted || '/' || batches_committed || '/' || last_committed_seq || '/' || failed || '/' || stop_requested || '/' || stopped AS ingest_status
-FROM nats_ingest_status(job_name := 'ingest_crash_b');
+EXPECT restarted=recovered_${name} 10
+POLL recovered=4/4/false 45
+SELECT 'recovered=' || rows_inserted || '/' || last_committed_seq || '/' || failed
+FROM nats_ingest_status(job_name := 'recovered_${name}');
 END
-EXPECT status2=4/1/4/false/false/false 30
 SEND
-SELECT 'count=' || COUNT(*) AS inserted_rows FROM ingest_out;
-SELECT 'stop2=' || job_name || '|' || stream_name || '|' || target_table || '|' || durable_name AS stop_result
-FROM nats_stop_ingest(job_name := 'ingest_crash_b');
+SELECT 'count=' || COUNT(*) FROM ingest_out;
+SELECT * FROM nats_stop_ingest(job_name := 'recovered_${name}');
 END
 EXPECT count=4 10
-EXPECT stop2=ingest_crash_b|ingest_resume|ingest_out|duckdb_ingest_crash 10
 QUIT
 SQL
-then
-  cat "$log_second" >&2
-  exit 1
-fi
+  then
+    cat "$log_recovery" >&2
+    return 1
+  fi
 
-echo "Ingest crash harness passed"
+  rm -f "$log_first" "$log_probe" "$log_recovery" "$db_file"
+  echo "PASS ingest crash point: $name"
+}
+
+run_crash_case after_fetch NATS_INGEST_FAIL_AFTER_FETCH=1 0 0
+run_crash_case after_append NATS_INGEST_FAIL_AFTER_APPEND=1 0 0
+run_crash_case after_flush NATS_INGEST_FAIL_AFTER_FLUSH=1 0 0
+run_crash_case after_commit NATS_INGEST_FAIL_AFTER_COMMIT=1 4 4
+
+echo "Ingest crash-window matrix passed"

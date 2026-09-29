@@ -18,6 +18,10 @@ Comprehensive test suite for Protocol Buffers support covering:
 - Subject filtering
 - Group by operations
 
+### `test_protobuf_descriptor_set.sql`
+Exercises protobuf extraction through `nats_scan` and bounded `COPY FROM` using a generated binary `FileDescriptorSet`.
+The local integration harness generates `/tmp/nats-js-telemetry.protoset` before running the test.
+
 ### `test_protobuf_errors.sql`
 Error handling test suite covering:
 - Missing required parameters

@@ -7,6 +7,41 @@
 LOAD 'build/release/extension/nats_js/nats_js.duckdb_extension';
 
 .print ========================================
+.print Test 0: Stream catalog discovers telemetry
+.print ========================================
+
+SELECT CASE WHEN count(*) = 1 AND bool_and(messages > 0 AND subject_count > 0)
+    THEN 'ok' ELSE error('nats_streams should discover telemetry and report its live counts') END AS catalog_check
+FROM nats_streams(url := 'nats://127.0.0.1:4222')
+WHERE stream = 'telemetry';
+
+.print
+.print ========================================
+.print Test 0b: Per-subject counts reconcile with stream stats
+.print ========================================
+
+WITH stream_stats AS (
+    SELECT messages FROM nats_stream_stats('telemetry', url := 'nats://127.0.0.1:4222')
+), subject_stats AS (
+    SELECT COALESCE(sum(messages), 0) AS messages, count(*) AS subject_rows
+    FROM nats_stream_subjects('telemetry', url := 'nats://127.0.0.1:4222')
+)
+SELECT CASE WHEN stream_stats.messages = subject_stats.messages AND subject_rows > 0
+    THEN 'ok' ELSE error('per-subject counts should reconcile with stream message count') END AS subject_count_check
+FROM stream_stats CROSS JOIN subject_stats;
+
+.print
+.print ========================================
+.print Test 0c: Per-subject counts accept a server-side filter
+.print ========================================
+
+SELECT CASE WHEN count(*) > 0 AND sum(messages) > 0
+                  AND bool_and(starts_with(subject, 'telemetry.dc1.power.'))
+    THEN 'ok' ELSE error('server-side subject filter returned unexpected subjects or no counts') END AS subject_filter_check
+FROM nats_stream_subjects('telemetry', subject := 'telemetry.dc1.power.>',
+                          url := 'nats://127.0.0.1:4222');
+
+.print ========================================
 .print Test 1: Stream stats returns expected metadata columns
 .print ========================================
 

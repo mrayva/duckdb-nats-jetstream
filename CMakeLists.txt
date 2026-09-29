@@ -39,9 +39,9 @@ find_package(flatbuffers CONFIG REQUIRED)
 target_link_libraries(${EXTENSION_NAME} cnats::nats_static protobuf::libprotobuf protobuf::libprotoc flatbuffers::flatbuffers)
 target_link_libraries(${LOADABLE_EXTENSION_NAME} cnats::nats_static protobuf::libprotobuf protobuf::libprotoc flatbuffers::flatbuffers)
 
-# DuckDB 1.5.5/main changed several internal C++ extension APIs. Detect those
+# DuckDB 1.5.5 and newer changed several internal C++ extension APIs. Detect those
 # headers from the host DuckDB source so the extension remains buildable with
-# the repository's older pinned checkout as well.
+# both the stable release and current upstream main.
 set(NATS_DUCKDB_API_DEFINITIONS)
 if(DEFINED DUCKDB_SOURCE_DIR)
     set(NATS_DUCKDB_SOURCE_ROOT "${DUCKDB_SOURCE_DIR}")

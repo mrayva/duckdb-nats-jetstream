@@ -60,11 +60,12 @@ private:
     vector<string> errors;
 };
 
-static void ImportSubscribeProtoSchema(const string &proto_file, const string &proto_message,
+static void ImportSubscribeProtoSchema(const string &proto_file, const string &descriptor_set, const string &proto_message,
                                        shared_ptr<DiskSourceTree> &source_tree,
                                        shared_ptr<SubscribeProtobufErrorCollector> &error_collector,
                                        shared_ptr<Importer> &importer, const Descriptor *&descriptor) {
-    auto schema = GetNatsProtobufSchema(proto_file, proto_message);
+    auto schema = descriptor_set.empty() ? GetNatsProtobufSchema(proto_file, proto_message)
+                                         : GetNatsProtobufDescriptorSetSchema(descriptor_set, proto_message);
     source_tree = schema->source_tree;
     error_collector = make_shared_ptr<SubscribeProtobufErrorCollector>();
     importer = schema->importer;
@@ -251,7 +252,7 @@ struct NatsSubscribeControlGlobalState : public GlobalTableFunctionState {
     }
 };
 
-static void AddSubscribeSnapshotColumns(vector<LogicalType> &return_types, vector<string> &names) {
+static void AddSubscribeSnapshotColumns(vector<LogicalType> &return_types, NatsBindColumnNames &names) {
     return_types = {LogicalType(LogicalTypeId::VARCHAR),  LogicalType(LogicalTypeId::VARCHAR),
                     LogicalType(LogicalTypeId::VARCHAR),  LogicalType(LogicalTypeId::VARCHAR),
                     LogicalType(LogicalTypeId::VARCHAR),  LogicalType(LogicalTypeId::BOOLEAN),
@@ -448,6 +449,8 @@ static NatsSubscribeConfig ParseSubscribeConfig(TableFunctionBindInput &input) {
             config.flexbuffers_fields = GetNamedStringList(input.named_parameters, "flexbuffers_extract");
         } else if (kv.first == "proto_file") {
             config.proto_file = StringValue::Get(kv.second);
+        } else if (kv.first == "proto_descriptor_set") {
+            config.proto_descriptor_set = StringValue::Get(kv.second);
         } else if (kv.first == "proto_message") {
             config.proto_message = StringValue::Get(kv.second);
         } else if (kv.first == "proto_extract") {
@@ -471,8 +474,8 @@ static NatsSubscribeConfig ParseSubscribeConfig(TableFunctionBindInput &input) {
     if (extraction_modes > 1) {
         throw std::runtime_error("Cannot combine JSON, MessagePack, CBOR, FlexBuffers, and protobuf extraction parameters");
     }
-    if (!config.proto_fields.empty() && config.proto_file.empty()) {
-        throw std::runtime_error("proto_file parameter is required with proto_extract");
+    if (!config.proto_fields.empty() && config.proto_file.empty() == config.proto_descriptor_set.empty()) {
+        throw std::runtime_error("Exactly one of proto_file or proto_descriptor_set is required with proto_extract");
     }
     if (!config.proto_fields.empty() && config.proto_message.empty()) {
         throw std::runtime_error("proto_message parameter is required with proto_extract");
@@ -753,7 +756,7 @@ static void RunSubscribeWorker(const shared_ptr<NatsSubscribeJobState> &job) {
         unique_ptr<Message> proto_message;
         if (!job->config.proto_fields.empty()) {
             const Descriptor *descriptor = nullptr;
-            ImportSubscribeProtoSchema(job->config.proto_file, job->config.proto_message, proto_source_tree,
+            ImportSubscribeProtoSchema(job->config.proto_file, job->config.proto_descriptor_set, job->config.proto_message, proto_source_tree,
                                        proto_error_collector, proto_importer, descriptor);
             job->config.proto_field_paths.clear();
             for (const auto &field : job->config.proto_fields) {
@@ -885,7 +888,7 @@ static void RunSubscribeWorker(const shared_ptr<NatsSubscribeJobState> &job) {
 }
 
 static unique_ptr<FunctionData> NatsSubscribeStartBind(ClientContext &, TableFunctionBindInput &input,
-                                                       vector<LogicalType> &return_types, vector<string> &names) {
+                                                       vector<LogicalType> &return_types, NatsBindColumnNames &names) {
     auto config = ParseSubscribeConfig(input);
     AddSubscribeSnapshotColumns(return_types, names);
     auto bind_data = make_uniq<NatsSubscribeBindData>();
@@ -918,7 +921,7 @@ static void NatsSubscribeStartExecute(ClientContext &, TableFunctionInput &data_
 }
 
 static unique_ptr<FunctionData> NatsSubscribeStopBind(ClientContext &, TableFunctionBindInput &input,
-                                                      vector<LogicalType> &return_types, vector<string> &names) {
+                                                      vector<LogicalType> &return_types, NatsBindColumnNames &names) {
     string job_name;
     bool has_job_name = false;
     for (auto &kv : input.named_parameters) {
@@ -961,7 +964,7 @@ static void NatsSubscribeStopExecute(ClientContext &, TableFunctionInput &data_p
 }
 
 static unique_ptr<FunctionData> NatsSubscribeRemoveBind(ClientContext &, TableFunctionBindInput &input,
-                                                        vector<LogicalType> &return_types, vector<string> &names) {
+                                                        vector<LogicalType> &return_types, NatsBindColumnNames &names) {
     string job_name;
     bool has_job_name = false;
     for (auto &kv : input.named_parameters) {
@@ -1005,7 +1008,7 @@ static void NatsSubscribeRemoveExecute(ClientContext &, TableFunctionInput &data
 }
 
 static unique_ptr<FunctionData> NatsSubscribeStatusBind(ClientContext &, TableFunctionBindInput &input,
-                                                        vector<LogicalType> &return_types, vector<string> &names) {
+                                                        vector<LogicalType> &return_types, NatsBindColumnNames &names) {
     string job_name;
     bool has_job_name = false;
     for (auto &kv : input.named_parameters) {
@@ -1024,7 +1027,7 @@ static unique_ptr<FunctionData> NatsSubscribeStatusBind(ClientContext &, TableFu
 }
 
 static unique_ptr<FunctionData> NatsSubscribePauseBind(ClientContext &, TableFunctionBindInput &input,
-                                                       vector<LogicalType> &return_types, vector<string> &names) {
+                                                       vector<LogicalType> &return_types, NatsBindColumnNames &names) {
     string job_name;
     bool has_job_name = false;
     for (auto &kv : input.named_parameters) {
@@ -1085,7 +1088,7 @@ static void NatsSubscribePauseExecute(ClientContext &, TableFunctionInput &data_
 }
 
 static unique_ptr<FunctionData> NatsSubscribeResumeBind(ClientContext &, TableFunctionBindInput &input,
-                                                        vector<LogicalType> &return_types, vector<string> &names) {
+                                                        vector<LogicalType> &return_types, NatsBindColumnNames &names) {
     string job_name;
     bool has_job_name = false;
     for (auto &kv : input.named_parameters) {
@@ -1169,7 +1172,7 @@ static void NatsSubscribeStatusExecute(ClientContext &, TableFunctionInput &data
 }
 
 static unique_ptr<FunctionData> NatsSubscribeJobsBind(ClientContext &, TableFunctionBindInput &,
-                                                      vector<LogicalType> &return_types, vector<string> &names) {
+                                                      vector<LogicalType> &return_types, NatsBindColumnNames &names) {
     AddSubscribeSnapshotColumns(return_types, names);
     return make_uniq<NatsSubscribeJobsBindData>();
 }
@@ -1212,6 +1215,7 @@ void NatsSubscribeFunction::Register(ExtensionLoader &loader) {
     start_fn.named_parameters["cbor_extract"] = LogicalType::LIST(LogicalType(LogicalTypeId::VARCHAR));
     start_fn.named_parameters["flexbuffers_extract"] = LogicalType::LIST(LogicalType(LogicalTypeId::VARCHAR));
     start_fn.named_parameters["proto_file"] = LogicalType(LogicalTypeId::VARCHAR);
+    start_fn.named_parameters["proto_descriptor_set"] = LogicalType(LogicalTypeId::VARCHAR);
     start_fn.named_parameters["proto_message"] = LogicalType(LogicalTypeId::VARCHAR);
     start_fn.named_parameters["proto_extract"] = LogicalType::LIST(LogicalType(LogicalTypeId::VARCHAR));
     loader.RegisterFunction(start_fn);

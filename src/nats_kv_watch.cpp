@@ -225,7 +225,7 @@ struct NatsKvWatchControlGlobalState : public GlobalTableFunctionState {
     }
 };
 
-void AddKvWatchSnapshotColumns(vector<LogicalType> &return_types, vector<string> &names) {
+void AddKvWatchSnapshotColumns(vector<LogicalType> &return_types, NatsBindColumnNames &names) {
     return_types = {LogicalType(LogicalTypeId::VARCHAR),  LogicalType(LogicalTypeId::VARCHAR),
                     LogicalType(LogicalTypeId::VARCHAR),  LogicalType(LogicalTypeId::VARCHAR),
                     LogicalType(LogicalTypeId::VARCHAR),  LogicalType(LogicalTypeId::BOOLEAN),
@@ -660,7 +660,7 @@ void RunKvWatchWorker(const shared_ptr<NatsKvWatchJobState> &job) {
 }
 
 unique_ptr<FunctionData> NatsKvWatchStartBind(ClientContext &, TableFunctionBindInput &input,
-                                              vector<LogicalType> &return_types, vector<string> &names) {
+                                              vector<LogicalType> &return_types, NatsBindColumnNames &names) {
     auto config = ParseKvWatchConfig(input);
     AddKvWatchSnapshotColumns(return_types, names);
     auto bind_data = make_uniq<NatsKvWatchBindData>();
@@ -693,7 +693,7 @@ void NatsKvWatchStartExecute(ClientContext &, TableFunctionInput &data_p, DataCh
 }
 
 unique_ptr<FunctionData> NatsKvWatchJobNameBind(ClientContext &, TableFunctionBindInput &input,
-                                                vector<LogicalType> &return_types, vector<string> &names) {
+                                                vector<LogicalType> &return_types, NatsBindColumnNames &names) {
     string job_name;
     bool has_job_name = false;
     for (auto &kv : input.named_parameters) {
@@ -843,7 +843,7 @@ void NatsKvWatchResumeExecute(ClientContext &, TableFunctionInput &data_p, DataC
 }
 
 unique_ptr<FunctionData> NatsKvWatchJobsBind(ClientContext &, TableFunctionBindInput &,
-                                             vector<LogicalType> &return_types, vector<string> &names) {
+                                             vector<LogicalType> &return_types, NatsBindColumnNames &names) {
     AddKvWatchSnapshotColumns(return_types, names);
     return make_uniq<NatsKvWatchJobsBindData>();
 }

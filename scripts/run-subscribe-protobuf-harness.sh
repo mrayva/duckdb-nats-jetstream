@@ -20,8 +20,12 @@ if [ ! -x "$PYTHON_BIN" ]; then PYTHON_BIN="$(command -v python3)"; fi
 db_file="$(mktemp /tmp/nats_subscribe_protobuf.XXXXXX.duckdb)"
 log_file="$(mktemp /tmp/nats_subscribe_protobuf.XXXXXX.log)"
 fixture="$(mktemp /tmp/nats_subscribe_protobuf.XXXXXX.bin)"
-rm -f "$db_file"
-trap 'rc=$?; rm -f "$log_file" "$db_file" "$fixture"; exit $rc' EXIT
+descriptor_set="$(mktemp /tmp/nats_subscribe_protobuf.XXXXXX.protoset)"
+rm -f "$db_file" "$descriptor_set"
+trap 'rc=$?; rm -f "$log_file" "$db_file" "$fixture" "$descriptor_set"; exit $rc' EXIT
+
+protoc -I "$ROOT_DIR/test/proto" --include_imports --descriptor_set_out="$descriptor_set" \
+  "$ROOT_DIR/test/proto/telemetry.proto"
 
 PYTHONPATH="$ROOT_DIR/test/proto" "$PYTHON_BIN" -c \
   "import telemetry_pb2; m=telemetry_pb2.Telemetry(); m.device_id='proto-device-1'; m.timestamp=123456789; m.metrics.kw=12.5; m.online=True; open('$fixture','wb').write(m.SerializeToString())"
@@ -47,8 +51,8 @@ FROM nats_start_subscribe(
     batch_size := 1,
     poll_ms := 100,
     create_target_table := true,
-    proto_file := '${ROOT_DIR}/test/proto/telemetry.proto',
-    proto_message := 'Telemetry',
+    proto_descriptor_set := '${descriptor_set}',
+    proto_message := 'telemetry.Telemetry',
     proto_extract := ['device_id', 'metrics.kw', 'online', 'timestamp']
 );
 END

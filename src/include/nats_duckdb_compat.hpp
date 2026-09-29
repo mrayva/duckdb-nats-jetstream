@@ -8,6 +8,8 @@
 namespace duckdb {
 
 #ifdef NATS_DUCKDB_IDENTIFIER_API
+using NatsBindColumnNames = vector<Identifier>;
+using NatsCopyFromColumnNames = vector<Identifier>;
 using NatsQualifiedNamePart = Identifier;
 
 inline const NatsQualifiedNamePart &NatsQualifiedCatalog(const QualifiedName &name) {
@@ -22,6 +24,8 @@ inline const NatsQualifiedNamePart &NatsQualifiedTable(const QualifiedName &name
     return name.Name();
 }
 #else
+using NatsBindColumnNames = vector<string>;
+using NatsCopyFromColumnNames = vector<string>;
 using NatsQualifiedNamePart = string;
 
 inline const NatsQualifiedNamePart &NatsQualifiedCatalog(const QualifiedName &name) {

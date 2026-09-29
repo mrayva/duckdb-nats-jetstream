@@ -7,7 +7,7 @@
 LOAD 'build/release/extension/nats_js/nats_js.duckdb_extension';
 
 .print ========================================
-.print Test 1: Missing proto_file parameter
+.print Test 1: Missing protobuf schema source
 .print Expected: Error message
 .print ========================================
 
@@ -104,4 +104,3 @@ SELECT * FROM nats_scan('telemetry_proto',
 .print ========================================
 .print Error handling tests completed!
 .print ========================================
-
