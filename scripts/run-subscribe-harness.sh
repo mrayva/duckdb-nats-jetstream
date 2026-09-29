@@ -83,6 +83,26 @@ EXPECT status=4/2/true/false 30
 EXPECT count=4 10
 EXPECT types=VARCHAR/BLOB/TIMESTAMP 10
 EXPECT stop=live_subscribe_probe|main.subscribe_out|live.subscribe 10
+SEND
+SELECT 'removed=' || job_name AS removed
+FROM nats_remove_subscribe(job_name := 'live_subscribe_probe');
+SELECT 'restart=' || job_name AS restarted
+FROM nats_start_subscribe(
+    job_name := 'live_subscribe_probe',
+    target_table := 'main.subscribe_out',
+    url := '${NATS_URL}',
+    subject := 'live.subscribe',
+    batch_size := 2,
+    poll_ms := 100,
+    create_target_table := true
+);
+END
+EXPECT removed=live_subscribe_probe 10
+EXPECT restart=live_subscribe_probe 10
+SEND
+SELECT * FROM nats_stop_subscribe(job_name := 'live_subscribe_probe');
+SELECT * FROM nats_remove_subscribe(job_name := 'live_subscribe_probe');
+END
 QUIT
 SQL
 then

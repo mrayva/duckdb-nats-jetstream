@@ -50,12 +50,6 @@ trap 'rc=$?; rm -f "$log_file" "$db_file"; exit $rc' EXIT
   "$NATS_CLI" pub --quiet --count 4 --server="$NATS_URL" "live.subscribe" "subscribe-test-{{Count}}" >/dev/null
 ) &
 
-(
-  sleep 6
-  echo "Publishing second subscribe batch to live.subscribe"
-  "$NATS_CLI" pub --quiet --count 4 --server="$NATS_URL" "live.subscribe" "subscribe-test-late-{{Count}}" >/dev/null
-) &
-
 if ! DUCKDB_LIB="$DUCKDB_LIB" python3 "$ROOT_DIR/scripts/duckdb_session.py" --duckdb-bin "$DUCKDB_BIN" --db-file "$db_file" <<SQL >"$log_file" 2>&1
 SEND
 LOAD '${EXTENSION_PATH}';
@@ -71,7 +65,7 @@ FROM nats_start_subscribe(
     url := '${NATS_URL}',
     subject := 'live.subscribe',
     batch_size := 2,
-    poll_ms := 100,
+    poll_ms := 10000,
     create_target_table := false
 );
 END
@@ -88,12 +82,14 @@ SELECT 'pause=' || job_name || '|' || target_table || '|' || subject || '|' || p
 FROM nats_pause_subscribe(job_name := 'live_subscribe_pause_resume');
 END
 EXPECT pause=live_subscribe_pause_resume|subscribe_out|live.subscribe|true/true 30
+RUN ${NATS_CLI} pub --quiet --count 4 --server=${NATS_URL} live.subscribe subscribe-test-late-{{Count}}
 SLEEP 3
 SEND
-SELECT 'status2=' || paused || '/' || pause_requested || '/' || rows_inserted || '/' || batches_committed AS subscribe_status
+SELECT 'status2=' || paused || '/' || pause_requested || '/' || rows_inserted || '/' || batches_committed || '/' ||
+       (SELECT COUNT(*) FROM subscribe_out) AS subscribe_status
 FROM nats_subscribe_status(job_name := 'live_subscribe_pause_resume');
 END
-EXPECT status2=true/true/4/2 30
+EXPECT status2=true/true/4/2/4 30
 SEND
 SELECT 'resume=' || job_name || '|' || target_table || '|' || subject || '|' || paused || '/' || pause_requested AS resume_result
 FROM nats_resume_subscribe(job_name := 'live_subscribe_pause_resume');

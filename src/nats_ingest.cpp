@@ -1616,9 +1616,41 @@ static shared_ptr<NatsIngestJobState> LaunchIngestJob(const NatsIngestConfig &co
             EnsureRegistryTable(db_connection);
             PersistRegistry(db_connection, job);
         }
-        job->worker = std::thread([job]() { RunIngestWorker(job); });
+        {
+            lock_guard<std::mutex> guard(job->job_mutex);
+            job->worker_finished = false;
+        }
+        job->worker = std::thread([job]() {
+            try {
+                RunIngestWorker(job);
+            } catch (const std::exception &ex) {
+                lock_guard<std::mutex> guard(job->job_mutex);
+                job->progress.running = false;
+                job->progress.stopped = true;
+                job->progress.failed = true;
+                job->progress.last_error = ex.what();
+                job->progress.last_error_time = Timestamp::GetCurrentTimestamp();
+            } catch (...) {
+                lock_guard<std::mutex> guard(job->job_mutex);
+                job->progress.running = false;
+                job->progress.stopped = true;
+                job->progress.failed = true;
+                job->progress.last_error = "Unknown ingest worker failure";
+                job->progress.last_error_time = Timestamp::GetCurrentTimestamp();
+            }
+            {
+                lock_guard<std::mutex> guard(job->job_mutex);
+                job->worker_finished = true;
+            }
+            job->cv.notify_all();
+        });
         return job;
     } catch (...) {
+        {
+            lock_guard<std::mutex> guard(job->job_mutex);
+            job->worker_finished = true;
+        }
+        job->cv.notify_all();
         ReleaseIngestLease(job);
         NatsIngestManager::Get().RemoveJob(job->config.job_name);
         throw;
@@ -2464,6 +2496,8 @@ NatsIngestJobState::~NatsIngestJobState() {
     cv.notify_all();
     if (worker.joinable() && worker.get_id() != std::this_thread::get_id()) {
         worker.join();
+    } else if (worker.joinable()) {
+        worker.detach();
     }
     if (sub != nullptr) {
         natsSubscription_Unsubscribe(sub);
@@ -2487,23 +2521,60 @@ NatsIngestManager &NatsIngestManager::Get() {
 
 shared_ptr<NatsIngestJobState> NatsIngestManager::CreateJob(NatsIngestConfig config) {
     auto job = make_shared_ptr<NatsIngestJobState>(std::move(config));
-    lock_guard<std::mutex> guard(mutex_);
-    auto it = jobs_.find(job->config.job_name);
-    if (it != jobs_.end()) {
-        bool existing_running;
+    while (true) {
+        shared_ptr<NatsIngestJobState> existing;
         {
-            lock_guard<std::mutex> job_guard(it->second->job_mutex);
-            existing_running = it->second->progress.running;
+            lock_guard<std::mutex> guard(mutex_);
+            auto it = jobs_.find(job->config.job_name);
+            if (it == jobs_.end()) {
+                lock_guard<std::mutex> job_guard(job->job_mutex);
+                job->worker_finished = false;
+                jobs_.emplace(job->config.job_name, job);
+                return job;
+            }
+            existing = it->second;
         }
-        if (existing_running) {
-            throw std::runtime_error("Ingest job '" + job->config.job_name + "' already exists");
+
+        {
+            unique_lock<std::mutex> job_guard(existing->job_mutex);
+            if (existing->progress.running && !existing->progress.stop_requested) {
+                throw std::runtime_error("Ingest job '" + job->config.job_name + "' already exists");
+            }
+            if (!existing->worker_finished) {
+                if (!existing->progress.stop_requested && !existing->progress.stopped && !existing->progress.failed) {
+                    throw std::runtime_error("Ingest job '" + job->config.job_name + "' is still starting");
+                }
+                if (!existing->cv.wait_for(job_guard, std::chrono::seconds(30), [&]() {
+                        return existing->worker_finished;
+                    })) {
+                    throw std::runtime_error("Timed out waiting for ingest job '" + job->config.job_name +
+                                             "' to finish cleanup");
+                }
+            }
         }
-        // A previous job under this name has already stopped or failed: drop it so its
-        // connection/subscription/thread are released and the name can be reused.
+
+        lock_guard<std::mutex> guard(mutex_);
+        auto it = jobs_.find(job->config.job_name);
+        if (it == jobs_.end() || it->second != existing) {
+            continue;
+        }
+        {
+            lock_guard<std::mutex> job_guard(existing->job_mutex);
+            if (!existing->worker_finished || existing->progress.running) {
+                continue;
+            }
+        }
+        if (existing->worker.joinable()) {
+            existing->worker.join();
+        }
         jobs_.erase(it);
+        {
+            lock_guard<std::mutex> job_guard(job->job_mutex);
+            job->worker_finished = false;
+        }
+        jobs_.emplace(job->config.job_name, job);
+        return job;
     }
-    jobs_.emplace(job->config.job_name, job);
-    return job;
 }
 
 shared_ptr<NatsIngestJobState> NatsIngestManager::GetJob(const string &job_name) {
@@ -2565,16 +2636,43 @@ bool NatsIngestManager::StopJob(const string &job_name) {
 }
 
 bool NatsIngestManager::RemoveJob(const string &job_name) {
+    shared_ptr<NatsIngestJobState> job;
+    {
+        lock_guard<std::mutex> guard(mutex_);
+        auto it = jobs_.find(job_name);
+        if (it == jobs_.end()) {
+            return false;
+        }
+        job = it->second;
+    }
+    {
+        unique_lock<std::mutex> job_guard(job->job_mutex);
+        if (job->progress.running && !job->progress.stop_requested) {
+            throw std::runtime_error("Ingest job '" + job_name + "' is still running; stop it before removing");
+        }
+        if (!job->worker_finished) {
+            if (!job->progress.stop_requested && !job->progress.stopped && !job->progress.failed) {
+                throw std::runtime_error("Ingest job '" + job_name + "' is still starting");
+            }
+            if (!job->cv.wait_for(job_guard, std::chrono::seconds(30), [&]() { return job->worker_finished; })) {
+                throw std::runtime_error("Timed out waiting for ingest job '" + job_name + "' to finish cleanup");
+            }
+        }
+    }
+
     lock_guard<std::mutex> guard(mutex_);
     auto it = jobs_.find(job_name);
-    if (it == jobs_.end()) {
+    if (it == jobs_.end() || it->second != job) {
         return false;
     }
     {
-        lock_guard<std::mutex> job_guard(it->second->job_mutex);
-        if (it->second->progress.running) {
-            throw std::runtime_error("Ingest job '" + job_name + "' is still running; stop it before removing");
+        lock_guard<std::mutex> job_guard(job->job_mutex);
+        if (!job->worker_finished || job->progress.running) {
+            throw std::runtime_error("Ingest job '" + job_name + "' has not finished cleanup");
         }
+    }
+    if (job->worker.joinable()) {
+        job->worker.join();
     }
     jobs_.erase(it);
     return true;

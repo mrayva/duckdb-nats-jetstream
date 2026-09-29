@@ -89,6 +89,7 @@ struct NatsSubscribeJobState {
     std::mutex mutex;
     std::condition_variable cv;
     std::thread worker;
+    bool worker_finished = true;
     natsConnection *conn = nullptr;
     natsSubscription *sub = nullptr;
 };

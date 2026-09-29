@@ -88,6 +88,8 @@ NatsSubscribeJobState::~NatsSubscribeJobState() {
         }
         if (worker.get_id() != std::this_thread::get_id()) {
             worker.join();
+        } else {
+            worker.detach();
         }
     }
     if (sub != nullptr) {
@@ -107,23 +109,60 @@ NatsSubscribeManager &NatsSubscribeManager::Get() {
 
 shared_ptr<NatsSubscribeJobState> NatsSubscribeManager::CreateJob(NatsSubscribeConfig config) {
     auto job = make_shared_ptr<NatsSubscribeJobState>(std::move(config));
-    lock_guard<std::mutex> guard(mutex_);
-    auto it = jobs_.find(job->config.job_name);
-    if (it != jobs_.end()) {
-        bool existing_running;
+    while (true) {
+        shared_ptr<NatsSubscribeJobState> existing;
         {
-            lock_guard<std::mutex> job_guard(it->second->mutex);
-            existing_running = it->second->progress.running;
+            lock_guard<std::mutex> guard(mutex_);
+            auto it = jobs_.find(job->config.job_name);
+            if (it == jobs_.end()) {
+                lock_guard<std::mutex> job_guard(job->mutex);
+                job->worker_finished = false;
+                jobs_.emplace(job->config.job_name, job);
+                return job;
+            }
+            existing = it->second;
         }
-        if (existing_running) {
-            throw BinderException("subscribe job '%s' already exists", job->config.job_name);
+
+        {
+            unique_lock<std::mutex> job_guard(existing->mutex);
+            if (existing->progress.running && !existing->progress.stop_requested) {
+                throw BinderException("subscribe job '%s' already exists", job->config.job_name);
+            }
+            if (!existing->worker_finished) {
+                if (!existing->progress.stop_requested && !existing->progress.failed) {
+                    throw BinderException("subscribe job '%s' is still starting", job->config.job_name);
+                }
+                if (!existing->cv.wait_for(job_guard, std::chrono::seconds(30), [&]() {
+                        return existing->worker_finished;
+                    })) {
+                    throw BinderException("Timed out waiting for subscribe job '%s' to finish cleanup",
+                                          job->config.job_name);
+                }
+            }
         }
-        // A previous job under this name has already stopped or failed: drop it so its
-        // connection/subscription/thread are released and the name can be reused.
+
+        lock_guard<std::mutex> guard(mutex_);
+        auto it = jobs_.find(job->config.job_name);
+        if (it == jobs_.end() || it->second != existing) {
+            continue;
+        }
+        {
+            lock_guard<std::mutex> job_guard(existing->mutex);
+            if (!existing->worker_finished || existing->progress.running) {
+                continue;
+            }
+        }
+        if (existing->worker.joinable()) {
+            existing->worker.join();
+        }
         jobs_.erase(it);
+        {
+            lock_guard<std::mutex> job_guard(job->mutex);
+            job->worker_finished = false;
+        }
+        jobs_.emplace(job->config.job_name, job);
+        return job;
     }
-    jobs_.emplace(job->config.job_name, job);
-    return job;
 }
 
 shared_ptr<NatsSubscribeJobState> NatsSubscribeManager::GetJob(const string &job_name) {
@@ -151,7 +190,6 @@ bool NatsSubscribeManager::PauseJob(const string &job_name) {
         return false;
     }
     lock_guard<std::mutex> guard(job->mutex);
-    job->progress.paused = true;
     job->progress.pause_requested = true;
     job->cv.notify_all();
     return true;
@@ -163,7 +201,6 @@ bool NatsSubscribeManager::ResumeJob(const string &job_name) {
         return false;
     }
     lock_guard<std::mutex> guard(job->mutex);
-    job->progress.paused = false;
     job->progress.pause_requested = false;
     job->cv.notify_all();
     return true;
@@ -181,16 +218,43 @@ bool NatsSubscribeManager::StopJob(const string &job_name) {
 }
 
 bool NatsSubscribeManager::RemoveJob(const string &job_name) {
+    shared_ptr<NatsSubscribeJobState> job;
+    {
+        lock_guard<std::mutex> guard(mutex_);
+        auto it = jobs_.find(job_name);
+        if (it == jobs_.end()) {
+            return false;
+        }
+        job = it->second;
+    }
+    {
+        unique_lock<std::mutex> job_guard(job->mutex);
+        if (job->progress.running && !job->progress.stop_requested) {
+            throw std::runtime_error("Subscribe job '" + job_name + "' is still running; stop it before removing");
+        }
+        if (!job->worker_finished) {
+            if (!job->progress.stop_requested && !job->progress.failed) {
+                throw std::runtime_error("Subscribe job '" + job_name + "' is still starting");
+            }
+            if (!job->cv.wait_for(job_guard, std::chrono::seconds(30), [&]() { return job->worker_finished; })) {
+                throw std::runtime_error("Timed out waiting for subscribe job '" + job_name + "' to finish cleanup");
+            }
+        }
+    }
+
     lock_guard<std::mutex> guard(mutex_);
     auto it = jobs_.find(job_name);
-    if (it == jobs_.end()) {
+    if (it == jobs_.end() || it->second != job) {
         return false;
     }
     {
-        lock_guard<std::mutex> job_guard(it->second->mutex);
-        if (it->second->progress.running) {
-            throw std::runtime_error("Subscribe job '" + job_name + "' is still running; stop it before removing");
+        lock_guard<std::mutex> job_guard(job->mutex);
+        if (!job->worker_finished || job->progress.running) {
+            throw std::runtime_error("Subscribe job '" + job_name + "' has not finished cleanup");
         }
+    }
+    if (job->worker.joinable()) {
+        job->worker.join();
     }
     jobs_.erase(it);
     return true;
@@ -787,44 +851,55 @@ static void RunSubscribeWorker(const shared_ptr<NatsSubscribeJobState> &job) {
         vector<OwnedNatsMessage> batch;
         batch.reserve(job->config.batch_size);
         natsStatus s = NATS_OK;
+        auto flush_batch = [&]() {
+            if (batch.empty()) {
+                return;
+            }
+            auto rows = batch.size();
+            FlushSubscribeBatch(conn, job->config, batch, proto_message.get());
+            {
+                lock_guard<std::mutex> guard(job->mutex);
+                job->progress.batches_committed++;
+                job->progress.rows_inserted += rows;
+                job->progress.last_commit_time = Timestamp::GetCurrentTimestamp();
+            }
+            job->cv.notify_all();
+            batch.clear();
+        };
 
         while (true) {
+            bool pause_requested = false;
             {
-                unique_lock<std::mutex> lock(job->mutex);
-                if (job->progress.stop_requested) {
-                    break;
-                }
-                if (job->progress.paused) {
-                    lock.unlock();
-                    RefreshSubscribeMetrics(job);
-                    lock.lock();
-                    job->cv.wait_for(lock, std::chrono::milliseconds(job->config.poll_ms), [&]() {
-                        return !job->progress.paused || job->progress.stop_requested;
-                    });
-                    if (job->progress.stop_requested) {
-                        break;
+                lock_guard<std::mutex> guard(job->mutex);
+                if (job->progress.stop_requested) break;
+                pause_requested = job->progress.pause_requested;
+            }
+            if (pause_requested) {
+                flush_batch();
+                std::unique_lock<std::mutex> lock(job->mutex);
+                if (job->progress.pause_requested && !job->progress.stop_requested) {
+                    job->progress.paused = true;
+                    job->cv.notify_all();
+                    while (job->progress.pause_requested && !job->progress.stop_requested) {
+                        job->cv.wait_for(lock, std::chrono::milliseconds(job->config.poll_ms));
+                        if (job->progress.pause_requested && !job->progress.stop_requested) {
+                            lock.unlock();
+                            RefreshSubscribeMetrics(job);
+                            lock.lock();
+                        }
                     }
-                    if (job->progress.paused) {
-                        continue;
-                    }
                 }
+                job->progress.paused = false;
+                job->cv.notify_all();
+                if (job->progress.stop_requested) break;
+                continue;
             }
 
             natsMsg *msg = nullptr;
             s = natsSubscription_NextMsg(&msg, job->sub, job->config.poll_ms);
             RefreshSubscribeMetrics(job);
             if (s == NATS_TIMEOUT) {
-                if (!batch.empty()) {
-                    FlushSubscribeBatch(conn, job->config, batch, proto_message.get());
-                    {
-                        lock_guard<std::mutex> guard(job->mutex);
-                        job->progress.batches_committed++;
-                        job->progress.rows_inserted += batch.size();
-                        job->progress.last_commit_time = Timestamp::GetCurrentTimestamp();
-                    }
-                    job->cv.notify_all();
-                    batch.clear();
-                }
+                flush_batch();
                 continue;
             }
             if (s == NATS_SLOW_CONSUMER) {
@@ -845,36 +920,26 @@ static void RunSubscribeWorker(const shared_ptr<NatsSubscribeJobState> &job) {
 
             batch.emplace_back(msg);
             if (batch.size() >= job->config.batch_size) {
-                FlushSubscribeBatch(conn, job->config, batch, proto_message.get());
-                {
-                    lock_guard<std::mutex> guard(job->mutex);
-                    job->progress.batches_committed++;
-                    job->progress.rows_inserted += batch.size();
-                    job->progress.last_commit_time = Timestamp::GetCurrentTimestamp();
-                }
-                job->cv.notify_all();
-                batch.clear();
+                flush_batch();
             }
         }
 
-        if (!batch.empty()) {
-            FlushSubscribeBatch(conn, job->config, batch, proto_message.get());
-            lock_guard<std::mutex> guard(job->mutex);
-            job->progress.batches_committed++;
-            job->progress.rows_inserted += batch.size();
-            job->progress.last_commit_time = Timestamp::GetCurrentTimestamp();
-        }
+        flush_batch();
         RefreshSubscribeMetrics(job);
 
         {
             lock_guard<std::mutex> guard(job->mutex);
             job->progress.running = false;
+            job->progress.paused = false;
+            job->progress.pause_requested = false;
             job->progress.connected = false;
             job->progress.reconnecting = false;
         }
     } catch (std::exception &ex) {
         lock_guard<std::mutex> guard(job->mutex);
         job->progress.running = false;
+        job->progress.paused = false;
+        job->progress.pause_requested = false;
         job->progress.failed = true;
         job->progress.last_error = ex.what();
         job->progress.last_error_time = Timestamp::GetCurrentTimestamp();
@@ -900,8 +965,39 @@ static unique_ptr<GlobalTableFunctionState> NatsSubscribeStartInitGlobal(ClientC
                                                                          TableFunctionInitInput &input) {
     auto &bind_data = input.bind_data->Cast<NatsSubscribeBindData>();
     auto job = NatsSubscribeManager::Get().CreateJob(bind_data.config);
-    job->db = context.db;
-    job->worker = std::thread(RunSubscribeWorker, job);
+    try {
+        job->db = context.db;
+        job->worker = std::thread([job]() {
+            try {
+                RunSubscribeWorker(job);
+            } catch (const std::exception &ex) {
+                lock_guard<std::mutex> guard(job->mutex);
+                job->progress.running = false;
+                job->progress.failed = true;
+                job->progress.last_error = ex.what();
+                job->progress.last_error_time = Timestamp::GetCurrentTimestamp();
+            } catch (...) {
+                lock_guard<std::mutex> guard(job->mutex);
+                job->progress.running = false;
+                job->progress.failed = true;
+                job->progress.last_error = "Unknown subscribe worker failure";
+                job->progress.last_error_time = Timestamp::GetCurrentTimestamp();
+            }
+            {
+                lock_guard<std::mutex> guard(job->mutex);
+                job->worker_finished = true;
+            }
+            job->cv.notify_all();
+        });
+    } catch (...) {
+        {
+            lock_guard<std::mutex> guard(job->mutex);
+            job->worker_finished = true;
+        }
+        job->cv.notify_all();
+        NatsSubscribeManager::Get().RemoveJob(job->config.job_name);
+        throw;
+    }
 
     auto state = make_uniq<NatsSubscribeControlGlobalState>();
     state->jobs.push_back(job);
@@ -1073,12 +1169,13 @@ static void NatsSubscribePauseExecute(ClientContext &, TableFunctionInput &data_
     {
         unique_lock<std::mutex> lock(job->mutex);
         if (!job->cv.wait_for(lock, std::chrono::seconds(30), [&]() {
-                return job->progress.paused || job->progress.failed || job->progress.stop_requested;
+                return job->progress.paused || !job->progress.pause_requested || job->progress.failed ||
+                       job->progress.stop_requested;
             })) {
             throw std::runtime_error("Timed out waiting for subscribe job '" + job->config.job_name + "' to pause");
         }
         if (!job->progress.paused && !job->progress.failed && !job->progress.stop_requested) {
-            throw std::runtime_error("Subscribe job '" + job->config.job_name + "' did not pause");
+            throw std::runtime_error("Subscribe pause request for job '" + job->config.job_name + "' was canceled");
         }
     }
     auto snapshot = SnapshotJob(job);

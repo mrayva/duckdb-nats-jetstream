@@ -114,6 +114,28 @@ EXPECT count=4 10
 EXPECT checkpoint=4 10
 EXPECT checkpoint_log_rows=1 10
 SEND
+SELECT 'removed=' || job_name AS removed
+FROM nats_remove_ingest(job_name := '${start_job_a}');
+SELECT 'restart=' || job_name AS restarted
+FROM nats_start_ingest(
+    job_name := '${start_job_a}',
+    stream_name := '${stream_name}',
+    target_table := 'ingest_out',
+    durable_name := '${durable_name}',
+    url := '${NATS_URL}',
+    batch_size := 2,
+    poll_ms := 100,
+    fetch_timeout_ms := 100,
+    start_seq := 1
+);
+END
+EXPECT removed=${start_job_a} 10
+EXPECT restart=${start_job_a} 10
+SEND
+SELECT * FROM nats_stop_ingest(job_name := '${start_job_a}');
+SELECT * FROM nats_remove_ingest(job_name := '${start_job_a}');
+END
+SEND
 CREATE TABLE ingest_bad_target(
     stream_name INTEGER,
     subject INTEGER,
