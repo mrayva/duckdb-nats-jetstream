@@ -484,13 +484,13 @@ static NatsSubscribeConfig ParseSubscribeConfig(TableFunctionBindInput &input) {
             config.poll_ms = BigIntValue::Get(kv.second);
         } else if (kv.first == "pending_message_limit") {
             auto value = BigIntValue::Get(kv.second);
-            if (value < -1 || value == 0 || value > std::numeric_limits<int>::max()) {
+            if (value < -1 || value == 0 || value > (std::numeric_limits<int>::max)()) {
                 throw std::runtime_error("pending_message_limit must be -1 or between 1 and 2147483647");
             }
             config.pending_message_limit = static_cast<int>(value);
         } else if (kv.first == "pending_bytes_limit") {
             auto value = BigIntValue::Get(kv.second);
-            if (value < -1 || value == 0 || value > std::numeric_limits<int>::max()) {
+            if (value < -1 || value == 0 || value > (std::numeric_limits<int>::max)()) {
                 throw std::runtime_error("pending_bytes_limit must be -1 or between 1 and 2147483647");
             }
             config.pending_bytes_limit = static_cast<int>(value);

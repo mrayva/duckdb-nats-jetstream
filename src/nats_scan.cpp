@@ -25,6 +25,9 @@
 #include <thread>
 #include <cstring>
 #include <charconv>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
 
 // Windows defines GetMessage as a macro (GetMessageA/GetMessageW)
 // This conflicts with protobuf's Reflection::GetMessage() method
@@ -591,11 +594,19 @@ static bool AppendJsonVectorScalar(string &output, const UnifiedVectorFormat &fo
     case LogicalTypeId::FLOAT:
     case LogicalTypeId::DOUBLE: {
         char buffer[64];
-        auto number = type == LogicalTypeId::FLOAT ? UnifiedVectorFormat::GetData<float>(format)[value_idx]
-                                                   : UnifiedVectorFormat::GetData<double>(format)[value_idx];
-        auto converted = std::to_chars(buffer, buffer + sizeof(buffer), number);
-        if (converted.ec != std::errc()) return false;
-        output.append(buffer, converted.ptr);
+        // std::to_chars for floating point is unavailable below macOS 13.3, so find the shortest round-tripping precision.
+        auto is_float = type == LogicalTypeId::FLOAT;
+        double number = is_float ? UnifiedVectorFormat::GetData<float>(format)[value_idx]
+                                 : UnifiedVectorFormat::GetData<double>(format)[value_idx];
+        int length = 0;
+        for (int precision = is_float ? 6 : 15; precision <= (is_float ? 9 : 17); precision++) {
+            length = snprintf(buffer, sizeof(buffer), "%.*g", precision, number);
+            if (length <= 0 || length >= static_cast<int>(sizeof(buffer))) return false;
+            bool round_trips = is_float ? strtof(buffer, nullptr) == static_cast<float>(number)
+                                        : strtod(buffer, nullptr) == number;
+            if (round_trips || std::isnan(number) || std::isinf(number)) break;
+        }
+        output.append(buffer, static_cast<size_t>(length));
         return true;
     }
     default:
