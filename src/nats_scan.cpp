@@ -1044,7 +1044,7 @@ static bool SetProtobufOutputVectorScalar(google::protobuf::Message &message,
         if (field->type() == FieldDescriptor::TYPE_INT32 || field->type() == FieldDescriptor::TYPE_SINT32 ||
             field->type() == FieldDescriptor::TYPE_SFIXED32) {
             // Out-of-range values take the checked slow path, which raises an error.
-            if (value < std::numeric_limits<int32_t>::min() || value > std::numeric_limits<int32_t>::max()) return false;
+            if (value < (std::numeric_limits<int32_t>::min)() || value > (std::numeric_limits<int32_t>::max)()) return false;
             reflection->SetInt32(&message, field, static_cast<int32_t>(value));
         } else reflection->SetInt64(&message, field, value);
         return true;
@@ -1056,7 +1056,7 @@ static bool SetProtobufOutputVectorScalar(google::protobuf::Message &message,
         uint64_t value;
         if (!unsigned_value(value)) return false;
         if (field->type() == FieldDescriptor::TYPE_UINT32 || field->type() == FieldDescriptor::TYPE_FIXED32) {
-            if (value > std::numeric_limits<uint32_t>::max()) return false;
+            if (value > (std::numeric_limits<uint32_t>::max)()) return false;
             reflection->SetUInt32(&message, field, static_cast<uint32_t>(value));
         } else reflection->SetUInt64(&message, field, value);
         return true;
