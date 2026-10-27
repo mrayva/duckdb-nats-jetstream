@@ -1276,14 +1276,14 @@ static void RestoreJobProgress(const shared_ptr<NatsIngestJobState> &job, const 
     lock_guard<std::mutex> guard(job->job_mutex);
     job->progress.pause_requested = snapshot.pause_requested;
     job->progress.paused = snapshot.paused;
-    job->progress.last_committed_seq = std::max(job->progress.last_committed_seq, snapshot.last_committed_seq);
-    job->progress.last_delivered_seq = std::max(job->progress.last_delivered_seq, snapshot.last_delivered_seq);
-    job->progress.rows_inserted = std::max(job->progress.rows_inserted, snapshot.rows_inserted);
-    job->progress.duplicates_skipped = std::max(job->progress.duplicates_skipped, snapshot.duplicates_skipped);
-    job->progress.batches_committed = std::max(job->progress.batches_committed, snapshot.batches_committed);
-    job->progress.fetches_completed = std::max(job->progress.fetches_completed, snapshot.fetches_completed);
+    job->progress.last_committed_seq = (std::max)(job->progress.last_committed_seq, snapshot.last_committed_seq);
+    job->progress.last_delivered_seq = (std::max)(job->progress.last_delivered_seq, snapshot.last_delivered_seq);
+    job->progress.rows_inserted = (std::max)(job->progress.rows_inserted, snapshot.rows_inserted);
+    job->progress.duplicates_skipped = (std::max)(job->progress.duplicates_skipped, snapshot.duplicates_skipped);
+    job->progress.batches_committed = (std::max)(job->progress.batches_committed, snapshot.batches_committed);
+    job->progress.fetches_completed = (std::max)(job->progress.fetches_completed, snapshot.fetches_completed);
     job->progress.last_batch_rows = snapshot.last_batch_rows;
-    job->progress.checkpoint_seq = std::max(job->progress.checkpoint_seq, snapshot.last_committed_seq);
+    job->progress.checkpoint_seq = (std::max)(job->progress.checkpoint_seq, snapshot.last_committed_seq);
     job->progress.last_start_time = snapshot.last_start_time;
     job->progress.last_fetch_time = snapshot.last_fetch_time;
     job->progress.last_ack_time = snapshot.last_ack_time;
@@ -1477,7 +1477,7 @@ static void InitializeIngestResources(const shared_ptr<NatsIngestJobState> &job)
             LoadCheckpoint(db_connection, config, resume_seq, job->progress);
             job->progress.checkpoint_seq = job->progress.last_committed_seq;
         }
-        effective_start_seq = std::max(config.start_seq, resume_seq);
+        effective_start_seq = (std::max)(config.start_seq, resume_seq);
     } else {
         lock_guard<std::mutex> guard(job->job_mutex);
         job->progress.checkpoint_seq = 0;
@@ -2139,7 +2139,7 @@ static void RunIngestWorker(const shared_ptr<NatsIngestJobState> &job) {
 
                     NatsMessageEnvelope envelope(msg);
                     uint64_t msg_seq = envelope.Sequence();
-                    batch_last_delivered_seq = std::max(batch_last_delivered_seq, msg_seq);
+                    batch_last_delivered_seq = (std::max)(batch_last_delivered_seq, msg_seq);
                     if (msg_seq != 0) {
                         if (msg_seq <= progress_snapshot.last_committed_seq) {
                             lock_guard<std::mutex> guard(job->job_mutex);
@@ -2157,7 +2157,7 @@ static void RunIngestWorker(const shared_ptr<NatsIngestJobState> &job) {
                     if (!config.subject_contains.empty() &&
                         (subject == nullptr || string(subject).find(config.subject_contains) == string::npos)) {
                         lock_guard<std::mutex> guard(job->job_mutex);
-                        job->progress.last_delivered_seq = std::max(job->progress.last_delivered_seq, msg_seq);
+                        job->progress.last_delivered_seq = (std::max)(job->progress.last_delivered_seq, msg_seq);
                         continue;
                     }
 
@@ -2208,7 +2208,7 @@ static void RunIngestWorker(const shared_ptr<NatsIngestJobState> &job) {
 
                 {
                     lock_guard<std::mutex> guard(job->job_mutex);
-                    job->progress.last_delivered_seq = std::max(job->progress.last_delivered_seq, batch_last_delivered_seq);
+                    job->progress.last_delivered_seq = (std::max)(job->progress.last_delivered_seq, batch_last_delivered_seq);
                 }
 
                 if (inserted_rows == 0) {

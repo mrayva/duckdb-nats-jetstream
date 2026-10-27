@@ -673,7 +673,7 @@ static void FlushSubscribeBatch(Connection &conn, const NatsSubscribeConfig &con
         auto *message = batch[row].get();
         const char *subject = natsMsg_GetSubject(message);
         const char *data = static_cast<const char *>(natsMsg_GetData(message));
-        auto data_length = static_cast<idx_t>(std::max(natsMsg_GetDataLength(message), 0));
+        auto data_length = static_cast<idx_t>((std::max)(natsMsg_GetDataLength(message), 0));
         data = data ? data : "";
         subject_data[row] = StringVector::AddString(subject_vector, subject ? subject : "");
         if (types[1].id() == LogicalTypeId::BLOB) {
@@ -720,10 +720,10 @@ static void RefreshSubscribeMetrics(const shared_ptr<NatsSubscribeJobState> &job
         return;
     }
     lock_guard<std::mutex> guard(job->mutex);
-    job->progress.pending_messages = static_cast<uint64_t>(std::max(pending_messages, 0));
-    job->progress.pending_bytes = static_cast<uint64_t>(std::max(pending_bytes, 0));
-    job->progress.max_pending_messages = static_cast<uint64_t>(std::max(max_pending_messages, 0));
-    job->progress.max_pending_bytes = static_cast<uint64_t>(std::max(max_pending_bytes, 0));
+    job->progress.pending_messages = static_cast<uint64_t>((std::max)(pending_messages, 0));
+    job->progress.pending_bytes = static_cast<uint64_t>((std::max)(pending_bytes, 0));
+    job->progress.max_pending_messages = static_cast<uint64_t>((std::max)(max_pending_messages, 0));
+    job->progress.max_pending_bytes = static_cast<uint64_t>((std::max)(max_pending_bytes, 0));
     job->progress.messages_delivered = static_cast<uint64_t>(std::max<int64_t>(messages_delivered, 0));
     job->progress.messages_dropped = static_cast<uint64_t>(std::max<int64_t>(messages_dropped, 0));
 }
