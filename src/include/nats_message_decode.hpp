@@ -1,6 +1,7 @@
 #pragma once
 
 #include "duckdb.hpp"
+#include "yyjson.hpp"
 #include <google/protobuf/descriptor.h>
 #include <google/protobuf/message.h>
 
@@ -50,6 +51,9 @@ void DecodeCborFieldPathsToChunk(DataChunk &chunk, idx_t row_idx, const vector<i
 void DecodeFlexbuffersFieldPathsToChunk(DataChunk &chunk, idx_t row_idx, const vector<idx_t> &output_columns,
                                         const NatsPayloadView &payload,
                                         const vector<vector<string>> &field_paths);
+
+// Exact text of a JSON number (integers keep full precision, no trailing ".000000").
+string NatsJsonNumberToString(duckdb_yyjson::yyjson_val *number);
 
 bool DecodeProtobufPayload(google::protobuf::Message &message, const NatsPayloadView &payload);
 

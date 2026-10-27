@@ -25,6 +25,7 @@
 #include <thread>
 #include <cstring>
 #include <charconv>
+#include <limits>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -743,6 +744,34 @@ static bool AppendStructuredVectorScalar(vector<uint8_t> &output, const UnifiedV
     }
 }
 
+template <class T>
+static T NatsParseInteger(const string &text) {
+    T result {};
+    auto begin = text.data();
+    auto end = begin + text.size();
+    auto parsed = std::from_chars(begin, end, result);
+    if (parsed.ec != std::errc() || parsed.ptr != end) {
+        throw InvalidInputException("COPY TO value '%s' is not a valid or in-range %s", text,
+                                    std::is_signed<T>::value ? "signed integer" : "unsigned integer");
+    }
+    return result;
+}
+
+static bool NatsTryParseInt32(const string &text, int32_t &result) {
+    auto end = text.data() + text.size();
+    auto parsed = std::from_chars(text.data(), end, result);
+    return parsed.ec == std::errc() && parsed.ptr == end;
+}
+
+static double NatsParseDouble(const string &text) {
+    char *end = nullptr;
+    double result = std::strtod(text.c_str(), &end);
+    if (text.empty() || end != text.c_str() + text.size()) {
+        throw InvalidInputException("COPY TO value '%s' is not a valid number", text);
+    }
+    return result;
+}
+
 static void AppendStructuredValue(vector<uint8_t> &output, const Value &value, bool cbor) {
     if (value.IsNull()) {
         output.push_back(0xc0);
@@ -775,7 +804,7 @@ static void AppendStructuredValue(vector<uint8_t> &output, const Value &value, b
     } else if (type == LogicalTypeId::BOOLEAN) {
         output.push_back(cbor ? (value.GetValue<bool>() ? 0xf5 : 0xf4) : (value.GetValue<bool>() ? 0xc3 : 0xc2));
     } else if (IsCopySignedType(type)) {
-        auto number = std::stoll(value.ToString());
+        auto number = NatsParseInteger<int64_t>(value.ToString());
         if (cbor) {
             if (number >= 0) {
                 if (number < 24) output.push_back(static_cast<uint8_t>(number));
@@ -792,12 +821,12 @@ static void AppendStructuredValue(vector<uint8_t> &output, const Value &value, b
             AppendBigEndian(output, static_cast<uint64_t>(number), 8);
         }
     } else if (IsCopyUnsignedType(type)) {
-        auto number = std::stoull(value.ToString());
+        auto number = NatsParseInteger<uint64_t>(value.ToString());
         if (cbor && number < 24) output.push_back(static_cast<uint8_t>(number));
         else if (!cbor && number < 128) output.push_back(static_cast<uint8_t>(number));
         else { output.push_back(cbor ? 0x1b : 0xcf); AppendBigEndian(output, number, 8); }
     } else if (type == LogicalTypeId::FLOAT || type == LogicalTypeId::DOUBLE || type == LogicalTypeId::DECIMAL) {
-        double number = std::stod(value.ToString());
+        double number = NatsParseDouble(value.ToString());
         uint64_t bits;
         memcpy(&bits, &number, sizeof(bits));
         output.push_back(cbor ? 0xfb : 0xcb);
@@ -843,10 +872,10 @@ static void SetProtobufOutputField(google::protobuf::Message &message,
             auto *entry_value = field->message_type()->FindFieldByName("value");
             const auto *entry_reflection = map_entry->GetReflection();
             switch (map_key->cpp_type()) {
-            case FieldDescriptor::CPPTYPE_INT32: entry_reflection->SetInt32(map_entry, entry_key, std::stoll(key_value[0].ToString())); break;
-            case FieldDescriptor::CPPTYPE_INT64: entry_reflection->SetInt64(map_entry, entry_key, std::stoll(key_value[0].ToString())); break;
-            case FieldDescriptor::CPPTYPE_UINT32: entry_reflection->SetUInt32(map_entry, entry_key, std::stoull(key_value[0].ToString())); break;
-            case FieldDescriptor::CPPTYPE_UINT64: entry_reflection->SetUInt64(map_entry, entry_key, std::stoull(key_value[0].ToString())); break;
+            case FieldDescriptor::CPPTYPE_INT32: entry_reflection->SetInt32(map_entry, entry_key, NatsParseInteger<int32_t>(key_value[0].ToString())); break;
+            case FieldDescriptor::CPPTYPE_INT64: entry_reflection->SetInt64(map_entry, entry_key, NatsParseInteger<int64_t>(key_value[0].ToString())); break;
+            case FieldDescriptor::CPPTYPE_UINT32: entry_reflection->SetUInt32(map_entry, entry_key, NatsParseInteger<uint32_t>(key_value[0].ToString())); break;
+            case FieldDescriptor::CPPTYPE_UINT64: entry_reflection->SetUInt64(map_entry, entry_key, NatsParseInteger<uint64_t>(key_value[0].ToString())); break;
             case FieldDescriptor::CPPTYPE_BOOL: entry_reflection->SetBool(map_entry, entry_key, key_value[0].GetValue<bool>()); break;
             case FieldDescriptor::CPPTYPE_STRING: entry_reflection->SetString(map_entry, entry_key, key_value[0].ToString()); break;
             default:
@@ -855,17 +884,20 @@ static void SetProtobufOutputField(google::protobuf::Message &message,
             const auto &map_scalar = key_value[1];
             if (map_scalar.IsNull()) continue;
             switch (map_value->cpp_type()) {
-            case FieldDescriptor::CPPTYPE_INT32: entry_reflection->SetInt32(map_entry, entry_value, std::stoll(map_scalar.ToString())); break;
-            case FieldDescriptor::CPPTYPE_INT64: entry_reflection->SetInt64(map_entry, entry_value, std::stoll(map_scalar.ToString())); break;
-            case FieldDescriptor::CPPTYPE_UINT32: entry_reflection->SetUInt32(map_entry, entry_value, std::stoull(map_scalar.ToString())); break;
-            case FieldDescriptor::CPPTYPE_UINT64: entry_reflection->SetUInt64(map_entry, entry_value, std::stoull(map_scalar.ToString())); break;
+            case FieldDescriptor::CPPTYPE_INT32: entry_reflection->SetInt32(map_entry, entry_value, NatsParseInteger<int32_t>(map_scalar.ToString())); break;
+            case FieldDescriptor::CPPTYPE_INT64: entry_reflection->SetInt64(map_entry, entry_value, NatsParseInteger<int64_t>(map_scalar.ToString())); break;
+            case FieldDescriptor::CPPTYPE_UINT32: entry_reflection->SetUInt32(map_entry, entry_value, NatsParseInteger<uint32_t>(map_scalar.ToString())); break;
+            case FieldDescriptor::CPPTYPE_UINT64: entry_reflection->SetUInt64(map_entry, entry_value, NatsParseInteger<uint64_t>(map_scalar.ToString())); break;
             case FieldDescriptor::CPPTYPE_BOOL: entry_reflection->SetBool(map_entry, entry_value, map_scalar.GetValue<bool>()); break;
-            case FieldDescriptor::CPPTYPE_FLOAT: entry_reflection->SetFloat(map_entry, entry_value, std::stof(map_scalar.ToString())); break;
-            case FieldDescriptor::CPPTYPE_DOUBLE: entry_reflection->SetDouble(map_entry, entry_value, std::stod(map_scalar.ToString())); break;
+            case FieldDescriptor::CPPTYPE_FLOAT: entry_reflection->SetFloat(map_entry, entry_value, static_cast<float>(NatsParseDouble(map_scalar.ToString()))); break;
+            case FieldDescriptor::CPPTYPE_DOUBLE: entry_reflection->SetDouble(map_entry, entry_value, NatsParseDouble(map_scalar.ToString())); break;
             case FieldDescriptor::CPPTYPE_STRING: entry_reflection->SetString(map_entry, entry_value, map_scalar.ToString()); break;
             case FieldDescriptor::CPPTYPE_ENUM: {
                 auto enum_value = entry_value->enum_type()->FindValueByName(map_scalar.ToString());
-                if (!enum_value) enum_value = entry_value->enum_type()->FindValueByNumber(std::stoi(map_scalar.ToString()));
+                int32_t enum_number;
+                if (!enum_value && NatsTryParseInt32(map_scalar.ToString(), enum_number)) {
+                    enum_value = entry_value->enum_type()->FindValueByNumber(enum_number);
+                }
                 if (!enum_value) {
                     throw BinderException("COPY TO protobuf map field '%s' has an invalid enum value", field->full_name());
                 }
@@ -894,32 +926,32 @@ static void SetProtobufOutputField(google::protobuf::Message &message,
         case FieldDescriptor::TYPE_INT32:
         case FieldDescriptor::TYPE_SINT32:
         case FieldDescriptor::TYPE_SFIXED32:
-            field->is_repeated() ? reflection->AddInt32(current_message, field, std::stoll(scalar.ToString()))
-                                  : reflection->SetInt32(current_message, field, std::stoll(scalar.ToString()));
+            field->is_repeated() ? reflection->AddInt32(current_message, field, NatsParseInteger<int32_t>(scalar.ToString()))
+                                  : reflection->SetInt32(current_message, field, NatsParseInteger<int32_t>(scalar.ToString()));
             break;
         case FieldDescriptor::TYPE_INT64:
         case FieldDescriptor::TYPE_SINT64:
         case FieldDescriptor::TYPE_SFIXED64:
-            field->is_repeated() ? reflection->AddInt64(current_message, field, std::stoll(scalar.ToString()))
-                                  : reflection->SetInt64(current_message, field, std::stoll(scalar.ToString()));
+            field->is_repeated() ? reflection->AddInt64(current_message, field, NatsParseInteger<int64_t>(scalar.ToString()))
+                                  : reflection->SetInt64(current_message, field, NatsParseInteger<int64_t>(scalar.ToString()));
             break;
         case FieldDescriptor::TYPE_UINT32:
         case FieldDescriptor::TYPE_FIXED32:
-            field->is_repeated() ? reflection->AddUInt32(current_message, field, std::stoull(scalar.ToString()))
-                                  : reflection->SetUInt32(current_message, field, std::stoull(scalar.ToString()));
+            field->is_repeated() ? reflection->AddUInt32(current_message, field, NatsParseInteger<uint32_t>(scalar.ToString()))
+                                  : reflection->SetUInt32(current_message, field, NatsParseInteger<uint32_t>(scalar.ToString()));
             break;
         case FieldDescriptor::TYPE_UINT64:
         case FieldDescriptor::TYPE_FIXED64:
-            field->is_repeated() ? reflection->AddUInt64(current_message, field, std::stoull(scalar.ToString()))
-                                  : reflection->SetUInt64(current_message, field, std::stoull(scalar.ToString()));
+            field->is_repeated() ? reflection->AddUInt64(current_message, field, NatsParseInteger<uint64_t>(scalar.ToString()))
+                                  : reflection->SetUInt64(current_message, field, NatsParseInteger<uint64_t>(scalar.ToString()));
             break;
         case FieldDescriptor::TYPE_FLOAT:
-            field->is_repeated() ? reflection->AddFloat(current_message, field, std::stof(scalar.ToString()))
-                                  : reflection->SetFloat(current_message, field, std::stof(scalar.ToString()));
+            field->is_repeated() ? reflection->AddFloat(current_message, field, static_cast<float>(NatsParseDouble(scalar.ToString())))
+                                  : reflection->SetFloat(current_message, field, static_cast<float>(NatsParseDouble(scalar.ToString())));
             break;
         case FieldDescriptor::TYPE_DOUBLE:
-            field->is_repeated() ? reflection->AddDouble(current_message, field, std::stod(scalar.ToString()))
-                                  : reflection->SetDouble(current_message, field, std::stod(scalar.ToString()));
+            field->is_repeated() ? reflection->AddDouble(current_message, field, NatsParseDouble(scalar.ToString()))
+                                  : reflection->SetDouble(current_message, field, NatsParseDouble(scalar.ToString()));
             break;
         case FieldDescriptor::TYPE_BOOL:
             field->is_repeated() ? reflection->AddBool(current_message, field, scalar.GetValue<bool>())
@@ -927,7 +959,10 @@ static void SetProtobufOutputField(google::protobuf::Message &message,
             break;
         case FieldDescriptor::TYPE_ENUM: {
             auto enum_value = field->enum_type()->FindValueByName(scalar.ToString());
-            if (!enum_value) enum_value = field->enum_type()->FindValueByNumber(std::stoi(scalar.ToString()));
+            int32_t enum_number;
+            if (!enum_value && NatsTryParseInt32(scalar.ToString(), enum_number)) {
+                enum_value = field->enum_type()->FindValueByNumber(enum_number);
+            }
             if (!enum_value) {
                 throw BinderException("COPY TO protobuf enum value '%s' was not found for field '%s'", scalar.ToString(),
                                       field->full_name());
@@ -1007,8 +1042,11 @@ static bool SetProtobufOutputVectorScalar(google::protobuf::Message &message,
         int64_t value;
         if (!signed_value(value)) return false;
         if (field->type() == FieldDescriptor::TYPE_INT32 || field->type() == FieldDescriptor::TYPE_SINT32 ||
-            field->type() == FieldDescriptor::TYPE_SFIXED32) reflection->SetInt32(&message, field, value);
-        else reflection->SetInt64(&message, field, value);
+            field->type() == FieldDescriptor::TYPE_SFIXED32) {
+            // Out-of-range values take the checked slow path, which raises an error.
+            if (value < std::numeric_limits<int32_t>::min() || value > std::numeric_limits<int32_t>::max()) return false;
+            reflection->SetInt32(&message, field, static_cast<int32_t>(value));
+        } else reflection->SetInt64(&message, field, value);
         return true;
     }
     case FieldDescriptor::TYPE_UINT32:
@@ -1017,9 +1055,10 @@ static bool SetProtobufOutputVectorScalar(google::protobuf::Message &message,
     case FieldDescriptor::TYPE_FIXED64: {
         uint64_t value;
         if (!unsigned_value(value)) return false;
-        if (field->type() == FieldDescriptor::TYPE_UINT32 || field->type() == FieldDescriptor::TYPE_FIXED32)
-            reflection->SetUInt32(&message, field, value);
-        else reflection->SetUInt64(&message, field, value);
+        if (field->type() == FieldDescriptor::TYPE_UINT32 || field->type() == FieldDescriptor::TYPE_FIXED32) {
+            if (value > std::numeric_limits<uint32_t>::max()) return false;
+            reflection->SetUInt32(&message, field, static_cast<uint32_t>(value));
+        } else reflection->SetUInt64(&message, field, value);
         return true;
     }
     case FieldDescriptor::TYPE_FLOAT:
@@ -1087,12 +1126,12 @@ static void AppendFlexField(flexbuffers::Builder &builder, const string &key, co
     } else if (value.type().id() == LogicalTypeId::BOOLEAN) {
         builder.Bool(key_ptr, value.GetValue<bool>());
     } else if (IsCopySignedType(value.type().id())) {
-        builder.Int(key_ptr, std::stoll(value.ToString()));
+        builder.Int(key_ptr, NatsParseInteger<int64_t>(value.ToString()));
     } else if (IsCopyUnsignedType(value.type().id())) {
-        builder.UInt(key_ptr, std::stoull(value.ToString()));
+        builder.UInt(key_ptr, NatsParseInteger<uint64_t>(value.ToString()));
     } else if (value.type().id() == LogicalTypeId::FLOAT || value.type().id() == LogicalTypeId::DOUBLE ||
                value.type().id() == LogicalTypeId::DECIMAL) {
-        builder.Double(key_ptr, std::stod(value.ToString()));
+        builder.Double(key_ptr, NatsParseDouble(value.ToString()));
     } else {
         builder.String(key_ptr, CopyValueText(value));
     }
@@ -1124,12 +1163,12 @@ static void AppendFlexValue(flexbuffers::Builder &builder, const Value &value) {
     } else if (value.type().id() == LogicalTypeId::BOOLEAN) {
         builder.Bool(value.GetValue<bool>());
     } else if (IsCopySignedType(value.type().id())) {
-        builder.Int(std::stoll(value.ToString()));
+        builder.Int(NatsParseInteger<int64_t>(value.ToString()));
     } else if (IsCopyUnsignedType(value.type().id())) {
-        builder.UInt(std::stoull(value.ToString()));
+        builder.UInt(NatsParseInteger<uint64_t>(value.ToString()));
     } else if (value.type().id() == LogicalTypeId::FLOAT || value.type().id() == LogicalTypeId::DOUBLE ||
                value.type().id() == LogicalTypeId::DECIMAL) {
-        builder.Double(std::stod(value.ToString()));
+        builder.Double(NatsParseDouble(value.ToString()));
     } else {
         builder.String(CopyValueText(value));
     }
@@ -2173,8 +2212,7 @@ static void NatsScanExecute(ClientContext &context, TableFunctionInput &data_p, 
                         if (yyjson_is_str(field_val)) {
                             vec_data[count] = StringVector::AddString(vec, yyjson_get_str(field_val));
                         } else if (yyjson_is_num(field_val)) {
-                            auto s = std::to_string(yyjson_get_num(field_val));
-                            vec_data[count] = StringVector::AddString(vec, s);
+                            vec_data[count] = StringVector::AddString(vec, NatsJsonNumberToString(field_val));
                         } else if (yyjson_is_bool(field_val)) {
                             vec_data[count] = StringVector::AddString(vec, yyjson_get_bool(field_val) ? "true" : "false");
                         } else if (yyjson_is_null(field_val)) {

@@ -32,7 +32,7 @@ trap 'rc=$?; rm -f "$log_file" "$db_file"; exit $rc' EXIT
 (
   sleep 1
   "$NATS_CLI" pub --server "$NATS_URL" live.subscribe.json \
-    '{"device_id":"json-device-1","metrics":{"kw":17.25},"online":true}' >/dev/null
+    '{"device_id":"json-device-1","metrics":{"kw":17.25},"online":true,"seq":9007199254740993,"count":7}' >/dev/null
 ) &
 
 if ! DUCKDB_LIB="$DUCKDB_LIB" "$PYTHON_BIN" "$ROOT_DIR/scripts/duckdb_session.py" \
@@ -48,7 +48,7 @@ FROM nats_start_subscribe(
     batch_size := 1,
     poll_ms := 100,
     create_target_table := true,
-    json_extract := ['device_id', 'metrics', 'online']
+    json_extract := ['device_id', 'metrics', 'online', 'seq', 'count']
 );
 END
 EXPECT start=live_subscribe_json_probe|main.subscribe_json_out|live.subscribe.json 10
@@ -58,6 +58,8 @@ SELECT 'status=' || rows_inserted || '/' || failed AS subscribe_status
 FROM nats_subscribe_status(job_name := 'live_subscribe_json_probe');
 SELECT 'row=' || device_id || '/' || metrics || '/' || online AS extracted_row
 FROM main.subscribe_json_out;
+SELECT 'numbers=' || seq || '/' || "count" AS extracted_numbers
+FROM main.subscribe_json_out;
 SELECT 'types=' || string_agg(type, '/' ORDER BY cid) AS target_types
 FROM pragma_table_info('subscribe_json_out');
 SELECT 'stop=' || job_name || '|' || target_table || '|' || subject AS stop_result
@@ -65,7 +67,8 @@ FROM nats_stop_subscribe(job_name := 'live_subscribe_json_probe');
 END
 EXPECT status=1/false 10
 EXPECT row=json-device-1/{"kw":17.25}/true 10
-EXPECT types=VARCHAR/BLOB/TIMESTAMP/VARCHAR/VARCHAR/VARCHAR 10
+EXPECT numbers=9007199254740993/7 10
+EXPECT types=VARCHAR/BLOB/TIMESTAMP/VARCHAR/VARCHAR/VARCHAR/VARCHAR/VARCHAR 10
 EXPECT stop=live_subscribe_json_probe|main.subscribe_json_out|live.subscribe.json 10
 QUIT
 SQL

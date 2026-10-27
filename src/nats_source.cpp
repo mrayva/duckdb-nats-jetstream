@@ -59,7 +59,7 @@ const char *NatsMessageEnvelope::Data() const {
 }
 
 int NatsMessageEnvelope::DataLength() const {
-    return data_length_;
+    return data_length_ < 0 ? 0 : data_length_;
 }
 
 NatsJetStreamBatchSource::NatsJetStreamBatchSource(natsSubscription *subscription, natsConnection *connection)

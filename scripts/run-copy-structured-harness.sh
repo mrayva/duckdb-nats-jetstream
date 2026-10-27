@@ -126,14 +126,14 @@ FROM nats_scan('copy_roundtrip', url := '${NATS_URL}', nats_subject := 'copy_rou
     json_extract := ['metrics.kw', 'metrics.online', 'attrs.x']);
 END
 EXPECT rows=6 20
-EXPECT json=json-device/42.500000/true/7.000000 20
+EXPECT json=json-device/42.5/true/7 20
 EXPECT msgpack=msgpack-device/43.500000/false/8 20
 EXPECT cbor=cbor-device/44.500000/true/9 20
 EXPECT flex=flex-device/45.500000/false/10 20
 EXPECT proto=proto-device/46.5/true 20
 EXPECT proto_tags=ok 20
 EXPECT proto_set=descriptor-set-device/47.5/true 20
-EXPECT nested=12.500000/true/1 20
+EXPECT nested=12.5/true/1 20
 QUIT
 SQL
 then
