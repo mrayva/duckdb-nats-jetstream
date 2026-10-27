@@ -1,4 +1,5 @@
 #include "nats_connection.hpp"
+#include "nats_duckdb_compat.hpp"
 #include <chrono>
 #include <filesystem>
 #include <thread>
@@ -50,13 +51,13 @@ void ValidateNatsConnectionConfig(const NatsConnectionConfig &config) {
 }
 
 void RegisterNatsConnectionParameters(TableFunction &function) {
-    function.named_parameters["url"] = LogicalType(LogicalTypeId::VARCHAR);
-    function.named_parameters["credentials_file"] = LogicalType(LogicalTypeId::VARCHAR);
-    function.named_parameters["tls_ca_file"] = LogicalType(LogicalTypeId::VARCHAR);
-    function.named_parameters["tls_cert_file"] = LogicalType(LogicalTypeId::VARCHAR);
-    function.named_parameters["tls_key_file"] = LogicalType(LogicalTypeId::VARCHAR);
-    function.named_parameters["tls_server_name"] = LogicalType(LogicalTypeId::VARCHAR);
-    function.named_parameters["tls_skip_verify"] = LogicalType(LogicalTypeId::BOOLEAN);
+    NatsAddNamedParameter(function, "url", LogicalType(LogicalTypeId::VARCHAR));
+    NatsAddNamedParameter(function, "credentials_file", LogicalType(LogicalTypeId::VARCHAR));
+    NatsAddNamedParameter(function, "tls_ca_file", LogicalType(LogicalTypeId::VARCHAR));
+    NatsAddNamedParameter(function, "tls_cert_file", LogicalType(LogicalTypeId::VARCHAR));
+    NatsAddNamedParameter(function, "tls_key_file", LogicalType(LogicalTypeId::VARCHAR));
+    NatsAddNamedParameter(function, "tls_server_name", LogicalType(LogicalTypeId::VARCHAR));
+    NatsAddNamedParameter(function, "tls_skip_verify", LogicalType(LogicalTypeId::BOOLEAN));
 }
 
 void ConfigureNatsOptions(natsOptions *options, const NatsConnectionConfig &config,

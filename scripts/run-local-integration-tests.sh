@@ -5,14 +5,14 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$ROOT_DIR/scripts/duckdb_host_lib.sh"
 if [ -z "${DUCKDB_BIN:-}" ]; then
-  for candidate in "$HOME/duckdb" "$HOME/.duckdb/cli/1.5.6/duckdb"; do
+  for candidate in "$HOME/duckdb" "$HOME/.duckdb/cli/2.0.0/duckdb"; do
     if [ -x "$candidate" ]; then
       DUCKDB_BIN="$candidate"
       break
     fi
   done
 fi
-DUCKDB_BIN="${DUCKDB_BIN:-$HOME/.duckdb/cli/1.5.6/duckdb}"
+DUCKDB_BIN="${DUCKDB_BIN:-$HOME/.duckdb/cli/2.0.0/duckdb}"
 EXTENSION_PATH="${EXTENSION_PATH:-$ROOT_DIR/build/release/extension/nats_js/nats_js.duckdb_extension}"
 NATS_URL="${NATS_URL:-nats://127.0.0.1:4222}"
 NATS_CLI="${NATS_CLI:-$HOME/nats}"

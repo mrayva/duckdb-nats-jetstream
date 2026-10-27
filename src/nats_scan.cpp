@@ -2784,25 +2784,25 @@ static TableFunction CreateNatsScanTableFunction() {
                             NatsScanInitGlobal, NatsScanInitLocal);
     nats_scan.projection_pushdown = true;
 
-    nats_scan.named_parameters["subject"] = LogicalType(LogicalTypeId::VARCHAR);
-    nats_scan.named_parameters["subject_contains"] = LogicalType(LogicalTypeId::VARCHAR);
-    nats_scan.named_parameters["nats_subject"] = LogicalType(LogicalTypeId::VARCHAR);
+    NatsAddNamedParameter(nats_scan, "subject", LogicalType(LogicalTypeId::VARCHAR));
+    NatsAddNamedParameter(nats_scan, "subject_contains", LogicalType(LogicalTypeId::VARCHAR));
+    NatsAddNamedParameter(nats_scan, "nats_subject", LogicalType(LogicalTypeId::VARCHAR));
     RegisterNatsConnectionParameters(nats_scan);
-    nats_scan.named_parameters["start_seq"] = LogicalType(LogicalTypeId::UBIGINT);
-    nats_scan.named_parameters["end_seq"] = LogicalType(LogicalTypeId::UBIGINT);
-    nats_scan.named_parameters["start_time"] = LogicalType(LogicalTypeId::TIMESTAMP);
-    nats_scan.named_parameters["end_time"] = LogicalType(LogicalTypeId::TIMESTAMP);
-    nats_scan.named_parameters["json_extract"] = LogicalType::LIST(LogicalType(LogicalTypeId::VARCHAR));
-    nats_scan.named_parameters["msgpack_extract"] = LogicalType::LIST(LogicalType(LogicalTypeId::VARCHAR));
-    nats_scan.named_parameters["cbor_extract"] = LogicalType::LIST(LogicalType(LogicalTypeId::VARCHAR));
-    nats_scan.named_parameters["flexbuffers_extract"] = LogicalType::LIST(LogicalType(LogicalTypeId::VARCHAR));
-    nats_scan.named_parameters["headers"] = LogicalType(LogicalTypeId::BOOLEAN);
-    nats_scan.named_parameters["proto_file"] = LogicalType(LogicalTypeId::VARCHAR);
-    nats_scan.named_parameters["proto_descriptor_set"] = LogicalType(LogicalTypeId::VARCHAR);
-    nats_scan.named_parameters["proto_message"] = LogicalType(LogicalTypeId::VARCHAR);
-    nats_scan.named_parameters["proto_extract"] = LogicalType::LIST(LogicalType(LogicalTypeId::VARCHAR));
-    nats_scan.named_parameters["batch_size"] = LogicalType(LogicalTypeId::UBIGINT);
-    nats_scan.named_parameters["fetch_timeout_ms"] = LogicalType(LogicalTypeId::BIGINT);
+    NatsAddNamedParameter(nats_scan, "start_seq", LogicalType(LogicalTypeId::UBIGINT));
+    NatsAddNamedParameter(nats_scan, "end_seq", LogicalType(LogicalTypeId::UBIGINT));
+    NatsAddNamedParameter(nats_scan, "start_time", LogicalType(LogicalTypeId::TIMESTAMP));
+    NatsAddNamedParameter(nats_scan, "end_time", LogicalType(LogicalTypeId::TIMESTAMP));
+    NatsAddNamedParameter(nats_scan, "json_extract", LogicalType::LIST(LogicalType(LogicalTypeId::VARCHAR)));
+    NatsAddNamedParameter(nats_scan, "msgpack_extract", LogicalType::LIST(LogicalType(LogicalTypeId::VARCHAR)));
+    NatsAddNamedParameter(nats_scan, "cbor_extract", LogicalType::LIST(LogicalType(LogicalTypeId::VARCHAR)));
+    NatsAddNamedParameter(nats_scan, "flexbuffers_extract", LogicalType::LIST(LogicalType(LogicalTypeId::VARCHAR)));
+    NatsAddNamedParameter(nats_scan, "headers", LogicalType(LogicalTypeId::BOOLEAN));
+    NatsAddNamedParameter(nats_scan, "proto_file", LogicalType(LogicalTypeId::VARCHAR));
+    NatsAddNamedParameter(nats_scan, "proto_descriptor_set", LogicalType(LogicalTypeId::VARCHAR));
+    NatsAddNamedParameter(nats_scan, "proto_message", LogicalType(LogicalTypeId::VARCHAR));
+    NatsAddNamedParameter(nats_scan, "proto_extract", LogicalType::LIST(LogicalType(LogicalTypeId::VARCHAR)));
+    NatsAddNamedParameter(nats_scan, "batch_size", LogicalType(LogicalTypeId::UBIGINT));
+    NatsAddNamedParameter(nats_scan, "fetch_timeout_ms", LogicalType(LogicalTypeId::BIGINT));
 
     return nats_scan;
 }
@@ -2940,7 +2940,7 @@ void NatsStreamStatsFunction::Register(ExtensionLoader &loader) {
     TableFunction nats_stream_subjects("nats_stream_subjects", {LogicalType(LogicalTypeId::VARCHAR)},
                                        NatsStreamSubjectsExecute, NatsStreamSubjectsBind,
                                        NatsStreamSubjectsInitGlobal);
-    nats_stream_subjects.named_parameters["subject"] = LogicalType(LogicalTypeId::VARCHAR);
+    NatsAddNamedParameter(nats_stream_subjects, "subject", LogicalType(LogicalTypeId::VARCHAR));
     RegisterNatsConnectionParameters(nats_stream_subjects);
     loader.RegisterFunction(nats_stream_subjects);
 
@@ -2955,8 +2955,8 @@ void NatsStreamStatsFunction::Register(ExtensionLoader &loader) {
                                           NatsStreamRangeStatsExecute, NatsStreamRangeStatsBind,
                                           NatsStreamRangeStatsInitGlobal);
     RegisterNatsConnectionParameters(nats_stream_range_stats);
-    nats_stream_range_stats.named_parameters["start_seq"] = LogicalType(LogicalTypeId::UBIGINT);
-    nats_stream_range_stats.named_parameters["end_seq"] = LogicalType(LogicalTypeId::UBIGINT);
+    NatsAddNamedParameter(nats_stream_range_stats, "start_seq", LogicalType(LogicalTypeId::UBIGINT));
+    NatsAddNamedParameter(nats_stream_range_stats, "end_seq", LogicalType(LogicalTypeId::UBIGINT));
     loader.RegisterFunction(nats_stream_range_stats);
 }
 

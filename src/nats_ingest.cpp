@@ -977,7 +977,7 @@ static void UpsertCheckpoint(PreparedStatement &statement, const NatsIngestConfi
     values.emplace_back(Value::UBIGINT(delivered_seq));
     values.emplace_back(Value::UBIGINT(rows_inserted));
     values.emplace_back(Value::UBIGINT(batches_committed));
-    auto result = statement.Execute(values, false);
+    auto result = statement.Execute(values);
     if (!result || result->HasError()) {
         throw std::runtime_error("Failed to update ingest checkpoint: " +
                                  (result ? result->GetError() : string("unknown error")));
@@ -2978,50 +2978,50 @@ static void NatsIngestJobsExecute(ClientContext &context, TableFunctionInput &da
 
 void NatsIngestFunction::Register(ExtensionLoader &loader) {
     TableFunction start_fn("nats_start_ingest", {}, NatsIngestStartExecute, NatsIngestStartBind, NatsIngestStartInitGlobal);
-    start_fn.named_parameters["job_name"] = LogicalType(LogicalTypeId::VARCHAR);
-    start_fn.named_parameters["stream_name"] = LogicalType(LogicalTypeId::VARCHAR);
-    start_fn.named_parameters["target_table"] = LogicalType(LogicalTypeId::VARCHAR);
-    start_fn.named_parameters["durable_name"] = LogicalType(LogicalTypeId::VARCHAR);
+    NatsAddNamedParameter(start_fn, "job_name", LogicalType(LogicalTypeId::VARCHAR));
+    NatsAddNamedParameter(start_fn, "stream_name", LogicalType(LogicalTypeId::VARCHAR));
+    NatsAddNamedParameter(start_fn, "target_table", LogicalType(LogicalTypeId::VARCHAR));
+    NatsAddNamedParameter(start_fn, "durable_name", LogicalType(LogicalTypeId::VARCHAR));
     RegisterNatsConnectionParameters(start_fn);
-    start_fn.named_parameters["start_seq"] = LogicalType(LogicalTypeId::UBIGINT);
-    start_fn.named_parameters["batch_size"] = LogicalType(LogicalTypeId::UBIGINT);
-    start_fn.named_parameters["poll_ms"] = LogicalType(LogicalTypeId::BIGINT);
-    start_fn.named_parameters["fetch_timeout_ms"] = LogicalType(LogicalTypeId::BIGINT);
-    start_fn.named_parameters["create_target_table"] = LogicalType(LogicalTypeId::BOOLEAN);
-    start_fn.named_parameters["subject"] = LogicalType(LogicalTypeId::VARCHAR);
-    start_fn.named_parameters["subject_contains"] = LogicalType(LogicalTypeId::VARCHAR);
-    start_fn.named_parameters["nats_subject"] = LogicalType(LogicalTypeId::VARCHAR);
-    start_fn.named_parameters["json_extract"] = LogicalType::LIST(LogicalType(LogicalTypeId::VARCHAR));
-    start_fn.named_parameters["msgpack_extract"] = LogicalType::LIST(LogicalType(LogicalTypeId::VARCHAR));
-    start_fn.named_parameters["cbor_extract"] = LogicalType::LIST(LogicalType(LogicalTypeId::VARCHAR));
-    start_fn.named_parameters["flexbuffers_extract"] = LogicalType::LIST(LogicalType(LogicalTypeId::VARCHAR));
-    start_fn.named_parameters["proto_file"] = LogicalType(LogicalTypeId::VARCHAR);
-    start_fn.named_parameters["proto_descriptor_set"] = LogicalType(LogicalTypeId::VARCHAR);
-    start_fn.named_parameters["proto_message"] = LogicalType(LogicalTypeId::VARCHAR);
-    start_fn.named_parameters["proto_extract"] = LogicalType::LIST(LogicalType(LogicalTypeId::VARCHAR));
+    NatsAddNamedParameter(start_fn, "start_seq", LogicalType(LogicalTypeId::UBIGINT));
+    NatsAddNamedParameter(start_fn, "batch_size", LogicalType(LogicalTypeId::UBIGINT));
+    NatsAddNamedParameter(start_fn, "poll_ms", LogicalType(LogicalTypeId::BIGINT));
+    NatsAddNamedParameter(start_fn, "fetch_timeout_ms", LogicalType(LogicalTypeId::BIGINT));
+    NatsAddNamedParameter(start_fn, "create_target_table", LogicalType(LogicalTypeId::BOOLEAN));
+    NatsAddNamedParameter(start_fn, "subject", LogicalType(LogicalTypeId::VARCHAR));
+    NatsAddNamedParameter(start_fn, "subject_contains", LogicalType(LogicalTypeId::VARCHAR));
+    NatsAddNamedParameter(start_fn, "nats_subject", LogicalType(LogicalTypeId::VARCHAR));
+    NatsAddNamedParameter(start_fn, "json_extract", LogicalType::LIST(LogicalType(LogicalTypeId::VARCHAR)));
+    NatsAddNamedParameter(start_fn, "msgpack_extract", LogicalType::LIST(LogicalType(LogicalTypeId::VARCHAR)));
+    NatsAddNamedParameter(start_fn, "cbor_extract", LogicalType::LIST(LogicalType(LogicalTypeId::VARCHAR)));
+    NatsAddNamedParameter(start_fn, "flexbuffers_extract", LogicalType::LIST(LogicalType(LogicalTypeId::VARCHAR)));
+    NatsAddNamedParameter(start_fn, "proto_file", LogicalType(LogicalTypeId::VARCHAR));
+    NatsAddNamedParameter(start_fn, "proto_descriptor_set", LogicalType(LogicalTypeId::VARCHAR));
+    NatsAddNamedParameter(start_fn, "proto_message", LogicalType(LogicalTypeId::VARCHAR));
+    NatsAddNamedParameter(start_fn, "proto_extract", LogicalType::LIST(LogicalType(LogicalTypeId::VARCHAR)));
     loader.RegisterFunction(start_fn);
 
     TableFunction stop_fn("nats_stop_ingest", {}, NatsIngestStopExecute, NatsIngestStopBind, NatsIngestStopInitGlobal);
-    stop_fn.named_parameters["job_name"] = LogicalType(LogicalTypeId::VARCHAR);
+    NatsAddNamedParameter(stop_fn, "job_name", LogicalType(LogicalTypeId::VARCHAR));
     loader.RegisterFunction(stop_fn);
 
     TableFunction remove_fn("nats_remove_ingest", {}, NatsIngestRemoveExecute, NatsIngestRemoveBind,
                             NatsIngestRemoveInitGlobal);
-    remove_fn.named_parameters["job_name"] = LogicalType(LogicalTypeId::VARCHAR);
+    NatsAddNamedParameter(remove_fn, "job_name", LogicalType(LogicalTypeId::VARCHAR));
     loader.RegisterFunction(remove_fn);
 
     TableFunction pause_fn("nats_pause_ingest", {}, NatsIngestPauseExecute, NatsIngestPauseBind, NatsIngestPauseInitGlobal);
-    pause_fn.named_parameters["job_name"] = LogicalType(LogicalTypeId::VARCHAR);
+    NatsAddNamedParameter(pause_fn, "job_name", LogicalType(LogicalTypeId::VARCHAR));
     loader.RegisterFunction(pause_fn);
 
     TableFunction resume_fn("nats_resume_ingest", {}, NatsIngestResumeExecute, NatsIngestResumeBind,
                             NatsIngestResumeInitGlobal);
-    resume_fn.named_parameters["job_name"] = LogicalType(LogicalTypeId::VARCHAR);
+    NatsAddNamedParameter(resume_fn, "job_name", LogicalType(LogicalTypeId::VARCHAR));
     loader.RegisterFunction(resume_fn);
 
     TableFunction status_fn("nats_ingest_status", {}, NatsIngestStatusExecute, NatsIngestStatusBind,
                             NatsIngestStatusInitGlobal);
-    status_fn.named_parameters["job_name"] = LogicalType(LogicalTypeId::VARCHAR);
+    NatsAddNamedParameter(status_fn, "job_name", LogicalType(LogicalTypeId::VARCHAR));
     loader.RegisterFunction(status_fn);
 
     TableFunction jobs_fn("nats_ingest_jobs", {}, NatsIngestJobsExecute, NatsIngestJobsBind, NatsIngestJobsInitGlobal);

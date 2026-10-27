@@ -1,11 +1,30 @@
 #pragma once
 
+#include "duckdb/function/table_function.hpp"
 #include "duckdb/parser/qualified_name.hpp"
 #ifdef NATS_DUCKDB_IDENTIFIER_API
 #include "duckdb/common/identifier.hpp"
 #endif
 
 namespace duckdb {
+
+// DuckDB 2.0 removed TableFunction::named_parameters; optional named arguments are
+// declared as typed kwargs on the function signature instead.
+#ifdef NATS_DUCKDB_TYPED_KWARGS
+inline void NatsAddNamedParameter(TableFunction &function, const char *name, const LogicalType &type) {
+    auto &signature = function.GetSignature();
+    auto add = [&](TypedKwargs &options) { options.Add(Identifier(name), type); };
+    if (signature.GetTypedKwargs()) {
+        signature.ExtendTypedKwargs(add);
+    } else {
+        signature.WithTypedKwargs(Identifier("options"), add);
+    }
+}
+#else
+inline void NatsAddNamedParameter(TableFunction &function, const char *name, const LogicalType &type) {
+    function.named_parameters[name] = type;
+}
+#endif
 
 #ifdef NATS_DUCKDB_IDENTIFIER_API
 using NatsBindColumnNames = vector<Identifier>;
