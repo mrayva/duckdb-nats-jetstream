@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [Unreleased]
+
+### Changed
+- Upgraded to DuckDB v2.0.0 (`duckdb/` submodule pinned to the `v2.0.0` tag, CI on `v2.0-cyanoptera`)
+- Named table-function parameters are declared as typed kwargs on the 2.0 function signature
+  (`NatsAddNamedParameter` in `nats_duckdb_compat.hpp`); older DuckDB releases keep the legacy path
+
 ## [0.2.2] - 2026-08-05
 
 ### Added

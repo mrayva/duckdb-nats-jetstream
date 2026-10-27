@@ -871,43 +871,43 @@ void NatsKvWatchJobsExecute(ClientContext &, TableFunctionInput &data_p, DataChu
 void NatsKvWatchFunction::Register(ExtensionLoader &loader) {
     TableFunction start_fn("nats_start_kv_watch", {}, NatsKvWatchStartExecute, NatsKvWatchStartBind,
                            NatsKvWatchStartInitGlobal);
-    start_fn.named_parameters["job_name"] = LogicalType(LogicalTypeId::VARCHAR);
-    start_fn.named_parameters["target_table"] = LogicalType(LogicalTypeId::VARCHAR);
+    NatsAddNamedParameter(start_fn, "job_name", LogicalType(LogicalTypeId::VARCHAR));
+    NatsAddNamedParameter(start_fn, "target_table", LogicalType(LogicalTypeId::VARCHAR));
     RegisterNatsConnectionParameters(start_fn);
-    start_fn.named_parameters["bucket"] = LogicalType(LogicalTypeId::VARCHAR);
-    start_fn.named_parameters["key_filter"] = LogicalType(LogicalTypeId::VARCHAR);
-    start_fn.named_parameters["batch_size"] = LogicalType(LogicalTypeId::UBIGINT);
-    start_fn.named_parameters["poll_ms"] = LogicalType(LogicalTypeId::BIGINT);
-    start_fn.named_parameters["updates_only"] = LogicalType(LogicalTypeId::BOOLEAN);
-    start_fn.named_parameters["ignore_deletes"] = LogicalType(LogicalTypeId::BOOLEAN);
-    start_fn.named_parameters["create_target_table"] = LogicalType(LogicalTypeId::BOOLEAN);
-    start_fn.named_parameters["key_column"] = LogicalType(LogicalTypeId::VARCHAR);
-    start_fn.named_parameters["value_column"] = LogicalType(LogicalTypeId::VARCHAR);
+    NatsAddNamedParameter(start_fn, "bucket", LogicalType(LogicalTypeId::VARCHAR));
+    NatsAddNamedParameter(start_fn, "key_filter", LogicalType(LogicalTypeId::VARCHAR));
+    NatsAddNamedParameter(start_fn, "batch_size", LogicalType(LogicalTypeId::UBIGINT));
+    NatsAddNamedParameter(start_fn, "poll_ms", LogicalType(LogicalTypeId::BIGINT));
+    NatsAddNamedParameter(start_fn, "updates_only", LogicalType(LogicalTypeId::BOOLEAN));
+    NatsAddNamedParameter(start_fn, "ignore_deletes", LogicalType(LogicalTypeId::BOOLEAN));
+    NatsAddNamedParameter(start_fn, "create_target_table", LogicalType(LogicalTypeId::BOOLEAN));
+    NatsAddNamedParameter(start_fn, "key_column", LogicalType(LogicalTypeId::VARCHAR));
+    NatsAddNamedParameter(start_fn, "value_column", LogicalType(LogicalTypeId::VARCHAR));
     loader.RegisterFunction(start_fn);
 
     TableFunction stop_fn("nats_stop_kv_watch", {}, NatsKvWatchControlExecute, NatsKvWatchJobNameBind,
                           NatsKvWatchStopInitGlobal);
-    stop_fn.named_parameters["job_name"] = LogicalType(LogicalTypeId::VARCHAR);
+    NatsAddNamedParameter(stop_fn, "job_name", LogicalType(LogicalTypeId::VARCHAR));
     loader.RegisterFunction(stop_fn);
 
     TableFunction remove_fn("nats_remove_kv_watch", {}, NatsKvWatchControlExecute, NatsKvWatchJobNameBind,
                             NatsKvWatchRemoveInitGlobal);
-    remove_fn.named_parameters["job_name"] = LogicalType(LogicalTypeId::VARCHAR);
+    NatsAddNamedParameter(remove_fn, "job_name", LogicalType(LogicalTypeId::VARCHAR));
     loader.RegisterFunction(remove_fn);
 
     TableFunction status_fn("nats_kv_watch_status", {}, NatsKvWatchControlExecute, NatsKvWatchJobNameBind,
                             NatsKvWatchStatusInitGlobal);
-    status_fn.named_parameters["job_name"] = LogicalType(LogicalTypeId::VARCHAR);
+    NatsAddNamedParameter(status_fn, "job_name", LogicalType(LogicalTypeId::VARCHAR));
     loader.RegisterFunction(status_fn);
 
     TableFunction pause_fn("nats_pause_kv_watch", {}, NatsKvWatchPauseExecute, NatsKvWatchJobNameBind,
                            NatsKvWatchPauseInitGlobal);
-    pause_fn.named_parameters["job_name"] = LogicalType(LogicalTypeId::VARCHAR);
+    NatsAddNamedParameter(pause_fn, "job_name", LogicalType(LogicalTypeId::VARCHAR));
     loader.RegisterFunction(pause_fn);
 
     TableFunction resume_fn("nats_resume_kv_watch", {}, NatsKvWatchResumeExecute, NatsKvWatchJobNameBind,
                             NatsKvWatchResumeInitGlobal);
-    resume_fn.named_parameters["job_name"] = LogicalType(LogicalTypeId::VARCHAR);
+    NatsAddNamedParameter(resume_fn, "job_name", LogicalType(LogicalTypeId::VARCHAR));
     loader.RegisterFunction(resume_fn);
 
     TableFunction jobs_fn("nats_kv_watch_jobs", {}, NatsKvWatchJobsExecute, NatsKvWatchJobsBind,

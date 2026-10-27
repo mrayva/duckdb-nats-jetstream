@@ -977,7 +977,7 @@ static void UpsertCheckpoint(PreparedStatement &statement, const NatsIngestConfi
     values.emplace_back(Value::UBIGINT(delivered_seq));
     values.emplace_back(Value::UBIGINT(rows_inserted));
     values.emplace_back(Value::UBIGINT(batches_committed));
-    auto result = statement.Execute(values, false);
+    auto result = statement.Execute(values);
     if (!result || result->HasError()) {
         throw std::runtime_error("Failed to update ingest checkpoint: " +
                                  (result ? result->GetError() : string("unknown error")));
@@ -1276,14 +1276,14 @@ static void RestoreJobProgress(const shared_ptr<NatsIngestJobState> &job, const 
     lock_guard<std::mutex> guard(job->job_mutex);
     job->progress.pause_requested = snapshot.pause_requested;
     job->progress.paused = snapshot.paused;
-    job->progress.last_committed_seq = std::max(job->progress.last_committed_seq, snapshot.last_committed_seq);
-    job->progress.last_delivered_seq = std::max(job->progress.last_delivered_seq, snapshot.last_delivered_seq);
-    job->progress.rows_inserted = std::max(job->progress.rows_inserted, snapshot.rows_inserted);
-    job->progress.duplicates_skipped = std::max(job->progress.duplicates_skipped, snapshot.duplicates_skipped);
-    job->progress.batches_committed = std::max(job->progress.batches_committed, snapshot.batches_committed);
-    job->progress.fetches_completed = std::max(job->progress.fetches_completed, snapshot.fetches_completed);
+    job->progress.last_committed_seq = (std::max)(job->progress.last_committed_seq, snapshot.last_committed_seq);
+    job->progress.last_delivered_seq = (std::max)(job->progress.last_delivered_seq, snapshot.last_delivered_seq);
+    job->progress.rows_inserted = (std::max)(job->progress.rows_inserted, snapshot.rows_inserted);
+    job->progress.duplicates_skipped = (std::max)(job->progress.duplicates_skipped, snapshot.duplicates_skipped);
+    job->progress.batches_committed = (std::max)(job->progress.batches_committed, snapshot.batches_committed);
+    job->progress.fetches_completed = (std::max)(job->progress.fetches_completed, snapshot.fetches_completed);
     job->progress.last_batch_rows = snapshot.last_batch_rows;
-    job->progress.checkpoint_seq = std::max(job->progress.checkpoint_seq, snapshot.last_committed_seq);
+    job->progress.checkpoint_seq = (std::max)(job->progress.checkpoint_seq, snapshot.last_committed_seq);
     job->progress.last_start_time = snapshot.last_start_time;
     job->progress.last_fetch_time = snapshot.last_fetch_time;
     job->progress.last_ack_time = snapshot.last_ack_time;
@@ -1477,7 +1477,7 @@ static void InitializeIngestResources(const shared_ptr<NatsIngestJobState> &job)
             LoadCheckpoint(db_connection, config, resume_seq, job->progress);
             job->progress.checkpoint_seq = job->progress.last_committed_seq;
         }
-        effective_start_seq = std::max(config.start_seq, resume_seq);
+        effective_start_seq = (std::max)(config.start_seq, resume_seq);
     } else {
         lock_guard<std::mutex> guard(job->job_mutex);
         job->progress.checkpoint_seq = 0;
@@ -2139,7 +2139,7 @@ static void RunIngestWorker(const shared_ptr<NatsIngestJobState> &job) {
 
                     NatsMessageEnvelope envelope(msg);
                     uint64_t msg_seq = envelope.Sequence();
-                    batch_last_delivered_seq = std::max(batch_last_delivered_seq, msg_seq);
+                    batch_last_delivered_seq = (std::max)(batch_last_delivered_seq, msg_seq);
                     if (msg_seq != 0) {
                         if (msg_seq <= progress_snapshot.last_committed_seq) {
                             lock_guard<std::mutex> guard(job->job_mutex);
@@ -2157,7 +2157,7 @@ static void RunIngestWorker(const shared_ptr<NatsIngestJobState> &job) {
                     if (!config.subject_contains.empty() &&
                         (subject == nullptr || string(subject).find(config.subject_contains) == string::npos)) {
                         lock_guard<std::mutex> guard(job->job_mutex);
-                        job->progress.last_delivered_seq = std::max(job->progress.last_delivered_seq, msg_seq);
+                        job->progress.last_delivered_seq = (std::max)(job->progress.last_delivered_seq, msg_seq);
                         continue;
                     }
 
@@ -2208,7 +2208,7 @@ static void RunIngestWorker(const shared_ptr<NatsIngestJobState> &job) {
 
                 {
                     lock_guard<std::mutex> guard(job->job_mutex);
-                    job->progress.last_delivered_seq = std::max(job->progress.last_delivered_seq, batch_last_delivered_seq);
+                    job->progress.last_delivered_seq = (std::max)(job->progress.last_delivered_seq, batch_last_delivered_seq);
                 }
 
                 if (inserted_rows == 0) {
@@ -2978,50 +2978,50 @@ static void NatsIngestJobsExecute(ClientContext &context, TableFunctionInput &da
 
 void NatsIngestFunction::Register(ExtensionLoader &loader) {
     TableFunction start_fn("nats_start_ingest", {}, NatsIngestStartExecute, NatsIngestStartBind, NatsIngestStartInitGlobal);
-    start_fn.named_parameters["job_name"] = LogicalType(LogicalTypeId::VARCHAR);
-    start_fn.named_parameters["stream_name"] = LogicalType(LogicalTypeId::VARCHAR);
-    start_fn.named_parameters["target_table"] = LogicalType(LogicalTypeId::VARCHAR);
-    start_fn.named_parameters["durable_name"] = LogicalType(LogicalTypeId::VARCHAR);
+    NatsAddNamedParameter(start_fn, "job_name", LogicalType(LogicalTypeId::VARCHAR));
+    NatsAddNamedParameter(start_fn, "stream_name", LogicalType(LogicalTypeId::VARCHAR));
+    NatsAddNamedParameter(start_fn, "target_table", LogicalType(LogicalTypeId::VARCHAR));
+    NatsAddNamedParameter(start_fn, "durable_name", LogicalType(LogicalTypeId::VARCHAR));
     RegisterNatsConnectionParameters(start_fn);
-    start_fn.named_parameters["start_seq"] = LogicalType(LogicalTypeId::UBIGINT);
-    start_fn.named_parameters["batch_size"] = LogicalType(LogicalTypeId::UBIGINT);
-    start_fn.named_parameters["poll_ms"] = LogicalType(LogicalTypeId::BIGINT);
-    start_fn.named_parameters["fetch_timeout_ms"] = LogicalType(LogicalTypeId::BIGINT);
-    start_fn.named_parameters["create_target_table"] = LogicalType(LogicalTypeId::BOOLEAN);
-    start_fn.named_parameters["subject"] = LogicalType(LogicalTypeId::VARCHAR);
-    start_fn.named_parameters["subject_contains"] = LogicalType(LogicalTypeId::VARCHAR);
-    start_fn.named_parameters["nats_subject"] = LogicalType(LogicalTypeId::VARCHAR);
-    start_fn.named_parameters["json_extract"] = LogicalType::LIST(LogicalType(LogicalTypeId::VARCHAR));
-    start_fn.named_parameters["msgpack_extract"] = LogicalType::LIST(LogicalType(LogicalTypeId::VARCHAR));
-    start_fn.named_parameters["cbor_extract"] = LogicalType::LIST(LogicalType(LogicalTypeId::VARCHAR));
-    start_fn.named_parameters["flexbuffers_extract"] = LogicalType::LIST(LogicalType(LogicalTypeId::VARCHAR));
-    start_fn.named_parameters["proto_file"] = LogicalType(LogicalTypeId::VARCHAR);
-    start_fn.named_parameters["proto_descriptor_set"] = LogicalType(LogicalTypeId::VARCHAR);
-    start_fn.named_parameters["proto_message"] = LogicalType(LogicalTypeId::VARCHAR);
-    start_fn.named_parameters["proto_extract"] = LogicalType::LIST(LogicalType(LogicalTypeId::VARCHAR));
+    NatsAddNamedParameter(start_fn, "start_seq", LogicalType(LogicalTypeId::UBIGINT));
+    NatsAddNamedParameter(start_fn, "batch_size", LogicalType(LogicalTypeId::UBIGINT));
+    NatsAddNamedParameter(start_fn, "poll_ms", LogicalType(LogicalTypeId::BIGINT));
+    NatsAddNamedParameter(start_fn, "fetch_timeout_ms", LogicalType(LogicalTypeId::BIGINT));
+    NatsAddNamedParameter(start_fn, "create_target_table", LogicalType(LogicalTypeId::BOOLEAN));
+    NatsAddNamedParameter(start_fn, "subject", LogicalType(LogicalTypeId::VARCHAR));
+    NatsAddNamedParameter(start_fn, "subject_contains", LogicalType(LogicalTypeId::VARCHAR));
+    NatsAddNamedParameter(start_fn, "nats_subject", LogicalType(LogicalTypeId::VARCHAR));
+    NatsAddNamedParameter(start_fn, "json_extract", LogicalType::LIST(LogicalType(LogicalTypeId::VARCHAR)));
+    NatsAddNamedParameter(start_fn, "msgpack_extract", LogicalType::LIST(LogicalType(LogicalTypeId::VARCHAR)));
+    NatsAddNamedParameter(start_fn, "cbor_extract", LogicalType::LIST(LogicalType(LogicalTypeId::VARCHAR)));
+    NatsAddNamedParameter(start_fn, "flexbuffers_extract", LogicalType::LIST(LogicalType(LogicalTypeId::VARCHAR)));
+    NatsAddNamedParameter(start_fn, "proto_file", LogicalType(LogicalTypeId::VARCHAR));
+    NatsAddNamedParameter(start_fn, "proto_descriptor_set", LogicalType(LogicalTypeId::VARCHAR));
+    NatsAddNamedParameter(start_fn, "proto_message", LogicalType(LogicalTypeId::VARCHAR));
+    NatsAddNamedParameter(start_fn, "proto_extract", LogicalType::LIST(LogicalType(LogicalTypeId::VARCHAR)));
     loader.RegisterFunction(start_fn);
 
     TableFunction stop_fn("nats_stop_ingest", {}, NatsIngestStopExecute, NatsIngestStopBind, NatsIngestStopInitGlobal);
-    stop_fn.named_parameters["job_name"] = LogicalType(LogicalTypeId::VARCHAR);
+    NatsAddNamedParameter(stop_fn, "job_name", LogicalType(LogicalTypeId::VARCHAR));
     loader.RegisterFunction(stop_fn);
 
     TableFunction remove_fn("nats_remove_ingest", {}, NatsIngestRemoveExecute, NatsIngestRemoveBind,
                             NatsIngestRemoveInitGlobal);
-    remove_fn.named_parameters["job_name"] = LogicalType(LogicalTypeId::VARCHAR);
+    NatsAddNamedParameter(remove_fn, "job_name", LogicalType(LogicalTypeId::VARCHAR));
     loader.RegisterFunction(remove_fn);
 
     TableFunction pause_fn("nats_pause_ingest", {}, NatsIngestPauseExecute, NatsIngestPauseBind, NatsIngestPauseInitGlobal);
-    pause_fn.named_parameters["job_name"] = LogicalType(LogicalTypeId::VARCHAR);
+    NatsAddNamedParameter(pause_fn, "job_name", LogicalType(LogicalTypeId::VARCHAR));
     loader.RegisterFunction(pause_fn);
 
     TableFunction resume_fn("nats_resume_ingest", {}, NatsIngestResumeExecute, NatsIngestResumeBind,
                             NatsIngestResumeInitGlobal);
-    resume_fn.named_parameters["job_name"] = LogicalType(LogicalTypeId::VARCHAR);
+    NatsAddNamedParameter(resume_fn, "job_name", LogicalType(LogicalTypeId::VARCHAR));
     loader.RegisterFunction(resume_fn);
 
     TableFunction status_fn("nats_ingest_status", {}, NatsIngestStatusExecute, NatsIngestStatusBind,
                             NatsIngestStatusInitGlobal);
-    status_fn.named_parameters["job_name"] = LogicalType(LogicalTypeId::VARCHAR);
+    NatsAddNamedParameter(status_fn, "job_name", LogicalType(LogicalTypeId::VARCHAR));
     loader.RegisterFunction(status_fn);
 
     TableFunction jobs_fn("nats_ingest_jobs", {}, NatsIngestJobsExecute, NatsIngestJobsBind, NatsIngestJobsInitGlobal);

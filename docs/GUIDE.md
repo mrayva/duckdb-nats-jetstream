@@ -20,7 +20,7 @@ This method automatically downloads the pre-built extension binary for your plat
 For development or if you need to build from source:
 
 **Prerequisites:**
-- DuckDB v1.5.6 (the supported release; the `duckdb/` submodule tracks upstream `main`; see `src/include/nats_duckdb_compat.hpp` for API compatibility)
+- DuckDB v2.0.0 (the supported release; the `duckdb/` submodule is pinned to the `v2.0.0` tag; see `src/include/nats_duckdb_compat.hpp` for API compatibility)
 - CMake 3.15 or later
 - C++17 compatible compiler
 - [vcpkg](https://vcpkg.io) (recommended — see below) or system installs of the NATS C client (cnats), Protocol Buffers, and FlatBuffers

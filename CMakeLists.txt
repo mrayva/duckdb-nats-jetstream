@@ -55,6 +55,12 @@ if(EXISTS "${NATS_DUCKDB_SOURCE_ROOT}/src/include/duckdb/parser/qualified_name.h
         list(APPEND NATS_DUCKDB_API_DEFINITIONS NATS_DUCKDB_IDENTIFIER_API)
     endif()
 
+    file(READ "${NATS_DUCKDB_SOURCE_ROOT}/src/include/duckdb/function/function.hpp" NATS_FUNCTION_HEADER)
+    string(FIND "${NATS_FUNCTION_HEADER}" "class TypedKwargs" NATS_HAS_TYPED_KWARGS)
+    if(NATS_HAS_TYPED_KWARGS GREATER -1)
+        list(APPEND NATS_DUCKDB_API_DEFINITIONS NATS_DUCKDB_TYPED_KWARGS)
+    endif()
+
     file(READ "${NATS_DUCKDB_SOURCE_ROOT}/src/include/duckdb/common/types/vector.hpp" NATS_VECTOR_HEADER)
     if(EXISTS "${NATS_DUCKDB_SOURCE_ROOT}/src/include/duckdb/common/vector/flat_vector.hpp")
         file(READ "${NATS_DUCKDB_SOURCE_ROOT}/src/include/duckdb/common/vector/flat_vector.hpp" NATS_VECTOR_HEADER)

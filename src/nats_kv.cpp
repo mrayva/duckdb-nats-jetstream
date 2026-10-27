@@ -65,7 +65,8 @@ string KvOperationName(kvOperation op) {
 
 constexpr int64_t NATS_KV_LIST_TIMEOUT_MS = 5000;
 
-NatsConnectionConfig ParseKvConnectionParameters(const named_parameter_map_t &named_parameters) {
+template <class NAMED_PARAMETERS>
+NatsConnectionConfig ParseKvConnectionParameters(const NAMED_PARAMETERS &named_parameters) {
     NatsConnectionConfig connection;
     for (auto &kv : named_parameters) {
         ParseNatsConnectionParameter(connection, string(kv.first), kv.second);
@@ -1076,8 +1077,8 @@ void NatsKvFunction::Register(ExtensionLoader &loader) {
     TableFunction scan_fn("nats_kv_scan", {LogicalType(LogicalTypeId::VARCHAR)}, NatsKvScanExecute,
                           NatsKvScanBind, NatsKvScanInitGlobal);
     RegisterNatsConnectionParameters(scan_fn);
-    scan_fn.named_parameters["key_filter"] = LogicalType(LogicalTypeId::VARCHAR);
-    scan_fn.named_parameters["since_revision"] = LogicalType(LogicalTypeId::BIGINT);
+    NatsAddNamedParameter(scan_fn, "key_filter", LogicalType(LogicalTypeId::VARCHAR));
+    NatsAddNamedParameter(scan_fn, "since_revision", LogicalType(LogicalTypeId::BIGINT));
     loader.RegisterFunction(scan_fn);
 
     TableFunction history_fn("nats_kv_history",
@@ -1111,7 +1112,7 @@ void NatsKvFunction::Register(ExtensionLoader &loader) {
                             {LogicalType(LogicalTypeId::VARCHAR), LogicalType(LogicalTypeId::VARCHAR)},
                             NatsKvDeleteExecute, NatsKvDeleteBind, NatsKvOneRowInitGlobal);
     RegisterNatsConnectionParameters(delete_fn);
-    delete_fn.named_parameters["purge"] = LogicalType(LogicalTypeId::BOOLEAN);
+    NatsAddNamedParameter(delete_fn, "purge", LogicalType(LogicalTypeId::BOOLEAN));
     loader.RegisterFunction(delete_fn);
 
     TableFunction status_fn("nats_kv_status", {LogicalType(LogicalTypeId::VARCHAR)}, NatsKvStatusExecute,
@@ -1122,10 +1123,10 @@ void NatsKvFunction::Register(ExtensionLoader &loader) {
     TableFunction create_bucket_fn("nats_kv_create_bucket", {LogicalType(LogicalTypeId::VARCHAR)},
                                    NatsKvCreateBucketExecute, NatsKvCreateBucketBind, NatsKvOneRowInitGlobal);
     RegisterNatsConnectionParameters(create_bucket_fn);
-    create_bucket_fn.named_parameters["history"] = LogicalType(LogicalTypeId::BIGINT);
-    create_bucket_fn.named_parameters["ttl_seconds"] = LogicalType(LogicalTypeId::BIGINT);
-    create_bucket_fn.named_parameters["max_bytes"] = LogicalType(LogicalTypeId::BIGINT);
-    create_bucket_fn.named_parameters["replicas"] = LogicalType(LogicalTypeId::BIGINT);
+    NatsAddNamedParameter(create_bucket_fn, "history", LogicalType(LogicalTypeId::BIGINT));
+    NatsAddNamedParameter(create_bucket_fn, "ttl_seconds", LogicalType(LogicalTypeId::BIGINT));
+    NatsAddNamedParameter(create_bucket_fn, "max_bytes", LogicalType(LogicalTypeId::BIGINT));
+    NatsAddNamedParameter(create_bucket_fn, "replicas", LogicalType(LogicalTypeId::BIGINT));
     loader.RegisterFunction(create_bucket_fn);
 
     TableFunction delete_bucket_fn("nats_kv_delete_bucket", {LogicalType(LogicalTypeId::VARCHAR)},
