@@ -459,7 +459,7 @@ static void FenceIngestCommit(Connection &conn, const shared_ptr<NatsIngestJobSt
         << NATS_INGEST_LEASE_SECONDS << " seconds', updated_at = " << now_sql << " WHERE stream_name = "
         << SqlStringLiteral(job->config.stream_name) << " AND durable_name = "
         << SqlStringLiteral(job->config.durable_name) << " AND owner_id = " << SqlStringLiteral(job->lease_owner_id)
-        << " AND fencing_token = " << job->fencing_token << " AND lease_until > " << now_sql << " RETURNING fencing_token";
+        << " AND fencing_token = " << job->fencing_token << " RETURNING fencing_token";
     auto result = conn.Query(sql.str());
     if (result->HasError()) {
         throw std::runtime_error("Failed to fence ingest commit: " + result->GetError());
@@ -468,6 +468,29 @@ static void FenceIngestCommit(Connection &conn, const shared_ptr<NatsIngestJobSt
     if (!chunk || chunk->size() == 0) {
         throw std::runtime_error(LeaseConflictMessage(job->config));
     }
+}
+
+// Keeps the lease alive across idle or fully filtered batches, which never reach FenceIngestCommit.
+static void RenewIngestLeaseIfDue(Connection &conn, const shared_ptr<NatsIngestJobState> &job,
+                                  std::chrono::steady_clock::time_point &last_renewal) {
+    static constexpr auto RENEW_INTERVAL = std::chrono::seconds(NATS_INGEST_LEASE_SECONDS / 3);
+    auto now = std::chrono::steady_clock::now();
+    if (now - last_renewal < RENEW_INTERVAL || conn.HasActiveTransaction()) {
+        return;
+    }
+    try {
+        EnsureActiveTransaction(conn);
+        MarkTransactionWrite(conn);
+        FenceIngestCommit(conn, job);
+        conn.Commit();
+    } catch (...) {
+        try {
+            conn.Rollback();
+        } catch (...) {
+        }
+        throw;
+    }
+    last_renewal = now;
 }
 
 static void ReleaseIngestLease(const shared_ptr<NatsIngestJobState> &job) {
@@ -1983,6 +2006,7 @@ static void RunIngestWorker(const shared_ptr<NatsIngestJobState> &job) {
         write_chunk.Initialize(Allocator::Get(*db_connection.context), appender->GetActiveTypes(), STANDARD_VECTOR_SIZE);
         auto checkpoint_statement = PrepareCheckpointStatement(db_connection);
         bool append_only_checkpoint = UsesAppendOnlyCheckpointLog(db_connection);
+        auto last_lease_renewal = std::chrono::steady_clock::now();
         idx_t write_row = 0;
         vector<Value> json_values;
         json_values.reserve(config.json_fields.size());
@@ -2087,6 +2111,7 @@ static void RunIngestWorker(const shared_ptr<NatsIngestJobState> &job) {
                     std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - phase_start)
                         .count());
                 if (!fetched_from_transport) {
+                    RenewIngestLeaseIfDue(db_connection, job, last_lease_renewal);
                     if (config.poll_ms > 0) {
                         std::this_thread::sleep_for(std::chrono::milliseconds(config.poll_ms));
                     }
@@ -2223,6 +2248,7 @@ static void RunIngestWorker(const shared_ptr<NatsIngestJobState> &job) {
                     timing.ack_ns += static_cast<uint64_t>(
                         std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - phase_start)
                             .count());
+                    RenewIngestLeaseIfDue(db_connection, job, last_lease_renewal);
                     continue;
                 }
 
@@ -2285,6 +2311,7 @@ static void RunIngestWorker(const shared_ptr<NatsIngestJobState> &job) {
                     phase_start = std::chrono::steady_clock::now();
                     FenceIngestCommit(db_connection, job);
                     db_connection.Commit();
+                    last_lease_renewal = std::chrono::steady_clock::now();
                     timing.commit_ns += static_cast<uint64_t>(
                         std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - phase_start)
                             .count());

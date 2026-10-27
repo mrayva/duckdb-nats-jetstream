@@ -1,6 +1,7 @@
 #include "nats_message_decode.hpp"
 
 #include "yyjson.hpp"
+#include <limits>
 #include <flatbuffers/flexbuffers.h>
 
 #include <cstring>
@@ -262,6 +263,10 @@ void DecodeJsonFields(const NatsPayloadView &payload, const vector<string> &fiel
             values[i] = Value();
         } else if (yyjson_is_str(field)) {
             values[i] = Value(yyjson_get_str(field));
+        } else if (yyjson_is_uint(field)) {
+            values[i] = Value::UBIGINT(yyjson_get_uint(field));
+        } else if (yyjson_is_sint(field)) {
+            values[i] = Value::BIGINT(yyjson_get_sint(field));
         } else if (yyjson_is_num(field)) {
             values[i] = Value(yyjson_get_num(field));
         } else if (yyjson_is_bool(field)) {
@@ -301,8 +306,7 @@ void DecodeJsonFieldsToChunk(DataChunk &chunk, idx_t row_idx, idx_t first_column
         } else if (yyjson_is_str(field)) {
             vector_data[row_idx] = StringVector::AddString(vector, yyjson_get_str(field));
         } else if (yyjson_is_num(field)) {
-            auto value = std::to_string(yyjson_get_num(field));
-            vector_data[row_idx] = StringVector::AddString(vector, value);
+            vector_data[row_idx] = StringVector::AddString(vector, NatsJsonNumberToString(field));
         } else if (yyjson_is_bool(field)) {
             vector_data[row_idx] = StringVector::AddString(vector, yyjson_get_bool(field) ? "true" : "false");
         } else {
@@ -491,6 +495,8 @@ private:
         }
         if (major == 4 || major == 5) {
             if (!ReadArgument(additional, count)) return false;
+            // Every element takes at least one byte, so this also keeps count * 2 from overflowing.
+            if (count > remaining) return false;
             uint64_t elements = major == 5 ? count * 2 : count;
             for (uint64_t i = 0; i < elements; i++) {
                 uint8_t child;
@@ -568,7 +574,26 @@ void DecodeFlexbuffersFieldPathsToChunk(DataChunk &chunk, idx_t row_idx, const v
     }
 }
 
+string NatsJsonNumberToString(yyjson_val *number) {
+    if (yyjson_is_uint(number)) {
+        return std::to_string(yyjson_get_uint(number));
+    }
+    if (yyjson_is_sint(number)) {
+        return std::to_string(yyjson_get_sint(number));
+    }
+    char *text = yyjson_val_write(number, 0, nullptr);
+    if (!text) {
+        return std::to_string(yyjson_get_num(number));
+    }
+    string result(text);
+    free(text);
+    return result;
+}
+
 bool DecodeProtobufPayload(google::protobuf::Message &message, const NatsPayloadView &payload) {
+    if (payload.size > static_cast<idx_t>(std::numeric_limits<int>::max())) {
+        return false;
+    }
     return message.ParseFromArray(payload.data, static_cast<int>(payload.size));
 }
 

@@ -111,6 +111,7 @@ void ConfigureNatsOptions(natsOptions *options, const NatsConnectionConfig &conf
 void ConnectNats(const NatsConnectionConfig &config, natsConnection **connection, idx_t max_attempts,
                  const NatsConnectionCallbacks *callbacks) {
     natsStatus last_status = NATS_OK;
+    max_attempts = (std::max)(max_attempts, static_cast<idx_t>(1));
     for (idx_t attempt = 0; attempt < max_attempts; attempt++) {
         natsOptions *options = nullptr;
         CheckNatsStatus(natsOptions_Create(&options), "Failed to create NATS options");
