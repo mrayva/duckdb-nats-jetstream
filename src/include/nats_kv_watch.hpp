@@ -48,10 +48,10 @@ struct NatsKvWatchProgress {
     bool reconnecting = false;
     uint64_t reconnect_count = 0;
     string last_error;
-    timestamp_t last_start_time;
-    timestamp_t last_commit_time;
-    timestamp_t last_error_time;
-    timestamp_t last_message_time;
+    timestamp_t last_start_time {0};
+    timestamp_t last_commit_time {0};
+    timestamp_t last_error_time {0};
+    timestamp_t last_message_time {0};
     timestamp_t last_reconnect_time {0};
 };
 

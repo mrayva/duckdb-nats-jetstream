@@ -65,7 +65,7 @@ SELECT 'stop=' || job_name || '|' || target_table || '|' || subject AS stop_resu
 FROM nats_stop_subscribe(job_name := 'live_subscribe_msgpack_probe');
 END
 EXPECT status=1/false 10
-EXPECT row=msgpack-device-1/42.500000/true/7 10
+EXPECT row=msgpack-device-1/42.5/true/7 10
 EXPECT types=VARCHAR/BLOB/TIMESTAMP/VARCHAR/VARCHAR/VARCHAR/VARCHAR 10
 EXPECT stop=live_subscribe_msgpack_probe|main.subscribe_msgpack_out|live.subscribe.msgpack 10
 QUIT

@@ -92,14 +92,14 @@ private:
                 uint32_t bits = static_cast<uint32_t>(number);
                 float value;
                 memcpy(&value, &bits, sizeof(value));
-                length = snprintf(buffer, sizeof(buffer), "%f", static_cast<double>(value));
+                length = snprintf(buffer, sizeof(buffer), "%s", Value::FLOAT(value).ToString().c_str());
                 break;
             }
             case 0xcb: {
                 if (!ReadUnsigned(8, number)) return false;
                 double value;
                 memcpy(&value, &number, sizeof(value));
-                length = snprintf(buffer, sizeof(buffer), "%f", value);
+                length = snprintf(buffer, sizeof(buffer), "%s", Value::DOUBLE(value).ToString().c_str());
                 break;
             }
             default:
@@ -442,7 +442,7 @@ private:
             } else if (additional == 27) {
                 memcpy(&value, &bits, sizeof(value));
             }
-            auto length = snprintf(buffer, sizeof(buffer), "%f", value);
+            auto length = snprintf(buffer, sizeof(buffer), "%s", Value::DOUBLE(value).ToString().c_str());
             set_string(buffer, static_cast<idx_t>(length));
             return true;
         }
@@ -565,7 +565,7 @@ void DecodeFlexbuffersFieldPathsToChunk(DataChunk &chunk, idx_t row_idx, const v
         } else if (value.IsUInt()) {
             text = std::to_string(value.AsUInt64());
         } else if (value.IsFloat()) {
-            text = std::to_string(value.AsDouble());
+            text = Value::DOUBLE(value.AsDouble()).ToString();
         } else {
             continue;
         }
@@ -725,10 +725,10 @@ Value ExtractProtobufValue(const google::protobuf::Message *message,
                         result += std::to_string(reflection->GetRepeatedUInt64(*current_message, field, j));
                         break;
                     case google::protobuf::FieldDescriptor::TYPE_FLOAT:
-                        result += std::to_string(reflection->GetRepeatedFloat(*current_message, field, j));
+                        result += Value::FLOAT(reflection->GetRepeatedFloat(*current_message, field, j)).ToString();
                         break;
                     case google::protobuf::FieldDescriptor::TYPE_DOUBLE:
-                        result += std::to_string(reflection->GetRepeatedDouble(*current_message, field, j));
+                        result += Value::DOUBLE(reflection->GetRepeatedDouble(*current_message, field, j)).ToString();
                         break;
                     case google::protobuf::FieldDescriptor::TYPE_BOOL:
                         result += reflection->GetRepeatedBool(*current_message, field, j) ? "true" : "false";
