@@ -4,9 +4,9 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$ROOT_DIR/scripts/duckdb_host_lib.sh"
-DUCKDB_BIN="${DUCKDB_BIN:-/tmp/duckdb-tip-clean/build/release/duckdb}"
+DUCKDB_BIN="${DUCKDB_BIN:-$ROOT_DIR/build/release/duckdb}"
 DUCKDB_LIB="${DUCKDB_LIB:-$(duckdb_host_lib_resolve)}"
-EXTENSION_PATH="${EXTENSION_PATH:-/tmp/duckdb-tip-clean/build/nats_js-tip/extension/nats_js/nats_js.duckdb_extension}"
+EXTENSION_PATH="${EXTENSION_PATH:-$ROOT_DIR/build/release/extension/nats_js/nats_js.duckdb_extension}"
 NATS_URL="${NATS_URL:-nats://127.0.0.1:4222}"
 NATS_CLI="${NATS_CLI:-$HOME/nats}"
 PYTHON_BIN="${PYTHON_BIN:-$ROOT_DIR/.venv/bin/python}"
